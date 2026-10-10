@@ -14,10 +14,14 @@ import {
   type Event,
   type IssueRef,
   type PrRef,
+  type ReviewComment,
+  type ReviewSide,
+  type ReviewVerdictKind,
   type Runtime,
   type Session,
   type WorktreeRef,
 } from "../shared/types.ts";
+import { compareReviewComments, headShaOf, isOutdated, markOutdated, nextReviewCommentId } from "./review.ts";
 
 /** 引擎产生的新事件（缺 seq/id，由存储层补）。 */
 export type NewEvent = {
@@ -46,6 +50,7 @@ export function emptyCard(id: string, at: string): Card {
     confirmations: [],
     pushes: [],
     comments: [],
+    review: { comments: [] },
     spawned: [],
     createdAt: at,
     updatedAt: at,
@@ -104,6 +109,44 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       break;
     }
 
+    /**
+     * 行级评审注释：**outdated 是投影时算的**，不是事件里的字段 ——
+     * 所以 `push.recorded` 时要把已有注释整体重算一遍（见下面 pushes 的分支）。
+     */
+    case "review.comment.added": {
+      const comment: ReviewComment = {
+        id: nextReviewCommentId(card.review.comments),
+        sha: String(p.sha ?? ""),
+        path: String(p.path ?? ""),
+        line: Number(p.line ?? 0),
+        side: (p.side === "old" ? "old" : "new") as ReviewSide,
+        body: String(p.body ?? ""),
+        at,
+        actor: event.actor,
+        outdated: false,
+      };
+      next.review = {
+        ...card.review,
+        comments: [...card.review.comments, comment]
+          .map((c) => ({ ...c, outdated: isOutdated(c.sha, headShaOf(card)) }))
+          .sort(compareReviewComments),
+      };
+      break;
+    }
+
+    case "review.verdict.recorded": {
+      next.review = {
+        ...card.review,
+        verdict: {
+          decision: p.verdict as ReviewVerdictKind,
+          at,
+          by: event.actor.name ?? event.actor.harness ?? event.actor.kind,
+          ...(p.body ? { body: String(p.body) } : {}),
+        },
+      };
+      break;
+    }
+
     case "card.spawned": {
       const childId = String(p.childId ?? "");
       if (childId) next.spawned = [...card.spawned, childId];
@@ -124,9 +167,14 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       next.pr = p.pr as PrRef;
       break;
 
-    case "push.recorded":
+    case "push.recorded": {
       next.pushes = [...card.pushes, { sha: String(p.sha ?? ""), at, actor: event.actor }];
+      // 推送 = HEAD 往前走了 → 所有锚在旧 head 上的评审注释变成"已过期"。
+      if (next.review.comments.length > 0) {
+        next.review = { ...next.review, comments: markOutdated(next.review.comments, headShaOf(next)) };
+      }
       break;
+    }
 
     case "gate.requested":
       next.gates = {

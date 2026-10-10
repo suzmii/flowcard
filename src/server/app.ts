@@ -9,6 +9,8 @@ import { commandSchema, projectInSchema, runtimeActionSchema } from "../shared/t
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
 import { readProject } from "./projects.ts";
+import { clampGraphLimit, readGraph } from "./graph.ts";
+import { readCardDiff } from "./diff.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
 import type { Store } from "./store.ts";
 import { pickDirectory } from "./picker.ts";
@@ -100,6 +102,80 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   });
 
   app.get("/api/projects", (c) => c.json({ projects: store.listProjects() }));
+
+  /**
+   * 提交图（只读）：`git log --graph` 的原始输出 + 提交/分支/worktree 实况 + 卡片↔分支映射。
+   * 只跑只读 git 子命令；`limit` 默认 200、上限 1000（图与响应都要有上限）。
+   */
+  app.get("/api/projects/:id/graph", async (c) => {
+    const id = c.req.param("id");
+    const project = store.getProject(id);
+    if (!project || project.virtual === true || project.path === "") {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "NOT_FOUND",
+            message: `项目 ${id} 不存在（或不是真实仓库）`,
+            hint: "flowcard project list 看现有项目；合成项目「未归属」没有仓库可画",
+          },
+        },
+        404,
+      );
+    }
+    const result = await readGraph(project.path, {
+      limit: clampGraphLimit(c.req.query("limit")),
+      cards: store.listCards(),
+    });
+    return c.json(result, result.ok ? 200 : 500);
+  });
+
+  /**
+   * 卡片 diff（只读）：base = 项目 defaultBranch（拿不到退 main/master），
+   * head = 卡片 worktree 的 HEAD；`git diff <baseSha>...<headSha>`（三点 = merge-base）。
+   * `?patch=1` 额外带上 git 的原始 unified diff 文本。
+   */
+  app.get("/api/cards/:id/diff", async (c) => {
+    const card = store.getCard(c.req.param("id"));
+    if (!card) {
+      return c.json({ ok: false, error: { code: "NOT_FOUND", message: "卡片不存在" } }, 404);
+    }
+    if (!card.worktree) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "NO_WORKTREE",
+            message: `卡片 ${card.id} 还没绑 worktree，没有可比的 head`,
+            hint: `先建并绑 worktree：flowcard worktree ${card.id} --path .worktrees/x --branch feat/x`,
+          },
+        },
+        409,
+      );
+    }
+    const project = store.getProject(card.projectId);
+    const repoPath = project && project.virtual !== true ? project.path : card.repoPath;
+    if (repoPath === undefined || repoPath === "") {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "NO_BASE",
+            message: `卡片 ${card.id} 归属的项目没有仓库路径，算不出 base`,
+            hint: "先登记项目：flowcard project add <仓库路径>",
+          },
+        },
+        409,
+      );
+    }
+    const result = await readCardDiff({
+      repoPath,
+      headDir: card.worktree.path,
+      ...(project?.defaultBranch ? { defaultBranch: project.defaultBranch } : {}),
+      includePatch: c.req.query("patch") === "1",
+    });
+    return c.json(result, result.ok ? 200 : result.error.code === "GIT_FAILED" ? 500 : 409);
+  });
 
   /**
    * 登记项目（看板的 Metadata）：读一次 git 元数据存起来。同 path 幂等（`created:false` 并刷新元数据），

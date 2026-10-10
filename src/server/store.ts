@@ -102,8 +102,9 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  * 也不会让"投影比代码旧"悄悄毁掉前端解析。
  *
  * v3：卡片新增 `projectId`（老事件没有 → 投影成 `local`），所以必须重放一遍。
+ * v4：卡片新增 `review` 槽位（行级评审注释 + 判定），老投影里没有 → 重放补上。
  */
-export const PROJECTION_VERSION = "3";
+export const PROJECTION_VERSION = "4";
 
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */

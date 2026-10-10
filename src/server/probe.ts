@@ -9,6 +9,7 @@
  * 只读：这里只跑 `git rev-parse/status/log/rev-list/remote`、`gh pr view`、`tea pulls list`。
  * 没有任何 fetch/push/pull 或远程写；工具缺失 / 未登录 / 无远程一律**降级并说明**，不报错。
  */
+import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import type { PrRef, WorktreeRef } from "../shared/types.ts";
@@ -60,7 +61,15 @@ export function defaultRun(file: string, args: string[], opts: RunOpts = {}): Pr
       const e = error as NodeJS.ErrnoException & { code?: number | string };
       const missing = e.code === "ENOENT";
       const code = typeof e.code === "number" ? e.code : missing ? 127 : 1;
-      settle({ code, stdout: out, stderr: err || (missing ? `${file}: 未安装` : e.message), missing });
+      // ENOENT 有两种来源：命令不存在，或 **cwd 不存在**（后者更常见于"仓库被删/移走"）。
+      // 说错原因会让人去装 git，所以这里分开讲。
+      const cwdGone = missing && opts?.cwd !== undefined && !existsSync(opts.cwd);
+      const reason = cwdGone
+        ? `${opts?.cwd}: 目录不存在或不可进入（工作目录没了，不是缺少 ${file}）`
+        : missing
+          ? `${file}: 未安装`
+          : e.message;
+      settle({ code, stdout: out, stderr: err || reason, missing });
     },
   );
   return promise;

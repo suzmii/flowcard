@@ -183,6 +183,40 @@ export type Runtime = {
   logPath?: string;
 };
 
+// ---------------------------------------------------------------- 代码评审（本地事实）
+
+export const REVIEW_SIDES = ["new", "old"] as const;
+export type ReviewSide = (typeof REVIEW_SIDES)[number];
+
+/**
+ * 行级评审注释。锚点是 `(sha, path, line, side)`，同一个位置可以有多条（按时间排序）。
+ *
+ * `outdated` **不是事件里的字段**，而是投影时当场算出来的：`注释的 sha ≠ 当前 head sha` 就算过期。
+ * 当前 head = 这张卡**最近一次 push 记录的 sha**（push 是 HEAD 往前走的唯一事实来源）；
+ * 一次 push 都没有时 head 未知，一律 `outdated: false`（宁可不说，也不冤枉一条评论）。
+ */
+export type ReviewComment = {
+  /** 卡片内自增，形如 "rc1"（按已有注释推导，不额外维护计数器） */
+  id: string;
+  sha: string;
+  path: string;
+  line: number;
+  side: ReviewSide;
+  body: string;
+  at: string;
+  actor: Actor;
+  outdated: boolean;
+};
+
+export const REVIEW_VERDICTS = ["approve", "request_changes", "comment"] as const;
+export type ReviewVerdictKind = (typeof REVIEW_VERDICTS)[number];
+
+/** 评审判定：**只记录**。不改流程状态 —— G3 验收仍由人在看板上点。 */
+export type ReviewVerdict = { decision: ReviewVerdictKind; at: string; by: string; body?: string };
+
+/** 卡片上的评审槽位（恒存在）：注释按 `(path, line, side, at, id)` 排序，判定只留最后一次。 */
+export type Review = { comments: ReviewComment[]; verdict?: ReviewVerdict };
+
 /** 卡片投影：issue / pr / worktree 三个槽位永远存在（可为 null），空也要能渲染。 */
 export type Card = {
   id: string;
@@ -205,6 +239,8 @@ export type Card = {
   confirmations: Confirmation[];
   pushes: PushRecord[];
   comments: Comment[];
+  /** 代码评审（本地事实：行级注释 + 判定）。恒存在，空也要能渲染。 */
+  review: Review;
   partOf?: string;
   spawned: string[];
   acceptedAt?: string;
@@ -218,6 +254,8 @@ export type EventType =
   | "card.opened"
   | "card.state.changed"
   | "card.comment.added"
+  | "review.comment.added"
+  | "review.verdict.recorded"
   | "card.spawned"
   | "card.accepted"
   | "card.blocked"
@@ -513,6 +551,31 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     id: z.string().min(1),
     dedupeKey: z.string().optional(),
   }),
+  /**
+   * 代码评审：**本地事实，不是远程写**。评论只落进事件流（不回写 Gitea），
+   * 所以不走 G2 确认；判定同理，不改流程状态（G3 验收仍由人点 `accept`）。
+   *
+   * `sha` 是评论的锚点（写评论时的 head）—— CLI 不给 `--sha` 时按卡片 worktree 的 HEAD 解析。
+   */
+  z.object({
+    cmd: z.literal("reviewComment"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    sha: z.string().min(1),
+    path: z.string().min(1),
+    line: z.number().int().positive(),
+    side: z.enum(REVIEW_SIDES).default("new"),
+    body: z.string().min(1),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
+    cmd: z.literal("reviewVerdict"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    verdict: z.enum(REVIEW_VERDICTS),
+    body: z.string().optional(),
+    dedupeKey: z.string().optional(),
+  }),
 ]);
 
 export type Command = z.infer<typeof commandSchema>;
@@ -536,3 +599,125 @@ export type RuntimeAction = z.infer<typeof runtimeActionSchema>["action"];
  * 路径可以是仓库内的任意子目录 —— `git rev-parse --show-toplevel` 自己找到根。
  */
 export const projectInSchema = z.object({ path: z.string().trim().min(1, "path 不能为空") });
+
+// ---------------------------------------------------------------- 只读视图：提交图 / diff
+
+/** 统一的读接口错误体（`ok: false` 那一支）。 */
+export type ApiError = { code: string; message: string; hint?: string };
+
+/** 提交图里的一条提交。`refs` 由 decorate 解析出来（`HEAD -> main` 只留 `main`）。 */
+export type GraphCommit = {
+  sha: string;
+  short: string;
+  parents: string[];
+  author: string;
+  at: string;
+  subject: string;
+  refs: string[];
+};
+
+export type GraphBranch = { name: string; head: string; upstream?: string };
+
+/** `git worktree list --porcelain` 的一条；卡片映射按 worktree.path 优先、分支名兜底。 */
+export type GraphWorktree = {
+  path: string;
+  /** detached HEAD → null（没有分支可清理） */
+  branch: string | null;
+  head: string;
+  detached: boolean;
+  cardId?: string;
+  cardTitle?: string;
+  cardState?: string;
+};
+
+/** 「有 worktree 的卡片」的反查表：给看板把卡片叠到提交图/泳道上。 */
+export type GraphCardRef = {
+  id: string;
+  title: string;
+  state: string;
+  branch: string;
+  worktreePath: string;
+};
+
+/**
+ * `GET /api/projects/:id/graph` 的成功体。`graphText` 是
+ * `git log --graph --oneline --decorate --all -n <limit>` 的**原样输出**（只去掉结尾换行）：
+ * 泳道交给 git 自己画，我们不重画。
+ */
+export type ProjectGraph = {
+  ok: true;
+  repoPath: string;
+  limit: number;
+  graphText: string;
+  commits: GraphCommit[];
+  branches: GraphBranch[];
+  worktrees: GraphWorktree[];
+  cards: GraphCardRef[];
+};
+
+export type ProjectGraphResult = ProjectGraph | { ok: false; error: ApiError };
+
+export const DIFF_STATUSES = ["added", "modified", "deleted", "renamed", "binary"] as const;
+export type DiffStatus = (typeof DIFF_STATUSES)[number];
+
+export type DiffLine = {
+  kind: "context" | "add" | "del";
+  /** 旧文件里的行号（`add` 没有） */
+  oldLine?: number;
+  /** 新文件里的行号（`del` 没有） */
+  newLine?: number;
+  text: string;
+};
+
+export type DiffHunk = {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  header: string;
+  lines: DiffLine[];
+};
+
+export type DiffFile = {
+  path: string;
+  /** 只在 renamed/copy 时有值 */
+  oldPath?: string;
+  status: DiffStatus;
+  additions: number;
+  deletions: number;
+  hunks: DiffHunk[];
+};
+
+/**
+ * 卡片 diff（只读）：`git diff <baseSha>...<headSha>`（三点 = merge-base 语义），
+ * 在仓库根跑。base = 项目 defaultBranch（拿不到退 main/master），head = 卡片 worktree 的 HEAD。
+ */
+export type CardDiff = {
+  base: string;
+  head: string;
+  baseSha: string;
+  headSha: string;
+  files: DiffFile[];
+  /** 超过阈值（默认 1 MiB）被截断：只保留完整的文件，其余丢掉 */
+  truncated?: boolean;
+  truncatedReason?: string;
+  /** 只有 `?patch=1` 时才有：git 的原始 unified diff（同样受截断阈值约束） */
+  patch?: string;
+};
+
+export type CardDiffResult = (CardDiff & { ok: true }) | { ok: false; error: ApiError };
+
+/** `flowcard diff` 默认打的摘要：文件级 + hunk 头，**不含行体**。 */
+export type DiffHunkSummary = Omit<DiffHunk, "lines">;
+/** 摘要里的文件项：**只有文件级信息**（不带 hunks——只有行数的空壳没有用）。 */
+export type DiffFileSummary = Omit<DiffFile, "hunks">;
+export type DiffSummary = {
+  ok: true;
+  base: string;
+  head: string;
+  baseSha: string;
+  headSha: string;
+  files: DiffFileSummary[];
+  truncated?: boolean;
+  truncatedReason?: string;
+};

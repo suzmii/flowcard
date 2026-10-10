@@ -6,6 +6,7 @@
 - 选型与明确否决项：`docs/adr/0001-stack.md`
 - omp 会话上报适配器实测与坑：`src/adapters/omp/README.md`
 - git/PR 探测：`docs/probe.md`
+- 提交图与代码评审（只读 + 本地记录）：`docs/design.md` §12
 
 ## 快速开始
 
@@ -45,6 +46,10 @@ node src/cli/main.ts end c1 --summary "做完了"
 node src/cli/main.ts accept c1                          # 人验收
 node src/cli/main.ts cleanup c1 --item "删 .worktrees/x" --item "删分支 feat/x"
 node src/cli/main.ts gate c1 --gate G4 --approve && node src/cli/main.ts cleanup c1
+node src/cli/main.ts diff c1                            # 看这一片的 diff（JSON 摘要；--patch 打原始 unified diff）
+node src/cli/main.ts review c1 --comment --path src/x.ts --line 12 --body "这里要判空"
+node src/cli/main.ts review c1 --approve --body "看过了"  # 判定只记录，不改流程状态（验收仍走 accept）
+node src/cli/main.ts review c1 --list                    # 看评论与判定（outdated = 锚的 sha 已经不是当前 head）
 ```
 
 退出码：`0` 成功 / `2` 用法错 / `3` 状态或门禁不允许 / `4` **缺必要条件**（JSON 里写明缺哪项）/ `5` 服务不可达。
@@ -78,4 +83,4 @@ test/          引擎/存储/HTTP/探测/运行时测试
 
 ## 不做什么
 
-不做 agent 编排（执行归 harness）、不做多用户与鉴权（只监听回环）、不做代码审查与 CI 系统（只记录状态）、不接 Jira/云同步/桌面壳、不引入 agent 框架。
+不做 agent 编排（执行归 harness）、不做多用户与鉴权（只监听回环）、不做 CI 系统、也不做远程审查面（提交图/diff 只读本地 git，评审记录留在本地、不回写 forge）、不接 Jira/云同步/桌面壳、不引入 agent 框架。

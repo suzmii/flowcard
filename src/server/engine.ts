@@ -11,6 +11,7 @@ import { describeMissing, missingRequirements, type Flow } from "../shared/flow.
 import { shortHash } from "../shared/hash.ts";
 import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type Project, type Rejection } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
+import { reviewAnchor } from "./review.ts";
 
 export type CommandOutcome = {
   events: NewEvent[];
@@ -596,6 +597,43 @@ export function runCommand(input: {
         { body: cmd.body },
         `comment:${cmd.card}:${shortHash(cmd.body)}`,
       );
+      break;
+    }
+
+    /**
+     * 代码评审：**本地事实，不是远程写**。评论只落进事件流（不回写 Gitea），
+     * 所以这里不走 G2、不发任何网络请求；判定同理，**不改流程状态**（G3 验收仍由人 `accept`）。
+     */
+    case "reviewComment": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      // 幂等键 = 锚点 + 正文指纹：同一条评论重发不产生第二条；同位置另写一条（内容不同）算新评论。
+      emit(
+        cmd.card,
+        "review.comment.added",
+        { sha: cmd.sha, path: cmd.path, line: cmd.line, side: cmd.side, body: cmd.body },
+        `review-comment:${cmd.card}:${cmd.sha}:${cmd.path}:${cmd.line}:${cmd.side}:${shortHash(cmd.body)}`,
+      );
+      notes.push(`评审注释已记录：${reviewAnchor(cmd)}`);
+      break;
+    }
+
+    case "reviewVerdict": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      /**
+       * 幂等键：同一条判定（同 verdict + 同正文）重发不产生第二条；
+       * 但**改主意再改回来要能记上** —— 所以键里只在"前一次判定与这次不同"时带上前值。
+       */
+      const previous = card.review.verdict?.decision;
+      const from = previous === undefined || previous === cmd.verdict ? "-" : previous;
+      emit(
+        cmd.card,
+        "review.verdict.recorded",
+        { verdict: cmd.verdict, ...(cmd.body ? { body: cmd.body } : {}) },
+        `review-verdict:${cmd.card}:${cmd.verdict}:${shortHash(cmd.body ?? "")}:from:${from}`,
+      );
+      notes.push(`评审判定已记录：${cmd.verdict}（不改流程状态：验收仍由人在看板上点 G3）`);
       break;
     }
 

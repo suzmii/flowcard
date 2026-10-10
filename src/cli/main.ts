@@ -6,8 +6,21 @@ import { readFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { parseArgs } from "node:util";
 import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
+import { summarizeDiff } from "../server/diff.ts";
+import { defaultRun, firstLine } from "../server/probe.ts";
 import { resolveUserPath } from "../shared/paths.ts";
-import { CONFIRM_ACTIONS, type Actor, type Command, type ConfirmAction } from "../shared/types.ts";
+import {
+  CONFIRM_ACTIONS,
+  REVIEW_SIDES,
+  REVIEW_VERDICTS,
+  type Actor,
+  type Card,
+  type CardDiffResult,
+  type Command,
+  type ConfirmAction,
+  type ReviewSide,
+  type ReviewVerdictKind,
+} from "../shared/types.ts";
 
 const DEFAULT_URL = process.env.FLOWCARD_URL ?? `http://127.0.0.1:${process.env.FLOWCARD_PORT ?? "47825"}`;
 
@@ -31,6 +44,12 @@ const { values, positionals } = parseArgs({
     gate: { type: "string" },
     approve: { type: "boolean" },
     reject: { type: "boolean" },
+    "request-changes": { type: "boolean" },
+    comment: { type: "boolean" },
+    verdict: { type: "string" },
+    line: { type: "string" },
+    side: { type: "string" },
+    patch: { type: "boolean" },
     request: { type: "boolean" },
     consume: { type: "boolean" },
     list: { type: "boolean" },
@@ -402,15 +421,188 @@ async function build(): Promise<Command> {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down diff review detect list show`);
   }
+}
+
+/** 读一张卡片（读接口；卡不存在 → 退出码 3）。 */
+async function fetchCard(cardId: string): Promise<Card> {
+  let res: Response;
+  try {
+    res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(cardId)}`);
+  } catch (error) {
+    unreachable(error);
+  }
+  const data = (await res.json().catch(() => null)) as { card?: Card } | null;
+  if (!res.ok || !data?.card) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: false, rejection: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } })}\n`,
+    );
+    process.exit(3);
+  }
+  return data.card;
+}
+
+/**
+ * 打完再退：大 JSON（diff 摘要能有几百 KB）经管道写出是异步的，
+ * 直接 `process.exit()` 会在 64 KiB 管道缓冲没排空时就掐掉输出（stdout 静默截断）。
+ */
+async function writeThenExit(text: string, code: number): Promise<never> {
+  await new Promise<void>((resolve) => {
+    process.stdout.write(text, () => resolve());
+  });
+  process.exit(code);
+}
+
+/**
+ * `flowcard diff <card> [--patch]`：只读。
+ * 默认打 JSON 摘要（文件级 + hunk 头，不含行体）；`--patch` 打 git 的原始 unified diff 文本。
+ */
+async function runDiff(): Promise<never> {
+  const card = requireCard();
+  const wantPatch = values.patch === true;
+  let res: Response;
+  try {
+    res = await fetch(
+      `${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}/diff${wantPatch ? "?patch=1" : ""}`,
+    );
+  } catch (error) {
+    unreachable(error);
+  }
+  const data = (await res.json().catch(() => null)) as (CardDiffResult & { patch?: string }) | null;
+  if (!res.ok || !data || data.ok === false) {
+    process.stdout.write(`${JSON.stringify(data ?? { ok: false })}\n`);
+    process.exit(res.status === 404 || res.status === 409 ? 3 : 2);
+  }
+  if (wantPatch) {
+    const patch = data.patch ?? "";
+    return writeThenExit(patch.endsWith("\n") || patch === "" ? patch : `${patch}\n`, 0);
+  }
+  return writeThenExit(`${JSON.stringify(summarizeDiff(data))}\n`, 0);
+}
+
+/**
+ * 评论锚点 `sha`：不给 `--sha` 就按卡片 worktree（退 repoPath）的 HEAD 解析 ——
+ * 锚点就是"写这条评论那一刻的 HEAD"；之后 head 再往前走，这条评论自动变成"已过期"。
+ */
+async function resolveReviewSha(cardId: string): Promise<string> {
+  const given = opt("sha");
+  if (given) return given;
+  const card = await fetchCard(cardId);
+  const dir = card.worktree?.path ?? card.repoPath;
+  if (!dir) {
+    die(2, `卡片 ${cardId} 没有 worktree/repoPath，算不出评论的 sha：在 worktree 里跑，或显式 --sha <sha>`);
+  }
+  const out = await defaultRun("git", ["-C", dir, "rev-parse", "HEAD"], { timeoutMs: 5000 });
+  const sha = firstLine(out.stdout);
+  if (out.code !== 0 || sha === "") {
+    die(2, `在 ${dir} 里读不出 HEAD（${firstLine(out.stderr) || `退出码 ${out.code}`}）：显式 --sha <sha>`);
+  }
+  return sha;
+}
+
+/**
+ * `flowcard review <card> [--comment|--approve|--request-changes|--verdict <值>|--list]`
+ *
+ *   --comment                行级评论（`--path` + `--line` + `--body`，可选 `--side new|old` / `--sha`）
+ *   --approve / --request-changes / --verdict   评审判定（**只记录，不改流程状态**）
+ *   不给动作标志（或 `--list`）  列出这张卡的评审记录
+ *
+ * 读动作（--list）在这里直接打完退出；写动作返回命令，交给 `submit` 统一提交。
+ */
+async function buildReviewCommand(): Promise<Command> {
+  const card = requireCard();
+  const wantComment = values.comment === true;
+  const approved = values.approve === true;
+  const requestChanges = values["request-changes"] === true;
+  const verdictFlag = opt("verdict");
+  const acting = [wantComment, approved, requestChanges, verdictFlag !== undefined].filter(
+    Boolean,
+  ).length;
+
+  if (acting > 1) {
+    die(2, "review 一次只做一件事：--comment / --approve / --request-changes / --verdict <值> 选一个");
+  }
+  if (values.list === true && acting > 0) {
+    die(2, "review --list 不能和 --comment / --approve / --request-changes / --verdict 一起用");
+  }
+
+  if (acting === 0) {
+    const full = await fetchCard(card);
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, cardId: card, review: full.review ?? { comments: [] } })}\n`,
+    );
+    process.exit(0);
+  }
+
+  if (wantComment) {
+    const side = opt("side") ?? "new";
+    if (!(REVIEW_SIDES as readonly string[]).includes(side)) {
+      die(2, `--side 只能是 ${REVIEW_SIDES.join(" / ")}，收到 "${side}"`);
+    }
+    const line = Number(opt("line"));
+    if (!Number.isInteger(line) || line <= 0) {
+      die(2, "review --comment 需要 --line <正整数>（diff 里的行号，看 flowcard diff 的输出）");
+    }
+    return {
+      cmd: "reviewComment",
+      actor: actor(),
+      card,
+      sha: await resolveReviewSha(card),
+      path: opt("path") ?? die(2, "review --comment 需要 --path <文件路径>"),
+      line,
+      side: side as ReviewSide,
+      body: opt("body") ?? die(2, "review --comment 需要 --body"),
+    };
+  }
+
+  let decision: ReviewVerdictKind;
+  if (verdictFlag !== undefined) {
+    if (!(REVIEW_VERDICTS as readonly string[]).includes(verdictFlag)) {
+      die(2, `--verdict 只能是 ${REVIEW_VERDICTS.join(" / ")}，收到 "${verdictFlag}"`);
+    }
+    decision = verdictFlag as ReviewVerdictKind;
+  } else {
+    decision = approved ? "approve" : "request_changes";
+  }
+  return {
+    cmd: "reviewVerdict",
+    actor: actor(),
+    card,
+    verdict: decision,
+    ...(opt("body") ? { body: opt("body")! } : {}),
+  };
+}
+
+/** 把一条命令 POST 给服务端，按 `rejection.code` 定退出码（写入口只有这一条路）。 */
+async function submit(command: Command): Promise<never> {
+  let res: Response;
+  try {
+    res = await fetch(`${DEFAULT_URL}/api/commands`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(command),
+    });
+  } catch (error) {
+    unreachable(error);
+  }
+
+  const payload = (await res.json()) as {
+    ok: boolean;
+    rejection?: { code: string };
+    blocked?: { missing: string[] };
+  };
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  if (!payload.ok) process.exit(payload.rejection?.code === "USAGE_ERROR" ? 2 : 3);
+  if (payload.blocked && payload.blocked.missing.length > 0) process.exit(4);
+  process.exit(0);
 }
 
 async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down diff review detect list show" })}\n`);
     process.exit(0);
   }
 
@@ -484,34 +676,16 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // 提交图与评审的读动作（diff / review --list）：只读接口，直接打端点。
+  if (name === "diff") await runDiff();
+  if (name === "review") await submit(await buildReviewCommand());
+
   // 项目（看板 Metadata）与附件不是命令：直接打各自的端点。
   if (name === "project") await runProject(positionals.slice(1));
   if (name === "attach") await runAttach(positionals[1]);
 
   const command = await build();
-  let res: Response;
-  try {
-    res = await fetch(`${DEFAULT_URL}/api/commands`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(command),
-    });
-  } catch (error) {
-    process.stdout.write(
-      `${JSON.stringify({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${DEFAULT_URL}：${String(error)}` } })}\n`,
-    );
-    process.exit(5);
-  }
-
-  const payload = (await res.json()) as {
-    ok: boolean;
-    rejection?: { code: string };
-    blocked?: { missing: string[] };
-  };
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  if (!payload.ok) process.exit(payload.rejection?.code === "USAGE_ERROR" ? 2 : 3);
-  if (payload.blocked && payload.blocked.missing.length > 0) process.exit(4);
-  process.exit(0);
+  await submit(command);
 }
 
 await main();
