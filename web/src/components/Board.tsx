@@ -20,11 +20,14 @@ export function Board({
   loading,
   selectedId,
   onSelect,
+  onSelectSession,
 }: {
   cards: CardView[];
   loading: boolean;
   selectedId: string | null;
   onSelect: (id: string) => void;
+  /** 点磁贴的会话灯/会话徽标：打开详情并直接落在对话区。 */
+  onSelectSession?: (id: string) => void;
 }) {
   return (
     <div className="board-scroll flex h-full min-h-0 gap-3 overflow-x-auto p-3">
@@ -65,6 +68,7 @@ export function Board({
                     card={card}
                     selected={card.id === selectedId}
                     onSelect={onSelect}
+                    {...(onSelectSession ? { onSelectSession } : {})}
                   />
                 ))
               )}

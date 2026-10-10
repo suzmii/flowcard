@@ -39,7 +39,11 @@ export type SessionCost = { total?: number; cost?: number };
 /** 转录里的一条消息（`tool` 行的 `tool` 槽位带工具名/参数/输出）。 */
 export type SessionMessage = {
   id: string;
-  role: "user" | "assistant" | "tool";
+  /**
+   * `thinking` 是模型的思考块：一条消息一个（`thinking_delta` 累加、`thinking_end` 覆盖为权威），
+   * 与助手文本同规则归并，但 id 带 `:thinking` 后缀、独占一行（免得盖掉同一条 messageId 的回答）。
+   */
+  role: "user" | "assistant" | "tool" | "thinking";
   at: string;
   text?: string;
   tool?: SessionToolEvent;
@@ -61,8 +65,9 @@ export type SessionSnapshot = {
 /** 每卡 SSE 推的事件（`type` 就是 SSE 的 `event:` 名，见 `GET /api/cards/:id/session/stream`）。 */
 export type SessionEvent =
   | { type: "ready"; ompSessionId?: string; cwd: string }
-  | { type: "message"; id: string; role: "user" | "assistant"; textDelta?: string; contentIndex?: number }
-  | { type: "message_end"; id: string; role: "user" | "assistant"; text: string; at: string }
+  /** `role:"thinking"` 复用 `message`/`message_end` 两帧（前端按 id 归并的规则完全一致）。 */
+  | { type: "message"; id: string; role: "user" | "assistant" | "thinking"; textDelta?: string; contentIndex?: number }
+  | { type: "message_end"; id: string; role: "user" | "assistant" | "thinking"; text: string; at: string }
   | {
       type: "tool";
       callId: string;
@@ -485,6 +490,13 @@ type Live = {
   promptSeq: number;
   /** 每条 omp messageId 第一次出现的时间（写转录用，别让 delta 每次刷新时间）。 */
   seenAt: Map<string, string>;
+  /**
+   * 工具调用按 `toolCallId` 记住**上一次**的形状：omp 的 `tool_execution_end/update` 不带 `args`，
+   * 直接覆盖会把命令摘要冲掉（网页折叠头上要显示的就是它），所以逐字段归并。
+   */
+  tools: Map<string, SessionToolEvent>;
+  /** 思考块按 omp messageId 累计（`thinking_delta` 累加、`thinking_end` 覆盖为权威）；一条消息一个。 */
+  thinking: Map<string, string>;
   off: () => void;
 };
 
@@ -570,6 +582,45 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
   };
 
   const externalId = (live: Live, ompMessageId: string): string => `${live.tag}:${ompMessageId}`;
+
+  /**
+   * 思考块的转录 id：跟助手文本同一条 omp messageId，但加 `:thinking` 后缀独占一行 ——
+   * 不然会跟同一条 messageId 的回答抢同一个 `(card_id, message_id)` 主键（互相覆盖）。
+   */
+  const thinkingId = (live: Live, ompMessageId: string): string =>
+    `${externalId(live, ompMessageId)}:thinking`;
+
+  /** 思考块的累计键：与正文同规则，按 `messageId` + `contentIndex` 分块。 */
+  const thinkingKey = (ompMessageId: string, contentIndex: number | null): string =>
+    `${ompMessageId}\u0000${contentIndex ?? 0}`;
+
+  /** 某个 messageId 已拼好的思考文本（按 contentIndex 排序拼接）；没有 → ""。 */
+  const thinkingTextFor = (live: Live, ompMessageId: string): string => {
+    const prefix = `${ompMessageId}\u0000`;
+    return [...live.thinking.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort((a, b) => Number(a[0].slice(prefix.length)) - Number(b[0].slice(prefix.length)))
+      .map(([, text]) => text)
+      .join("");
+  };
+
+  /**
+   * 工具事件归并：omp 的 `tool_execution_update/end` **不带 `args`**，直接整块覆盖会把命令摘要冲掉
+   * （网页折叠头上显示的就是它）。所以逐字段保留上一次的值：新的有就用新的，没有就沿用旧的。
+   */
+  const mergeTool = (previous: SessionToolEvent | undefined, next: SessionToolEvent): SessionToolEvent => {
+    const args = next.args !== undefined ? next.args : previous?.args;
+    const output = next.output !== undefined ? next.output : previous?.output;
+    const isError = next.isError !== undefined ? next.isError : previous?.isError;
+    return {
+      callId: next.callId,
+      name: next.name === "" ? (previous?.name ?? next.name) : next.name,
+      status: next.status,
+      ...(args === undefined ? {} : { args }),
+      ...(output === undefined ? {} : { output }),
+      ...(isError === undefined ? {} : { isError }),
+    };
+  };
 
   const seenAt = (live: Live, ompMessageId: string): string => {
     const found = live.seenAt.get(ompMessageId);
@@ -727,6 +778,29 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         });
         break;
       }
+      case "thinking": {
+        // 与正文同规则：按 messageId + contentIndex 分块累加（先只流给网页，thinking_end 才落库）。
+        const key = thinkingKey(event.messageId, event.contentIndex);
+        live.thinking.set(key, (live.thinking.get(key) ?? "") + event.delta);
+        emit(live, {
+          type: "message",
+          id: thinkingId(live, event.messageId),
+          role: "thinking",
+          textDelta: event.delta,
+          ...(event.contentIndex === null ? {} : { contentIndex: event.contentIndex }),
+        });
+        break;
+      }
+      case "thinking_end": {
+        // 权威值覆盖该块（`content` 为空就沿用累计的，与 text_end 同规则），然后落一次转录。
+        if (event.text !== "") live.thinking.set(thinkingKey(event.messageId, event.contentIndex), event.text);
+        const id = thinkingId(live, event.messageId);
+        const at = seenAt(live, event.messageId);
+        const text = thinkingTextFor(live, event.messageId);
+        persist(live, { id, role: "thinking", at, text });
+        emit(live, { type: "message_end", id, role: "thinking", text, at });
+        break;
+      }
       case "message": {
         // 用户消息由 flowcard 自己 echo（prompt 时就写好了）；工具结果走 tool_execution_*。
         if (event.role !== "assistant") break;
@@ -743,23 +817,24 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       }
       case "tool": {
         const output = toolOutputText(event.result);
-        const tool: SessionToolEvent = {
+        const tool = mergeTool(live.tools.get(event.toolCallId), {
           callId: event.toolCallId,
           name: event.toolName,
           status: event.phase,
           ...(event.args === undefined ? {} : { args: event.args }),
           ...(output === undefined ? {} : { output }),
           ...(event.isError === null ? {} : { isError: event.isError }),
-        };
+        });
+        live.tools.set(event.toolCallId, tool);
         persist(live, { id: `${live.tag}:${event.toolCallId}`, role: "tool", at: now(), tool });
         emit(live, {
           type: "tool",
-          callId: event.toolCallId,
-          name: event.toolName,
-          phase: event.phase,
-          ...(event.args === undefined ? {} : { args: event.args }),
-          ...(output === undefined ? {} : { output }),
-          ...(event.isError === null ? {} : { isError: event.isError }),
+          callId: tool.callId,
+          name: tool.name,
+          phase: tool.status,
+          ...(tool.args === undefined ? {} : { args: tool.args }),
+          ...(tool.output === undefined ? {} : { output: tool.output }),
+          ...(tool.isError === undefined ? {} : { isError: tool.isError }),
         });
         break;
       }
@@ -957,6 +1032,8 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       readyOk: false,
       promptSeq: 0,
       seenAt: new Map(),
+      tools: new Map(),
+      thinking: new Map(),
       off: () => undefined,
     };
     records.set(cardId, live);

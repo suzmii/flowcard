@@ -35,6 +35,7 @@ const HUMAN = { kind: "human" as const, name: "tester" };
  *   hang              —— 收到 prompt 只吐一半就挂着，等 abort 才收尾（测中断）
  *   exit-after-turn   —— 一轮跑完就自己退（测"子进程早退"）
  *   die-before-ready  —— 连 ready 都不吐就退（测起不来）
+ *   thinking          —— 一轮只有思考块 + 一句正文（测思考流式/落库，不跑工具）
  */
 const FAKE_OMP_SOURCE = String.raw`
 const NL = "\n";
@@ -112,6 +113,19 @@ function handleLine(line) {
       out({ type: "agent_start" });
       out({ type: "turn_start" });
       out({ type: "message_start", messageId: asked, message: { role: "assistant", content: [] } });
+      if (MODE === "thinking") {
+        // 思考块：两个 delta 累加 + thinking_end 权威覆盖；随后才是正文（同一条 messageId）。
+        out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "先想一" } });
+        out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "下再说" } });
+        out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_end", contentIndex: 1, content: "先想一下再说" } });
+        out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "好" } });
+        out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "好" } });
+        out({ type: "message_end", messageId: asked, message: { role: "assistant", content: [{ type: "text", text: "好" }], stopReason: "stop" } });
+        out({ type: "prompt_result", id: cmd.id, agentInvoked: true, status: "completed", sessionSettled: true });
+        out({ type: "session_settled" });
+        pending = null;
+        return;
+      }
       out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "先" } });
       out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "跑一下" } });
       if (MODE === "hang") return;
@@ -205,30 +219,27 @@ function makeSessions(store: Store, mode: string, calls: StartRpcOptions[] = [],
 /** 事件日志 + 按条件等待（订阅驱动，不轮询）。 */
 class EventLog {
   readonly events: SessionEvent[] = [];
-  #waiters: Array<{ match: (event: SessionEvent) => boolean; resolve: (event: SessionEvent) => void }> = [];
+  #waiters: Array<{
+    match: (event: SessionEvent) => boolean;
+    remaining: number;
+    resolve: (event: SessionEvent) => void;
+  }> = [];
 
   push = (event: SessionEvent): void => {
     this.events.push(event);
-    const index = this.#waiters.findIndex((waiter) => waiter.match(event));
-    const waiter = index < 0 ? undefined : this.#waiters.splice(index, 1)[0];
-    waiter?.resolve(event);
+    for (const waiter of [...this.#waiters]) {
+      if (!waiter.match(event)) continue;
+      waiter.remaining -= 1;
+      if (waiter.remaining > 0) continue;
+      this.#waiters.splice(this.#waiters.indexOf(waiter), 1);
+      waiter.resolve(event);
+    }
   };
 
   waitFor(match: (event: SessionEvent) => boolean, timeoutMs = 4_000): Promise<SessionEvent> {
     const existing = this.events.find(match);
     if (existing !== undefined) return Promise.resolve(existing);
-    return new Promise<SessionEvent>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`等不到匹配的事件（${timeoutMs}ms）；已有：${this.events.map((e) => e.type).join(",")}`));
-      }, timeoutMs);
-      this.#waiters.push({
-        match,
-        resolve: (event) => {
-          clearTimeout(timer);
-          resolve(event);
-        },
-      });
-    });
+    return this.#next(match, 1, timeoutMs);
   }
 
   byType(type: SessionEvent["type"]): SessionEvent[] {
@@ -238,16 +249,35 @@ class EventLog {
   /**
    * 等**第 `nth` 次**匹配的事件（`waitFor` 只认第一次）—— 多轮对话要靠这个数着等：
    * 每轮结束都会推一条 `state{busy:false}`，只按形状等就分不清是哪一轮。
+   *
+   * **不能**在"还没够数"时退回 `waitFor`：它会立刻拿一个**已经存在的**匹配事件结账（等于没等），
+   * 数轮次时就会把启动期那条当成"这一轮跑完了"。所以这里只等**调用之后新到的**事件。
    */
   waitForNth(match: (event: SessionEvent) => boolean, nth: number, timeoutMs = 4_000): Promise<SessionEvent> {
     const seen = this.events.filter(match);
     if (seen.length >= nth) return Promise.resolve(seen[nth - 1] as SessionEvent);
-    let remaining = nth - seen.length;
-    return this.waitFor((event) => {
-      if (!match(event)) return false;
-      remaining -= 1;
-      return remaining <= 0;
-    }, timeoutMs);
+    return this.#next(match, nth - seen.length, timeoutMs);
+  }
+
+  /** 等接下来 `count` 个匹配的事件（只算调用之后新到的）。 */
+  #next(
+    match: (event: SessionEvent) => boolean,
+    count: number,
+    timeoutMs: number,
+  ): Promise<SessionEvent> {
+    return new Promise<SessionEvent>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`等不到匹配的事件（${timeoutMs}ms）；已有：${this.events.map((e) => e.type).join(",")}`));
+      }, timeoutMs);
+      this.#waiters.push({
+        match,
+        remaining: count,
+        resolve: (event) => {
+          clearTimeout(timer);
+          resolve(event);
+        },
+      });
+    });
   }
 }
 
@@ -379,18 +409,64 @@ describe("托管会话（假 omp 真管道）", () => {
     await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
     expect(sessions.snapshot(id).busy).toBe(true);
 
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
     expect(await sessions.abort(id)).toEqual({ ok: true });
     const aborted = await log.waitFor(
       (e) => e.type === "message_end" && e.role === "assistant" && e.text === "12",
     );
     expect(aborted.type === "message_end" ? aborted.text : "").toBe("12");
-    await log.waitFor((e) => e.type === "state" && e.busy === false);
+    // 等**中断之后**第一次 busy 归零（启动期也有同形状的态，按形状等会立刻拿旧的结账）
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
     expect(sessions.snapshot(id).busy).toBe(false);
     // abort 不是结束：会话还活着，等真正的 stop
     expect(sessions.snapshot(id).status).toBe("running");
     expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual(["请从 1 数到 500", "12"]);
     await sessions.stop(id);
     expect(sessions.snapshot(id).status).toBe("ended");
+  });
+
+  it("思考块：SSE 流式出现、按 messageId/contentIndex 归并、落库后 GET 读回 role=thinking", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const sessions = makeSessions(store, "thinking");
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+    const app = createApp(store, { sessions });
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    expect((await sessions.prompt(id, "想想再答")).ok).toBe(true);
+
+    // SSE：思考增量流式出现（累加），thinking_end 落一条 message_end 权威覆盖
+    await log.waitFor((e) => e.type === "message" && e.role === "thinking" && e.textDelta === "先想一");
+    const end = await log.waitFor((e) => e.type === "message_end" && e.role === "thinking");
+    expect(end.type === "message_end" ? end.text : "").toBe("先想一下再说");
+    const deltas = log
+      .byType("message")
+      .map((e) => (e.type === "message" && e.role === "thinking" ? e.textDelta : ""))
+      .join("");
+    expect(deltas).toBe("先想一下再说");
+    // 思考块独占一行，不盖掉同一条 messageId 的助手回答
+    const assistant = await log.waitFor((e) => e.type === "message_end" && e.role === "assistant");
+    expect(assistant.type === "message_end" ? assistant.text : "").toBe("好");
+
+    const snapshot = sessions.snapshot(id);
+    expect(snapshot.messages.map((m) => m.role)).toEqual(["user", "thinking", "assistant"]);
+    const thinking = snapshot.messages.find((m) => m.role === "thinking");
+    expect(thinking?.text).toBe("先想一下再说");
+    expect(thinking?.id).toContain(":thinking");
+
+    // 亲口从 HTTP GET 读回：role=thinking（不是被兜底成 assistant）
+    const got = (await (await app.request(`/api/cards/${id}/session`)).json()) as {
+      messages: { role: string; text?: string }[];
+    };
+    expect(got.messages.map((m) => m.role)).toEqual(["user", "thinking", "assistant"]);
+    expect(got.messages.find((m) => m.role === "thinking")?.text).toBe("先想一下再说");
+
+    await sessions.stop(id);
+    // 重启（新注册表）后转录仍在：思考块照样读得回
+    const restarted = createHostedSessions({ store, resolveOmpPath: async () => undefined });
+    expect(restarted.snapshot(id).messages.map((m) => m.role)).toEqual(["user", "thinking", "assistant"]);
   });
 
   it("子进程早退：状态收尾 + 代表会话上报 end（卡片会话变 ended）", async () => {
@@ -614,12 +690,13 @@ describe("多轮对话（同一个子进程接着聊）", () => {
     await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
 
     // 第一轮
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
     const first = await sessions.prompt(id, "第一轮：只回答 ok");
     expect(first.ok).toBe(true);
     expect(first.messageId).toContain(":p1");
     await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-3"));
-    // 每轮跑完的标志：busy 归零（第 1 次是 ready 之后那拍，第 2 次才是第一轮跑完）
-    await log.waitForNth((e) => e.type === "state" && e.busy === false, 2);
+    // 每轮跑完的标志：这一轮置忙之后**第一次** busy 归零（别去数启动期的那些态 —— 数量随加载而变）
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
     expect(sessions.snapshot(id).busy).toBe(false);
 
     // 第二轮：**同一个子进程**（tag 一样）接着发
@@ -630,7 +707,7 @@ describe("多轮对话（同一个子进程接着聊）", () => {
     // 第二轮的收尾帧（msg-6 是第二轮的最终回答，第一轮是 msg-3）—— 两轮的帧分得开
     const answered = await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-6"));
     expect(answered.type === "message_end" ? answered.text : "").toBe("ok");
-    await log.waitForNth((e) => e.type === "state" && e.busy === false, 3); // 第 3 次 = 第二轮跑完
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 2); // 第二轮跑完
 
     const snapshot = sessions.snapshot(id);
     expect(snapshot.status).toBe("running"); // 两轮之间会话没被结束

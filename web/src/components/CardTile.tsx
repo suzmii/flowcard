@@ -1,4 +1,4 @@
-import { CircleDot, GitPullRequest, Lock, MessageSquare, Play } from "lucide-react";
+import { CircleDot, GitBranch, GitPullRequest, Lock, MessageSquare, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { RUNTIME_TONE, SESSION_STATE_LABELS } from "@/lib/contract";
 import { badgeSignals, sessionLight } from "@/lib/activity";
@@ -20,20 +20,36 @@ const LIGHT_TONE: Record<string, string> = {
   failed: "bg-red-600",
 };
 
+/**
+ * worktree 路径短形：只留最后两段（`.worktrees/<名字>`）。
+ * 全路径永远在 tooltip 里 —— 磁贴只有 17.5rem 宽，塞不下绝对路径。
+ */
+function shortWorktreePath(path: string): string {
+  const parts = path.split("/").filter((part) => part !== "");
+  return parts.slice(-2).join("/");
+}
+
 export function CardTile({
   card,
   selected,
   onSelect,
+  onSelectSession,
 }: {
   card: CardView;
   selected: boolean;
+  /** 打开卡片详情。 */
   onSelect: (id: string) => void;
+  /** 点会话灯/会话徽标：同样打开详情，但直接落在对话区（不给就退回 onSelect）。 */
+  onSelectSession?: (id: string) => void;
 }) {
   const activity = badgeSignals(card);
   const light = sessionLight(card);
   const openGates = Object.values(card.gates).filter((gate) => gate.status === "open");
   const runtime = card.runtime ?? null;
   const unreadComments = card.remoteComments.filter((comment) => !comment.read).length;
+  const worktree = card.worktree;
+  // 磁贴主点击（打开详情）不变；会话相关的两处小按钮走同一条路，只是让详情直接对着对话区
+  const openSession = onSelectSession ?? onSelect;
 
   return (
     <button
@@ -45,12 +61,21 @@ export function CardTile({
       )}
     >
       {light ? (
+        // 会话灯 = 会话的入口：点一下就打开这张卡的详情并直接落在对话区。
+        // 用 after 撑大命中区（灯本身只有 10px），不改磁贴的主点击。
         <span
-          className={cn("absolute right-2 top-2 size-2.5 rounded-full ring-2 ring-card", LIGHT_TONE[light.tone])}
+          className={cn(
+            "absolute right-2 top-2 size-2.5 cursor-pointer rounded-full ring-2 ring-card after:absolute after:-inset-2 after:content-['']",
+            LIGHT_TONE[light.tone],
+          )}
           data-testid="tile-session-light"
           data-light-tone={light.tone}
-          title={light.label}
-          aria-label={light.label}
+          title={`${light.label} · 点开详情直接看对话`}
+          aria-label={`${light.label}（打开对话）`}
+          onClick={(event) => {
+            event.stopPropagation();
+            openSession(card.id);
+          }}
         />
       ) : null}
 
@@ -66,7 +91,16 @@ export function CardTile({
 
       <div className="mt-2 flex flex-wrap items-center gap-1">
         {card.session ? (
-          <Badge variant="outline" title={`会话 ${card.session.id}（${card.session.cwd}）`}>
+          <Badge
+            variant="outline"
+            className="cursor-pointer"
+            data-testid="tile-session-badge"
+            title={`会话 ${card.session.id}（${card.session.cwd}）· 点开详情直接看对话`}
+            onClick={(event) => {
+              event.stopPropagation();
+              openSession(card.id);
+            }}
+          >
             <span className={`size-1.5 rounded-full ${SESSION_TONE[card.session.state] ?? "bg-neutral-400"}`} />
             {card.session.harness}
           </Badge>
@@ -91,6 +125,32 @@ export function CardTile({
         ) : (
           <Badge variant="muted" title="没有 WIP PR">
             <GitPullRequest className="opacity-40" />无 PR
+          </Badge>
+        )}
+
+        {/* worktree 与 Issue / PR 一样是常驻槽位：有没有都画出来。 */}
+        {worktree ? (
+          <Badge
+            variant="info"
+            className="max-w-full min-w-0"
+            data-testid="tile-worktree"
+            data-worktree={worktree.branch}
+            data-worktree-source={worktree.source}
+            title={`worktree ${worktree.path}\n分支 ${worktree.branch} · 来源 ${worktree.source}（harness / flowcard）`}
+          >
+            <GitBranch className="shrink-0" />
+            {/* 分支名可能很长：截断显示，全名与全路径都在 tooltip 里 */}
+            <span className="max-w-[9rem] truncate">{worktree.branch}</span>
+            <span
+              className="max-w-[6rem] truncate font-mono text-[10px] font-normal opacity-70"
+              title={worktree.path}
+            >
+              …/{shortWorktreePath(worktree.path)}
+            </span>
+          </Badge>
+        ) : (
+          <Badge variant="muted" data-testid="tile-worktree" data-worktree="none" title="没有绑定 worktree">
+            <GitBranch className="opacity-40" />无 worktree
           </Badge>
         )}
 

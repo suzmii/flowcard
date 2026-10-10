@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { CheckCheck, CircleSlash, ExternalLink, MessagesSquare, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { CheckCheck, CircleSlash, ExternalLink, Maximize2, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
 import { StateActions } from "@/components/detail/StateActions";
@@ -7,6 +7,7 @@ import { CodeChanges } from "@/components/detail/CodeChanges";
 import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
+import { SessionChat } from "@/components/detail/SessionChat";
 import { SessionPanel } from "@/components/detail/SessionPanel";
 import { SlotGrid } from "@/components/detail/SlotGrid";
 import { Badge } from "@/components/ui/badge";
@@ -37,6 +38,7 @@ export function CardDetail({
   card,
   cards,
   issueBase,
+  focusSession = false,
   onClose,
   onOpenSession,
   onRefresh,
@@ -45,19 +47,28 @@ export function CardDetail({
   cards: CardView[];
   /** 当前项目的 Issue 基址（repo 短形 + URL 模板）：Issue 绑定入口只填数字就靠它 */
   issueBase?: IssueBase;
+  /** 从磁贴的会话灯/会话徽标进来的：打开后直接把对话区滚进视野（对话本来就内嵌在这里）。 */
+  focusSession?: boolean;
   onClose: () => void;
-  /** 对话已独立成「会话」视图：这里只留入口，点了就切过去并选中这张卡。 */
+  /** 对话的「独立/全屏」入口：切到顶层「会话」视图并选中这张卡。 */
   onOpenSession: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
+  const chatRef = useRef<HTMLDivElement | null>(null);
 
   /**
    * 远端评论**不自动标已读**：打开详情就清零的话，未读高亮（磁贴上的「N 条新评论」）永远看不到。
    * 标已读是人的动作 —— 这里发一枪 `markRemoteCommentsRead`，卡片上的未读随之清零。
    */
   const unreadIds = card.remoteComments.filter((comment) => !comment.read).map((comment) => comment.id);
+
+  // 会话灯那条路：详情一挂上就把对话区滚进视野（换卡也重来一次）
+  useEffect(() => {
+    if (!focusSession) return;
+    chatRef.current?.scrollIntoView({ block: "start", inline: "nearest" });
+  }, [focusSession, card.id]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -188,16 +199,25 @@ export function CardDetail({
             <SessionPanel card={card} />
           </Section>
 
-          <Section title="对话" hint="完整对话搬到了「会话」视图（左栏列表 / 全高转录 / 输入框贴底）">
+          {/* 对话就在卡片里（常用功能不放二级菜单）：转录自己滚、输入框贴底，读与发都在这一屏。
+              下面那行只作「独立/全屏」入口（左栏列表 + 全高转录）。 */}
+          <Section title="对话" hint="直接在这里读转录、发消息；会话跑在卡片的 worktree 里">
+            <div
+              ref={chatRef}
+              className="h-[65vh] min-h-[20rem] scroll-mt-2"
+              data-testid="detail-session-chat"
+            >
+              <SessionChat key={card.id} card={card} />
+            </div>
             <button
               type="button"
               data-testid="open-session-view"
               onClick={onOpenSession}
               className="flex w-full items-center gap-2 rounded-lg border bg-background px-3 py-2 text-left text-xs transition-colors hover:border-foreground/30 hover:bg-accent/40"
             >
-              <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
+              <Maximize2 className="size-4 shrink-0 text-muted-foreground" />
               <span className="font-medium">在会话视图里打开 →</span>
-              <span className="ml-auto text-muted-foreground">默认贴在最底，新消息跟着滚</span>
+              <span className="ml-auto text-muted-foreground">独立/全屏：左栏会话列表 + 全高转录</span>
             </button>
           </Section>
 

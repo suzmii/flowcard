@@ -89,6 +89,8 @@ export function App() {
   const board = useBoard({ includeDeleted: showDeleted });
   const projects = useProjects();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  /** 详情是否要直接对着对话区（从磁贴的会话灯/会话徽标进来时为真）。 */
+  const [focusSession, setFocusSession] = useState(false);
   const [view, setView] = useState<View>(() => readView());
   const [sessionCardId, setSessionCardId] = useState<string | null>(() => readSessionCardId());
   const [refreshing, setRefreshing] = useState(false);
@@ -97,6 +99,23 @@ export function App() {
   const switchView = useCallback((next: View) => {
     setView(next);
     writeView(next);
+  }, []);
+
+  /** 磁贴主点击：打开卡片详情（顶部开始）。 */
+  const openCard = useCallback((id: string) => {
+    setSelectedId(id);
+    setFocusSession(false);
+  }, []);
+
+  /** 磁贴的会话灯/会话徽标：同样打开详情，但直接落在对话区。 */
+  const openCardSession = useCallback((id: string) => {
+    setSelectedId(id);
+    setFocusSession(true);
+  }, []);
+
+  const closeCard = useCallback(() => {
+    setSelectedId(null);
+    setFocusSession(false);
   }, []);
 
   /** 会话视图的选中：写进 localStorage，切视图/刷新都还在。 */
@@ -111,6 +130,7 @@ export function App() {
       pickSessionCard(id);
       switchView("sessions");
       setSelectedId(null);
+      setFocusSession(false);
     },
     [pickSessionCard, switchView],
   );
@@ -291,14 +311,15 @@ export function App() {
           <GraphView
             project={currentProject}
             version={board.lastChangedAt ?? ""}
-            onOpenCard={setSelectedId}
+            onOpenCard={openCard}
           />
         ) : (
           <Board
             cards={visibleCards}
             loading={board.loading}
             selectedId={selectedId}
-            onSelect={setSelectedId}
+            onSelect={openCard}
+            onSelectSession={openCardSession}
           />
         )}
       </main>
@@ -308,7 +329,8 @@ export function App() {
           card={selected}
           cards={cards}
           issueBase={projectIssueBase(currentProject)}
-          onClose={() => setSelectedId(null)}
+          focusSession={focusSession}
+          onClose={closeCard}
           onOpenSession={() => openSessionView(selected.id)}
           onRefresh={board.refresh}
         />

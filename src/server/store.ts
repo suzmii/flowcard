@@ -149,7 +149,8 @@ export type SessionToolEvent = {
 export type SessionMessageInput = {
   cardId: string;
   messageId: string;
-  role: "user" | "assistant" | "tool";
+  /** `thinking` = 模型的思考块（一条消息一个，见 `hosted-session.ts` 的归并规则）。 */
+  role: "user" | "assistant" | "tool" | "thinking";
   at: string;
   text?: string;
   tool?: SessionToolEvent;
@@ -254,7 +255,7 @@ const toSessionMessage = (row: SessionMessageDbRow): SessionMessageRow => {
     cardId: row.card_id,
     seq: row.seq,
     messageId: row.message_id,
-    role: row.role === "user" || row.role === "tool" ? row.role : "assistant",
+    role: row.role === "user" || row.role === "tool" || row.role === "thinking" ? row.role : "assistant",
     at: row.at,
     ...(row.text === null ? {} : { text: row.text }),
     ...(tool === undefined ? {} : { tool }),
