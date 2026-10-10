@@ -1,0 +1,27 @@
+{
+  "name": "flowcard",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node src/server/main.ts",
+    "dev": "node --watch src/server/main.ts",
+    "cli": "node src/cli/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "hono": "^4.9.8",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.8",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
