@@ -31,13 +31,17 @@
 ```ts
 type Session = {
   harness: "omp" | "codex" | "claude" | "other";
-  id: string;              // harness 侧会话标识（omp 用会话文件路径）
+  id: string;              // harness 侧会话标识：omp 用 ctx.sessionManager.getSessionId()（UUID）
+  file?: string;           // omp: getSessionFile()（.jsonl 绝对路径；--no-session 时不存在）
+  agentKind: "main" | "sub";  // 只有 main 才映射到卡片（见下）
   state: "idle" | "running" | "ended" | "lost";  // lost 由心跳超时推出
   startedAt: string;
   lastSeenAt: string;      // 心跳
   resumeHint?: string;     // 会话恢复命令，展示用
 };
 ```
+
+**只有 `agentKind === "main"` 的会话才绑定卡片**：omp 的 subagent 会话同样会触发 `session_start`（M0 实测确认），不过滤就会凭空多出卡片。
 
 ## 3. 流程状态（看板的列）
 
@@ -155,11 +159,21 @@ flowcard list / show <card>                     # 读
 
 | harness | 接入面 | 状态 |
 |---|---|---|
-| omp | 扩展 / hook（`-e`、`--hook`、`omp install ./dir`） | **M0 先打这个 spike** |
+| omp | 单文件扩展 + `omp -e <file>`（`--hook` 是等价别名） | ✅ **M0 已验证** |
 | codex | `hooks` feature（`SessionStart`/`SessionEnd`/…） | 后置 |
 | claude | hooks | 后置 |
 
-存活判定：`heartbeat` TTL 默认 30 s；超时把 `session.state` 标为 `lost`（**只改徽标，不自动改流程状态**——误判会毁掉信任）。适配器崩溃必须**不影响 agent 会话**。
+**M0 实测事实**（omp 18.8.6，证据与复现命令见 `src/adapters/omp/README.md`）：
+
+- 扩展是**单文件模块**，default export 一个接收扩展 API 的工厂函数即可；**不需要 manifest，也不需要 `omp install`**；加载即 `omp -e <file>`。
+- 身份只能从 handler 的**第二参数 ctx** 取（`session_start`/`session_shutdown` 的事件体是空的）：`ctx.sessionManager.getSessionId()`、`ctx.sessionManager.getSessionFile()`、`ctx.cwd`、`ctx.agent = {kind:"main"|"sub", id, …}`。
+- 定时器**必须用 `ctx.setInterval`**（contained + unref + shutdown 自动清理）。裸 `setInterval` 回调抛错会变成进程级 `uncaughtException`，**直接拆掉会话**。
+- 超时预算：普通 handler 30 s，但 `session_shutdown` 只有 **2 s** → 上报的 fetch 超时必须 ≤1.5 s。
+- 失败隔离实测有效：把端点指向没人监听的端口，POST 全部失败而 omp 仍 `exit 0`、无 stderr。
+- **坑（必须按规则处理）**：RPC 里 `new_session` 之后，心跳会切到新的 sessionId **而不再触发 `session_start`**。规则：**卡片绑定的是 claim 时那个 sessionId**；收到未知 sessionId 的心跳 → 不认（记 warn 事件），该卡片的会话照常按 TTL 判失联。
+- 版本风险：omp 官方文档明说扩展 API 会变（18.3 就移除过 `settings.get/set` 字符串路径）→ 适配器必须**独立降级**（失败只写日志），且只依赖最小结构类型，不引 omp 的类型包。
+
+存活判定：`heartbeat` TTL 默认 30 s；超时把 `session.state` 标为 `lost`（**只改徽标，不自动改流程状态**——误判会毁掉信任）。**SIGKILL/强杀时会话不会上报 `session.ended`**（只有正常 dispose 路径会），所以 TTL 是唯一兜底。适配器崩溃必须**不影响 agent 会话**。
 
 ## 9. 数据与运行
 
@@ -171,7 +185,7 @@ flowcard list / show <card>                     # 读
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M0（风险 spike）** | omp 扩展上报 `session.started/heartbeat/ended` 到本地 HTTP | 真实 omp 会话跑一次，三个事件都落库 |
+| **M0（风险 spike）** | ✅ **已完成**：omp 单文件扩展 + `omp -e` 加载，把 `session.started/heartbeat/ended` 打到本地 HTTP | 复现（无推理请求，5 s）：收到 `1 started + 3 heartbeat + 1 ended`，同一 sessionId，omp `exit 0` |
 | **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE | CLI 走完 `open→spec→批准→claim→beat→end→验收`；重启后状态一致；`rebuild` 可重放 |
 | **M2 看板** | React + Vite + shadcn；列=状态，卡片=会话徽标/心跳/恢复按钮/门禁待办 | 浏览器里完成 M1 全部动作，SSE 实时 |
 | **M3 门禁闭环** | `approve`/`confirm`/`review` 三类 + 一事一议的"远程写确认" | agent 申请 push 确认 → 卡片上出现待办 → 点后方可继续 |
