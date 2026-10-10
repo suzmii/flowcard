@@ -139,20 +139,27 @@ function build(): Command {
           source: (opt("source") as "harness" | "flowcard" | undefined) ?? "harness",
         },
       };
-    case "claim":
+    case "claim": {
+      // card 可以不写：服务端按 --cwd 反查是哪张卡片的 worktree（写了 card 就照旧显式绑）。
+      const card = positionals[1];
+      const cwd = opt("cwd");
+      if (!card && !cwd) {
+        die(2, "claim 要么给 <card>，要么给 --cwd 让服务端按会话工作目录反查卡片");
+      }
       return {
         cmd: "claim",
         actor: actor(),
-        card: requireCard(),
+        ...(card ? { card } : {}),
         session: {
           harness: opt("harness") ?? die(2, "claim 需要 --harness"),
           id: opt("session") ?? die(2, "claim 需要 --session <id>"),
-          cwd: opt("cwd") ?? die(2, "claim 需要 --cwd（会话的工作目录，用来校验是否在 worktree 里）"),
+          cwd: cwd ?? die(2, "claim 需要 --cwd（会话的工作目录，用来校验是否在 worktree 里）"),
           agentKind: (opt("kind") as "main" | "sub" | undefined) ?? "main",
           ...(opt("file") ? { file: opt("file")! } : {}),
           ...(opt("resume") ? { resumeHint: opt("resume")! } : {}),
         },
       };
+    }
     case "beat":
       return {
         cmd: "beat",

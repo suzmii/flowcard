@@ -4,15 +4,29 @@
 
 ```
 在卡片的 worktree 里：
-  FLOWCARD_CARD=c1 omp -e /path/to/workspace/flowcard/src/adapters/omp/flowcard-omp-adapter.ts
+  omp -e /path/to/workspace/flowcard/src/adapters/omp/flowcard-omp-adapter.ts
 
 omp 启动 → POST /api/commands {cmd:"claim"}  → 卡片 ready → working（前提：Issue/worktree/PR 已绑齐）
 每 HEARTBEAT_MS → POST {cmd:"beat"}          → lastSeenAt 前进；cwd 漂出 worktree 会记 session.cwd.mismatch
 omp 退出 → POST {cmd:"end"}                  → session.state=ended
 ```
 
-环境变量：`FLOWCARD_URL`（默认 `http://127.0.0.1:47825`）、`FLOWCARD_CARD`（**必给**，否则只写日志不上报）、
+**M6 起不用再给卡片 id**：`claim` 不带 `card` 时，服务端（`store.ts` 的 `resolveClaimCardByCwd`）拿
+全部卡片比一遍 `session.cwd` 落在谁的 `worktree.path` 里（路径段比较，`/a/b` 不匹配 `/a/bc`），
+多张命中取**路径最长**的那个；零命中或并列最长 → `NOT_FOUND`，`hint` 里列出可用卡片当参照物
+（如「可用卡片：c1(/repo/.worktrees/x)、c2(/repo/.worktrees/y)」）。
+适配器拿到响应里的 `card.id` 后才开始心跳/结束上报；**解析失败只记一次日志**（心跳会静默重试，
+不刷屏），会话照常跑。
+
+环境变量：`FLOWCARD_URL`（默认 `http://127.0.0.1:47825`）、`FLOWCARD_CARD`（**可选**，显式覆盖自动解析）、
 `FLOWCARD_HEARTBEAT_MS`（默认 15000）、`FLOWCARD_OMP_LOG`（默认 `/tmp/omp-adapter.log`）。
+
+CLI 等价用法（不写 card，由服务端按 `--cwd` 反查）：
+
+```bash
+flowcard claim <card> --harness omp --session <id> --cwd <worktree 路径>   # 老写法，照旧可用
+flowcard claim         --harness omp --session <id> --cwd <worktree 路径>   # 不写 card → 服务端解析
+```
 
 行为约定（都来自下面的 M0 实测）：
 

@@ -9,7 +9,7 @@
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
 import { shortHash } from "../shared/hash.ts";
-import type { Card, Command, EventType, Rejection } from "../shared/types.ts";
+import type { Card, Command, CwdClaimResolution, EventType, Rejection } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 
 export type CommandOutcome = {
@@ -24,12 +24,20 @@ export type CommandOutcome = {
 
 const MAX_DERIVED_EVENTS = 50;
 
+/** 带 card 的命令的卡片 id；claim 允许不写（由 cwd 解析），所以是 string | undefined。 */
+const cardIdOf = (cmd: Command): string | undefined => ("card" in cmd ? cmd.card : undefined);
+
 export function runCommand(input: {
   flow: Flow;
   getCard: (id: string) => Card | undefined;
   cmd: Command;
   now: string;
   newCardId: () => string;
+  /**
+   * `claim` 没给 card 时用它按 cwd 找卡片。解析要读全部卡片（IO），所以由 server/store 注入，
+   * 引擎自己保持纯函数；没注入（如测试 harness 不关心）时 claim 不给 card 会直接 NOT_FOUND。
+   */
+  resolveCardByCwd?: (cwd: string) => CwdClaimResolution;
 }): CommandOutcome {
   const { flow, cmd, now } = input;
   const local = new Map<string, Card>();
@@ -65,7 +73,7 @@ export function runCommand(input: {
   const fail = (r: Rejection): CommandOutcome => ({
     events: [],
     cards: {},
-    primaryCardId: "card" in cmd ? cmd.card : "",
+    primaryCardId: cardIdOf(cmd) ?? "",
     rejection: r,
     notes,
   });
@@ -91,7 +99,7 @@ export function runCommand(input: {
 
   // ------------------------------------------------------------ A 段：命令事实
 
-  let primaryCardId = "card" in cmd ? cmd.card : "";
+  let primaryCardId = cardIdOf(cmd) ?? "";
 
   switch (cmd.cmd) {
     case "open": {
@@ -326,14 +334,32 @@ export function runCommand(input: {
     }
 
     case "claim": {
-      const card = get(cmd.card);
-      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
       if (cmd.session.agentKind !== "main") {
         return fail({
           code: "USAGE_ERROR",
           message: "只有 main 会话能绑定卡片（subagent 归 harness 自己管）",
         });
       }
+      let cardId = cmd.card;
+      if (!cardId) {
+        // 没给 card：按会话 cwd 在全部卡片里找 worktree。解析失败要能直接告诉人「在哪个目录里跑才有卡」。
+        const resolved = input.resolveCardByCwd?.(cmd.session.cwd);
+        if (!resolved || "error" in resolved) {
+          return fail({
+            code: "NOT_FOUND",
+            message:
+              resolved?.error.message ??
+              `cwd ${cmd.session.cwd} 解析不到卡片（这个实例没装 cwd 解析）`,
+            hint:
+              resolved?.error.hint ??
+              "在卡片的 worktree 目录里启动会话，或显式指定 FLOWCARD_CARD=<card>",
+          });
+        }
+        cardId = resolved.cardId;
+        primaryCardId = cardId;
+      }
+      const card = get(cardId);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` });
       const current = card.session;
       if (current && current.state === "running" && current.id !== cmd.session.id) {
         return fail({
@@ -344,10 +370,10 @@ export function runCommand(input: {
       }
       // 幂等键带上 cwd：同一会话从新目录再 claim（omp 的 /wt、/move 之后）要能刷新记录
       emit(
-        cmd.card,
+        cardId,
         "session.started",
         { session: cmd.session },
-        `claim:${cmd.card}:${cmd.session.id}:${shortHash(cmd.session.cwd)}`,
+        `claim:${cardId}:${cmd.session.id}:${shortHash(cmd.session.cwd)}`,
       );
       break;
     }

@@ -6,7 +6,8 @@ import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { Flow } from "../shared/flow.ts";
-import type { Actor, Card, Command, Event } from "../shared/types.ts";
+import { isInside, normalizePath } from "../shared/paths.ts";
+import type { Actor, Card, Command, CwdClaimResolution, Event } from "../shared/types.ts";
 import { runCommand, type CommandOutcome } from "./engine.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 
@@ -16,6 +17,60 @@ export type ExecuteResult = {
   duplicates: number;
   card: Card | undefined;
 };
+
+/** 解析失败时给出的 message / hint 各自的上限（要能一眼读完，又要带参照物）。 */
+const CLAIM_HINT_BUDGET = 200;
+
+const clip = (s: string, max: number): string => (s.length <= max ? s : `${s.slice(0, max - 1)}…`);
+
+/**
+ * `claim` 没给 card 时的回退解析：会话 cwd 落在哪张卡片的 worktree 里。
+ *
+ * - 命中多张 → 取 `worktree.path` 最长的（最具体的 worktree 赢）；
+ * - 零命中，或并列最长（拿不到唯一解）→ 返回 `error`，message/hint 里带上现有卡片当参照物。
+ *
+ * 纯函数（只读传进来的卡片数组），所以引擎注入它就行，不用碰 IO。
+ */
+export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResolution {
+  const cands = cards.flatMap((c) =>
+    c.worktree ? [{ id: c.id, raw: c.worktree.path, path: normalizePath(c.worktree.path) }] : [],
+  );
+  // 参照物里的路径太长就只留尾巴：hint 是给人定位用的，不是让人读全路径。
+  const listed = cands
+    .map((c) => `${c.id}(${c.raw.length <= 40 ? c.raw : `…${c.raw.slice(-36)}`})`)
+    .join("、");
+  const hits = cands.filter((c) => isInside(cwd, c.path));
+
+  if (hits.length === 0) {
+    return {
+      error: {
+        message: clip(`cwd ${cwd} 没有对应任何卡片的 worktree`, CLAIM_HINT_BUDGET),
+        hint: clip(
+          cands.length === 0
+            ? "这个实例还没有带 worktree 的卡片：先 flowcard open 建卡并绑 worktree，再在 worktree 里启动会话"
+            : `可用卡片：${listed}。在对应 worktree 里启动会话才会自动绑卡；也可用 FLOWCARD_CARD=cN 显式指定`,
+          CLAIM_HINT_BUDGET,
+        ),
+      },
+    };
+  }
+
+  hits.sort((a, b) => b.path.length - a.path.length);
+  const most = hits.filter((h) => h.path === hits[0]!.path);
+  if (most.length > 1) {
+    return {
+      error: {
+        message: clip(
+          `cwd ${cwd} 同时落在 ${most.length} 张卡片的同一个 worktree 里：${most.map((h) => h.id).join("、")}`,
+          CLAIM_HINT_BUDGET,
+        ),
+        hint: "这些卡片的 worktree.path 完全相同，无法自动选；用 FLOWCARD_CARD=cN 显式指定",
+      },
+    };
+  }
+
+  return { cardId: hits[0]!.id };
+}
 
 /**
  * 投影格式版本：**改动 `Card` 的形态（增删槽位）时把它 +1**。
@@ -172,6 +227,7 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       cmd,
       now,
       newCardId: nextCardId,
+      resolveCardByCwd: (cwd) => resolveClaimCardByCwd(cwd, listCards()),
     });
     if (outcome.rejection) {
       return { outcome, inserted: [], duplicates: 0, card: undefined };

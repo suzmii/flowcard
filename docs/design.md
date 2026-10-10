@@ -121,6 +121,7 @@ type WorktreeRef = { path: string; branch: string;
 2. 未通过时卡片停在 `ready`，并给出确切修复动作：`/wt <branch>`（方式 A）或 `/move <path>`（方式 B）+ 在 worktree 里重开会话的命令。
 3. 进入 `working` 之后若 `cwd` 漂出 worktree（`/move` 回主干等）→ 记 `card.cwd.mismatch` 事件，卡片显示警告并回到"未在 worktree"状态（**不改流程状态**，只提示 + 门禁收紧：不许提交、不许 `review`）。
 4. `worktree` 槽位里的 `path`/`branch` 优先**从 cwd 反查**（`git -C <cwd> rev-parse --show-toplevel --abbrev-ref HEAD`），避免人手工填错；期望落在项目仓库的 `.worktrees/` 下，不在则记警告但仍接受。
+5. **卡片自动识别（M6）**：会话不用再报卡片 id——适配器 `claim` 不给 `card`，服务端按 `session.cwd` 落在谁的 `worktree.path` 里反查（路径段比较，`/a/b` 不匹配 `/a/bc`；多张命中取**路径最长**的那个），零命中或并列最长就回 `NOT_FOUND`，`hint` 里列出可用卡片当参照物。`FLOWCARD_CARD` 保留为显式覆盖。
 
 ### 3.2 卡片可以启动自己的项目（运行时）
 
@@ -281,7 +282,7 @@ flowcard open   --title "…" [--body …] [--repo <path>]   # 开卡（inbox）
 flowcard issue  <card> --create | --bind <repo>#<n>      # 建或绑定 Issue（→ issue 列）
 flowcard plan   <card> --body "方案…"                     # 写方案并申请 G1
 flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
-flowcard claim  <card> --harness omp --session <id>       # 领卡（会话说：我开始了）
+flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 领卡；不给 card 时服务端按 cwd 反查
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
 flowcard confirm <card> --request --for push --detail "git push -u origin feat/x"  # 申请一次远程写确认（G2）
@@ -309,6 +310,12 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | omp | 单文件扩展 + `omp -e <file>`（`--hook` 是等价别名） | ✅ **M0 已验证** |
 | codex | `hooks` feature（`SessionStart`/`SessionEnd`/…） | 后置 |
 | claude | hooks | 后置 |
+
+**M6（卡片自动识别，已完成）**：适配器 `claim` 不带 `card` → 服务端按会话 `cwd` 反查 `worktree.path`
+（路径段比较；多命中取最长；零命中/并列回 `NOT_FOUND` + 可用卡片参照物）；适配器拿到响应里的
+`card.id` 后才开始心跳/结束上报，解析失败只记**一次**日志（心跳静默重试），绝不影响会话。
+`FLOWCARD_CARD` 保留为显式覆盖；CLI 侧 `flowcard claim --harness omp --session <id> --cwd <路径>`
+同样可以不写 card。
 
 **M0 实测事实**（omp 18.8.6，证据与复现命令见 `src/adapters/omp/README.md`）：
 
@@ -338,6 +345,6 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M3 运行时** | 每卡启动按钮：项目启动配置（`.flowcard.toml`）、进程组启停与日志、**单例不变式**（启动一张卡就停掉其他卡的运行时）、状态进事件流 | 配好配置的项目能一键起停；启 B 之后 A 的进程确实死了（`ps` 验证）；进程组杀干净 |
 | **M4 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
 | **M5 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |
-| **M6 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上 |
+| **M6 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定、**按会话 cwd 自动认卡**）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上（worktree 里启动 omp，不用给卡片 id） |
 
 顺序：M1 → M2 → M3 → M4 → M5 → M6（M0、M1 已完成）。

@@ -301,7 +301,11 @@ export const commandSchema = z.discriminatedUnion("cmd", [
   z.object({
     cmd: z.literal("claim"),
     actor: actorSchema,
-    card: z.string().min(1),
+    /**
+     * 卡片 id **可选**：不写时由服务端按 `session.cwd` 落在哪张卡片的 worktree 里解析
+     * （`FLOWCARD_CARD` 是显式覆盖）。解析要读全部卡片，所以引擎只收 store 注入的回调。
+     */
+    card: z.string().min(1).optional(),
     session: sessionInSchema,
     dedupeKey: z.string().optional(),
   }),
@@ -451,6 +455,15 @@ export const commandSchema = z.discriminatedUnion("cmd", [
 ]);
 
 export type Command = z.infer<typeof commandSchema>;
+
+/**
+ * `claim` 不带 `card` 时的解析结果。
+ *
+ * 解析规则（实现在 `server/store.ts`）：cwd 落在某张卡片 `worktree.path` 之内（路径段比较，
+ * `/a/b` 不匹配 `/a/bc`）就算命中；多张命中取路径最长的那个；零命中或有并列最长（拿不到唯一解）
+ * 就返回 `error`。message/hint 由 store 拼好（它才知道有哪些卡片），引擎只原样转述。
+ */
+export type CwdClaimResolution = { cardId: string } | { error: { message: string; hint: string } };
 
 /** POST /api/cards/:id/runtime 的 body。 */
 export const runtimeActionSchema = z.object({ action: z.enum(["up", "down"]) });
