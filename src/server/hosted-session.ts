@@ -769,13 +769,12 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       }
       case "text_end": {
         // 权威块文本到了：先落一次（这样 message_end 丢了也还有）。
+        // **正文为空就不落**：omp 的一条助手消息可能只有思考/工具调用，
+        // 落一条空 assistant 行会让网页渲染出空的「助手：」卡片（用户报过）。
         const id = externalId(live, event.messageId);
-        persist(live, {
-          id,
-          role: "assistant",
-          at: seenAt(live, event.messageId),
-          text: live.session.textFor(event.messageId) ?? event.text,
-        });
+        const text = live.session.textFor(event.messageId) ?? event.text;
+        if (text.trim() === "") break;
+        persist(live, { id, role: "assistant", at: seenAt(live, event.messageId), text });
         break;
       }
       case "thinking": {
@@ -811,6 +810,8 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         }
         const text = event.text ?? live.session.textFor(event.messageId) ?? "";
         const at = seenAt(live, event.messageId);
+        // 空正文不落库也不推（见 text_end 的注释）；工具与思考是独立角色，不受影响
+        if (text.trim() === "") break;
         persist(live, { id, role: "assistant", at, text });
         emit(live, { type: "message_end", id, role: "assistant", text, at });
         break;
@@ -901,7 +902,15 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
 
   const sessionEnv = (cardId: string): NodeJS.ProcessEnv => {
     const base = deps.baseUrl ?? `http://${process.env.FLOWCARD_HOST ?? "127.0.0.1"}:${process.env.FLOWCARD_PORT ?? "47825"}`;
-    const env: NodeJS.ProcessEnv = { ...process.env, FLOWCARD_CARD: cardId, FLOWCARD_URL: base };
+    // 身份注入：会话里的 agent 调 `flowcard` 时才知道"我是 agent、harness 是 omp"，
+    // 否则它写的评论会被记成人类（用户报过：AI 的评论显示作者是"我"）。
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      FLOWCARD_CARD: cardId,
+      FLOWCARD_URL: base,
+      FLOWCARD_ACTOR_KIND: "agent",
+      FLOWCARD_HARNESS: "omp",
+    };
     if (deps.logDir !== undefined) env["FLOWCARD_OMP_LOG"] = `${deps.logDir}/omp-${cardId}.log`;
     return { ...env, ...(deps.env ?? {}) };
   };

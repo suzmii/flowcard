@@ -94,6 +94,16 @@ function actor(): Actor {
   if (harness) {
     return { kind: "agent", harness, ...(sessionId ? { sessionId } : {}) };
   }
+  // 会话里跑的 agent 不该靠"记得加 --harness"：托管会话会把身份注入环境（见 hosted-session.ts），
+  // 这里优先认它 —— 否则 agent 写的评论会被记成人类（用户报过"AI 的消息显示作者是我"）。
+  if (process.env["FLOWCARD_ACTOR_KIND"] === "agent") {
+    const fromEnv = process.env["FLOWCARD_SESSION_ID"];
+    return {
+      kind: "agent",
+      harness: process.env["FLOWCARD_HARNESS"] ?? "omp",
+      ...(fromEnv ? { sessionId: fromEnv } : {}),
+    };
+  }
   return { kind: "human", name: opt("as") ?? process.env.USER ?? "human" };
 }
 

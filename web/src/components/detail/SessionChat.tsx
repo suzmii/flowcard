@@ -668,7 +668,10 @@ export function SessionChat({
             {loading && messages.length === 0 ? (
               <p className="text-xs text-muted-foreground">读取会话转录…</p>
             ) : null}
-            {messages.map((message) => (
+            {messages
+              // 修复前落库的空助手行（omp 那种"只有思考/工具调用、没有正文"的消息）不渲染
+              .filter((message) => !(message.role === "assistant" && (message.text ?? "").trim() === ""))
+              .map((message) => (
               <MessageRow key={message.id} message={message} />
             ))}
             {view.notices.length > 0 ? (
