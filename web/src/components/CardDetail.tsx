@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { postCommand } from "@/lib/api";
 import { STATE_LABELS, STATE_TONE } from "@/lib/contract";
 import type { IssueBase } from "@/lib/projects";
+import { cardActivity, cardNextStep } from "@/lib/activity";
 import type { CardView } from "@/lib/schema";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -119,6 +120,10 @@ export function CardDetail({
             <h2 className="text-sm font-semibold leading-snug">{card.title}</h2>
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               <Badge variant="outline">{STATE_LABELS[card.state]}</Badge>
+              <span className="text-xs text-muted-foreground" data-testid="detail-activity">
+                当前：{cardActivity(card).filter((a) => a.key !== "session-cwd").slice(0, 3).map((a) => a.label).join(" · ") || "—"}
+                {" · "}下一步：{cardNextStep(card)}
+              </span>
               <Badge variant="muted" className="font-mono">
                 {card.id}
               </Badge>

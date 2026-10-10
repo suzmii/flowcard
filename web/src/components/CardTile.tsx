@@ -1,6 +1,7 @@
 import { CircleDot, GitPullRequest, Lock, MessageSquare, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { RUNTIME_TONE, SESSION_STATE_LABELS } from "@/lib/contract";
+import { cardActivity } from "@/lib/activity";
 import type { CardView } from "@/lib/schema";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -20,6 +21,7 @@ export function CardTile({
   selected: boolean;
   onSelect: (id: string) => void;
 }) {
+  const activity = cardActivity(card);
   const openGates = Object.values(card.gates).filter((gate) => gate.status === "open");
   const runtime = card.runtime ?? null;
   const unreadComments = card.remoteComments.filter((comment) => !comment.read).length;
@@ -77,6 +79,16 @@ export function CardTile({
             <GitPullRequest className="opacity-40" />无 PR
           </Badge>
         )}
+
+        {activity.length > 0 ? (
+          <span className="flex flex-wrap items-center gap-1" data-testid="tile-activity">
+            {activity.slice(0, 2).map((signal) => (
+              <Badge key={signal.key} variant={signal.tone} title={signal.detail ?? signal.label} data-testid={`tile-activity-${signal.key}`}>
+                {signal.label}
+              </Badge>
+            ))}
+          </span>
+        ) : null}
 
         {openGates.length > 0 ? (
           <Badge variant="warning" title={openGates.map((gate) => `${gate.id} ${gate.title}`).join(" / ")}>
