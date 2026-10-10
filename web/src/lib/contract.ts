@@ -2,11 +2,14 @@
  * 唯一一处跨边界引用：类型从 `src/shared/types.ts` 走 `import type`（编译期擦除，不进 bundle）；
  * 两个字面量表在前端本地镜像，并用类型断言锁死与共享契约的一致性（见文件末尾的编译期检查）。
  */
-import type { CardState, RuntimeStatus } from "../../../src/shared/types.ts";
+import type { CardState, ConfirmAction, ConfirmStatus, RuntimeStatus } from "../../../src/shared/types.ts";
 
 export type {
   Card,
   CardState,
+  ConfirmAction,
+  ConfirmStatus,
+  Confirmation,
   Gate,
   Runtime,
   RuntimeAction,
@@ -66,6 +69,21 @@ export const GATE_STATUS_LABELS: Record<string, string> = {
   rejected: "已驳回",
 };
 
+/** G2 远程写确认（`card.confirmations`）：一次授权只覆盖一次动作。 */
+export const CONFIRM_ACTION_LABELS: Record<ConfirmAction, string> = {
+  push: "推送 push",
+  openPr: "开/改 PR",
+  commentRemote: "远程评论",
+  merge: "合并 merge",
+  other: "其他远程写",
+};
+
+export const CONFIRM_STATUS_LABELS: Record<ConfirmStatus, string> = {
+  pending: "待批",
+  approved: "已批准",
+  rejected: "已驳回",
+};
+
 /**
  * 运行时（`card.runtime`）：契约在 `src/shared/types.ts` 的 `Runtime`。
  * 后端可能还没把 `POST /api/cards/:id/runtime` 挂上，所以 UI 侧对 null 与 404 都要能降级。
@@ -94,3 +112,5 @@ type _StatesExactlyMatch =
   Assert<Equal<(typeof CARD_STATES)[number], CardState>>;
 type _LabelsAreExhaustive = Assert<Equal<keyof typeof STATE_LABELS, CardState>>;
 type _RuntimeLabelsAreExhaustive = Assert<Equal<keyof typeof RUNTIME_LABELS, RuntimeStatus>>;
+type _ConfirmActionLabelsAreExhaustive = Assert<Equal<keyof typeof CONFIRM_ACTION_LABELS, ConfirmAction>>;
+type _ConfirmStatusLabelsAreExhaustive = Assert<Equal<keyof typeof CONFIRM_STATUS_LABELS, ConfirmStatus>>;

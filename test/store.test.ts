@@ -2,6 +2,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { personalFlow } from "../src/flow/personal.ts";
 import { createStore } from "../src/server/store.ts";
@@ -94,6 +95,28 @@ describe("存储", () => {
     expect(rejected.inserted).toHaveLength(0);
     expect(store.listEvents().filter((e) => e.cardId === id)).toHaveLength(1);
     store.close();
+  });
+
+  it("投影格式升级：老库（缺新槽位 + 版本号旧）启动时自动重建", () => {
+    const dir = mkdtempSync(join(tmpdir(), "flowcard-projver-"));
+    const first = createStore({ dataDir: dir, flow: personalFlow });
+    const id = first.execute(
+      { cmd: "open", actor: HUMAN, title: "老库", body: "" },
+      "2026-10-10T00:00:00.000Z",
+    ).outcome.primaryCardId;
+    first.close();
+
+    // 造出"代码升级前"的样子：投影里没有 confirmations，且版本号是旧的
+    const db = new DatabaseSync(join(dir, "flowcard.sqlite"));
+    db.exec("UPDATE cards SET card = REPLACE(card, '\"confirmations\":', '\"confirmations_old\":')");
+    db.exec("UPDATE meta SET value = '1' WHERE key = 'projection_version'");
+    db.close();
+
+    const second = createStore({ dataDir: dir, flow: personalFlow });
+    const card = second.getCard(id);
+    expect(card?.confirmations).toEqual([]);
+    expect(card?.title).toBe("老库");
+    second.close();
   });
 
   it("重启后卡片仍在（事件落盘）", () => {

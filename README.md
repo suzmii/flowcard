@@ -25,6 +25,10 @@ node src/cli/main.ts worktree c1 --path .worktrees/x --branch feat/x
 node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch feat/x
 node src/cli/main.ts claim c1 --harness omp --session <id> --cwd .worktrees/x
 node src/cli/main.ts push c1 --sha <sha>
+node src/cli/main.ts confirm c1 --request --for push --detail "git push -u origin feat/x"
+node src/cli/main.ts confirm c1 --list                  # 人看完 detail 再批：只覆盖这一次动作
+node src/cli/main.ts confirm c1 --approve cf1 --reason "看过了"
+node src/cli/main.ts confirm c1 --consume cf1           # agent 执行完回报：这条授权作废
 node src/cli/main.ts end c1 --summary "做完了"
 node src/cli/main.ts accept c1                          # 人验收
 node src/cli/main.ts cleanup c1 --item "删 .worktrees/x" --item "删分支 feat/x"

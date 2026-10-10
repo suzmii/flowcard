@@ -66,6 +66,20 @@ const pushSchema = z.looseObject({
   actor: actorSchema,
 });
 
+/** G2 远程写确认（`Card.confirmations`）。 */
+const confirmationSchema = z.looseObject({
+  id: z.string(),
+  action: z.enum(["push", "openPr", "commentRemote", "merge", "other"]),
+  detail: z.string(),
+  status: z.enum(["pending", "approved", "rejected"]),
+  requestedAt: z.string(),
+  requestedBy: actorSchema,
+  decidedAt: z.string().optional(),
+  decidedBy: z.string().optional(),
+  reason: z.string().optional(),
+  consumedAt: z.string().optional(),
+});
+
 const commentSchema = z.looseObject({
   id: z.string(),
   at: z.string(),
@@ -94,6 +108,7 @@ export const cardViewSchema = z.looseObject({
   session: sessionSchema.nullable(),
   runtime: runtimeSchema.nullable(),
   gates: z.record(z.string(), gateSchema),
+  confirmations: z.array(confirmationSchema),
   pushes: z.array(pushSchema),
   comments: z.array(commentSchema),
   partOf: z.string().optional(),
@@ -119,7 +134,7 @@ export const commandsResponseSchema = z.looseObject({
   ok: z.boolean(),
   card: cardViewSchema.optional(),
   inserted: z.number().optional(),
-  duplicates: z.array(z.string()).optional(),
+  duplicates: z.number().optional(),
   notes: z.array(z.string()).optional(),
   rejection: rejectionSchema.optional(),
   blocked: z.looseObject({ missing: z.array(z.string()) }).optional(),

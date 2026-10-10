@@ -178,11 +178,27 @@ stateDiagram-v2
 | 门禁 | 位置 | 批什么 |
 |---|---|---|
 | `G1 approve` | `issue → ready` | 方案（原因、改法、验收）批准后才许开工 |
-| `G2 confirm` | 任何**远程写**：建 Issue、push、开/改 PR、远程评论、合并 | **一事一议**：一次授权只覆盖一次动作，payload 带上将要执行的确切命令/URL |
+| `G2 confirm` | 任何**远程写**：建 Issue、push、开/改 PR、远程评论、合并 | **一事一议**：一次授权只覆盖一次动作，`detail` 带上将要执行的确切命令/URL |
 | `G3 review` | `review → 等合并` | 明确验收（不看内容不算过） |
 | `G4 cleanup` | `merged → done` | 先报告"删什么、为什么现在可以删、对应 PR 状态"，同意后才执行 |
 
 约定：一张卡同一时刻**最多一个未决门禁**；门禁带 `requestedBy`、`payload`、`decision`（approved/rejected + 理由）。
+
+### 5.1 G2 是凭据，不是流程节点
+
+上面那条「最多一个未决」只管 G1/G3/G4。**G2 不占 `card.gates`，单独放 `card.confirmations`**：它是「这一次操作」的一次性授权，可以有多条、有历史、可以重复申请。
+
+```
+agent: requestConfirm{action, detail}   → confirm.requested（pending，detail = 将执行的确切命令/URL）
+人:    decideConfirm{id, approved|rejected, reason?} → confirm.decided
+agent: consumeConfirm{id}               → confirm.consumed（这条授权就此作废）
+```
+
+- **一次批准只覆盖一次动作**：`consumeConfirm` 成功后再执行第二次远程写，必须重新 `requestConfirm`（被 consume / 被驳回的那张永久失效，不能再被 consume）。
+- 从措辞推断授权一律不算：`detail` 必须是**这条命令或这个 URL**，且长度有下限；空话、模糊描述连申请都提交不了。
+- 驳回**必须写理由**，否则报 `USAGE_ERROR`（agent 要靠它改 detail 再申请）。
+- 看板**只申请 / 批准 / 记录**（设计 §10）：`git push`、`tea pr create` 由 agent 或人自己敲。
+- 幂等：同一条申请重复发送不会产生第二条；但一件已经结算（用掉/被拒）的事再申请，算**新的一次申请**。
 
 ## 6. 事件日志是真相
 
@@ -268,6 +284,11 @@ flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktr
 flowcard claim  <card> --harness omp --session <id>       # 领卡（会话说：我开始了）
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
+flowcard confirm <card> --request --for push --detail "git push -u origin feat/x"  # 申请一次远程写确认（G2）
+flowcard confirm <card> [--list]                          # 看这张卡的确认与历史（含已批准未用；不给动作标志就是列）
+flowcard confirm <card> --approve <cf-id> [--reason "…"]   # 人批准：只覆盖这一次动作
+flowcard confirm <card> --reject <cf-id> --reason "…"      # 人驳回：理由必填
+flowcard confirm <card> --consume <cf-id>                 # agent 回报：这张授权已经用掉
 flowcard beat   <card> --harness omp --session <id>
 flowcard end    <card> --summary "…"                      # 交回（→ review）
 flowcard accept <card>                                    # 人验收（G3）

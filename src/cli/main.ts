@@ -3,7 +3,7 @@
  * 契约：stdout 永远是一行 JSON；退出码 0 成功 / 2 用法 / 3 状态不允许 / 4 缺必要条件 / 5 服务不可达。
  */
 import { parseArgs } from "node:util";
-import type { Actor, Command } from "../shared/types.ts";
+import { CONFIRM_ACTIONS, type Actor, type Command, type ConfirmAction } from "../shared/types.ts";
 
 const DEFAULT_URL = process.env.FLOWCARD_URL ?? `http://127.0.0.1:${process.env.FLOWCARD_PORT ?? "47825"}`;
 
@@ -26,6 +26,12 @@ const { values, positionals } = parseArgs({
     gate: { type: "string" },
     approve: { type: "boolean" },
     reject: { type: "boolean" },
+    request: { type: "boolean" },
+    consume: { type: "boolean" },
+    list: { type: "boolean" },
+    "for": { type: "string" },
+    detail: { type: "string" },
+    id: { type: "string" },
     reason: { type: "string" },
     path: { type: "string" },
     branch: { type: "string" },
@@ -175,6 +181,52 @@ function build(): Command {
       };
     case "push":
       return { cmd: "push", actor: actor(), card: requireCard(), sha: opt("sha") ?? die(2, "push 需要 --sha") };
+    /**
+     * G2 远程写确认。一次授权只覆盖一次动作：
+     *   申请 → 批准 → 执行 → consume；下一次写要重新申请。
+     * 确认 id 可以写成位置参数（--approve cf1）或用 --id cf1。
+     */
+    case "confirm": {
+      const card = requireCard();
+      const request = values.request === true;
+      const consume = values.consume === true;
+      const approved = values.approve === true;
+      const rejected = values.reject === true;
+      const picked = [request, consume, approved, rejected].filter(Boolean).length;
+      if (picked === 0) {
+        die(2, "confirm 需要动作标志：--request / --approve <id> / --reject <id> / --consume <id>");
+      }
+      if (picked > 1) die(2, "confirm 一次只做一件事：--request / --approve / --reject / --consume 选一个");
+
+      if (request) {
+        const action = opt("for") ?? die(2, "confirm --request 需要 --for <push|openPr|commentRemote|merge|other>");
+        if (!(CONFIRM_ACTIONS as readonly string[]).includes(action)) {
+          die(2, `--for 只能是 ${CONFIRM_ACTIONS.join(" / ")}，收到 "${action}"`);
+        }
+        return {
+          cmd: "requestConfirm",
+          actor: actor(),
+          card,
+          action: action as ConfirmAction,
+          detail:
+            opt("detail") ?? die(2, 'confirm --request 需要 --detail "<将执行的确切命令或 URL>"'),
+        };
+      }
+
+      const id = opt("id") ?? positionals[2];
+      if (!id) die(2, `confirm ${approved ? "--approve" : rejected ? "--reject" : "--consume"} 需要确认 id（形如 cf1）`);
+      if (approved || rejected) {
+        return {
+          cmd: "decideConfirm",
+          actor: actor(),
+          card,
+          id,
+          decision: approved ? "approved" : "rejected",
+          ...(opt("reason") ? { reason: opt("reason")! } : {}),
+        };
+      }
+      return { cmd: "consumeConfirm", actor: actor(), card, id };
+    }
     case "end":
       return {
         cmd: "end",
@@ -237,7 +289,7 @@ function build(): Command {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
   }
 }
 
@@ -245,7 +297,7 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
     process.exit(0);
   }
 
@@ -265,6 +317,33 @@ async function main(): Promise<void> {
     const res = await fetch(`${DEFAULT_URL}/api/cards/${requireCard()}`);
     process.stdout.write(`${JSON.stringify(await res.json())}\n`);
     process.exit(res.ok ? 0 : 3);
+  }
+
+  // 「列确认」是读（不改状态）：没给动作标志（或显式 --list）就列出这张卡的所有确认。
+  if (name === "confirm") {
+    const acting =
+      values.request === true ||
+      values.consume === true ||
+      values.approve === true ||
+      values.reject === true;
+    if (acting && values.list === true) {
+      die(2, "confirm 的 --list 不能和 --request / --approve / --reject / --consume 一起用");
+    }
+    if (!acting) {
+      const card = requireCard();
+      const res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}`);
+      const data = (await res.json().catch(() => null)) as { card?: { confirmations?: unknown } } | null;
+      if (!res.ok || !data?.card) {
+        process.stdout.write(
+          `${JSON.stringify({ ok: false, rejection: { code: "NOT_FOUND", message: `卡片 ${card} 不存在` } })}\n`,
+        );
+        process.exit(3);
+      }
+      process.stdout.write(
+        `${JSON.stringify({ ok: true, card, confirmations: data.card.confirmations ?? [] })}\n`,
+      );
+      process.exit(0);
+    }
   }
 
   // 启动/停止卡片运行时：不是命令（引擎不碰进程），直接打运行时端点。

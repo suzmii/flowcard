@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { CircleSlash, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
+import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
 import { SessionPanel } from "@/components/detail/SessionPanel";
@@ -153,6 +154,10 @@ export function CardDetail({
 
           <Section title="门禁" hint="未决门禁可在这里批准/驳回">
             <GatePanel card={card} busy={busy} onRun={run} />
+          </Section>
+
+          <Section title="远程写确认（G2）" hint="一事一议：一次批准只覆盖一次动作">
+            <ConfirmPanel card={card} busy={busy} onRun={run} />
           </Section>
 
           <Section title="运行时" hint="/api/cards/:id/runtime">

@@ -205,6 +205,106 @@ export function runCommand(input: {
       break;
     }
 
+    /**
+     * G2：申请一次远程写确认。detail 就是「将执行的确切命令 / URL」，人照它做判断。
+     *
+     * 幂等键带上「同样内容的确认里已经结算（被驳回或已 consume）的条数」：
+     * - 重复发送同一条申请 → 键相同 → 不产生第二条（幂等）；
+     * - 用掉/被拒之后再申请同样的一件事 → 结算数变了 → 是新的一次申请。
+     *   （否则「第二次写必须重新申请」会被自己的幂等键吞掉，agent 永远申请不出来。）
+     */
+    case "requestConfirm": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const settled = card.confirmations.filter(
+        (c) =>
+          c.action === cmd.action &&
+          c.detail === cmd.detail &&
+          (c.status === "rejected" || c.consumedAt !== undefined),
+      ).length;
+      emit(
+        cmd.card,
+        "confirm.requested",
+        { action: cmd.action, detail: cmd.detail },
+        `confirm:${cmd.card}:${cmd.action}:${shortHash(cmd.detail)}:${settled}`,
+      );
+      break;
+    }
+
+    /** G2 决策：批准 / 驳回（驳回必须给理由——下一次申请才知道该怎么改）。 */
+    case "decideConfirm": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const target = card.confirmations.find((c) => c.id === cmd.id);
+      if (!target) {
+        return fail({
+          code: "NOT_FOUND",
+          message: `确认 ${cmd.id} 不存在`,
+          hint: `flowcard confirm ${cmd.card} --list 看这张卡现有的确认`,
+        });
+      }
+      if (target.status !== "pending") {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `确认 ${cmd.id} 已经是 ${target.status === "approved" ? "已批准" : "已驳回"}，不能重复决策`,
+        });
+      }
+      if (cmd.decision === "rejected" && !cmd.reason?.trim()) {
+        return fail({
+          code: "USAGE_ERROR",
+          message: `驳回确认 ${cmd.id} 必须给理由`,
+          hint: "写清为什么不许：agent 要靠它改 detail 再申请一次",
+        });
+      }
+      emit(
+        cmd.card,
+        "confirm.decided",
+        { id: cmd.id, decision: cmd.decision, ...(cmd.reason ? { reason: cmd.reason } : {}) },
+        `confirm:${cmd.card}:${cmd.id}:${cmd.decision}`,
+      );
+      break;
+    }
+
+    /**
+     * G2：agent 回报「这次授权已经用掉了」。**一次批准只覆盖一次动作**，
+     * 所以只有 approved 且没 consumedAt 才能成功；失败情形要分得开。
+     */
+    case "consumeConfirm": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const target = card.confirmations.find((c) => c.id === cmd.id);
+      if (!target) {
+        return fail({
+          code: "NOT_FOUND",
+          message: `确认 ${cmd.id} 不存在`,
+          hint: `flowcard confirm ${cmd.card} --list 看这张卡现有的确认`,
+        });
+      }
+      if (target.status === "pending") {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `确认 ${cmd.id} 还没被批准，不能使用`,
+          hint: `先批准：flowcard confirm ${cmd.card} --approve ${cmd.id}（或看板上批准）`,
+        });
+      }
+      if (target.status === "rejected") {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `确认 ${cmd.id} 已被驳回${target.reason ? `（${target.reason}）` : ""}，不能使用`,
+          hint: "被驳回的申请永久失效；真要执行就重新申请一次",
+        });
+      }
+      if (target.consumedAt) {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `确认 ${cmd.id} 已经在 ${target.consumedAt} 被用掉了，一次授权只覆盖一次动作`,
+          hint: `再执行一次远程写就重新申请：flowcard confirm ${cmd.card} --request --for ${target.action} --detail "…"`,
+        });
+      }
+      emit(cmd.card, "confirm.consumed", { id: cmd.id }, `confirm:${cmd.card}:${cmd.id}:consumed`);
+      break;
+    }
+
     case "worktree": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });

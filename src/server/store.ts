@@ -17,6 +17,13 @@ export type ExecuteResult = {
   card: Card | undefined;
 };
 
+/**
+ * 投影格式版本：**改动 `Card` 的形态（增删槽位）时把它 +1**。
+ * 启动时版本不一致就自动 rebuild 一次——投影本来就能从事件重放，这样老库不用手工救，
+ * 也不会让"投影比代码旧"悄悄毁掉前端解析。
+ */
+export const PROJECTION_VERSION = "2";
+
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */
   execute(cmd: Command, now?: string): ExecuteResult;
@@ -131,6 +138,19 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     return `c${next}`;
   };
 
+  const metaGet = (key: string): string | undefined => {
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  };
+
+  const metaSet = (key: string, value: string): void => {
+    db.prepare(
+      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(key, value);
+  };
+
   const getCard = (id: string): Card | undefined => {
     const row = db.prepare("SELECT card FROM cards WHERE id = ?").get(id) as
       | { card: string }
@@ -190,6 +210,12 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     }
     return listCards().length;
   };
+
+  // 投影版本不一致 → 从事件重放一次（自愈，不需要人手工 rebuild）
+  if (metaGet("projection_version") !== PROJECTION_VERSION) {
+    rebuild();
+    metaSet("projection_version", PROJECTION_VERSION);
+  }
 
   return {
     execute,

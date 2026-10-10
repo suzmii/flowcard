@@ -7,6 +7,9 @@ import type {
   Card,
   CardState,
   Comment,
+  ConfirmAction,
+  ConfirmStatus,
+  Confirmation,
   Event,
   IssueRef,
   PrRef,
@@ -38,12 +41,23 @@ export function emptyCard(id: string, at: string): Card {
     session: null,
     runtime: null,
     gates: {},
+    confirmations: [],
     pushes: [],
     comments: [],
     spawned: [],
     createdAt: at,
     updatedAt: at,
   };
+}
+
+/** 卡片内确认 id 自增（"cf1"…）：按已有确认的最大编号推导，不额外维护计数器表。 */
+export function nextConfirmationId(confirmations: Confirmation[]): string {
+  let max = 0;
+  for (const confirmation of confirmations) {
+    const matched = /^cf(\d+)$/.exec(confirmation.id);
+    if (matched) max = Math.max(max, Number(matched[1]));
+  }
+  return `cf${max + 1}`;
 }
 
 export function applyEvent(card: Card, event: NewEvent | Event): Card {
@@ -138,6 +152,45 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
           ...(p.reason ? { reason: String(p.reason) } : {}),
         },
       };
+      break;
+    }
+
+    case "confirm.requested": {
+      const confirmation: Confirmation = {
+        id: nextConfirmationId(card.confirmations),
+        action: p.action as ConfirmAction,
+        detail: String(p.detail ?? ""),
+        status: "pending",
+        requestedAt: at,
+        requestedBy: event.actor,
+      };
+      next.confirmations = [...card.confirmations, confirmation];
+      break;
+    }
+
+    case "confirm.decided": {
+      const id = String(p.id);
+      if (!card.confirmations.some((c) => c.id === id)) break;
+      next.confirmations = card.confirmations.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              status: p.decision as ConfirmStatus,
+              decidedAt: at,
+              decidedBy: event.actor.name ?? event.actor.kind,
+              ...(p.reason ? { reason: String(p.reason) } : {}),
+            }
+          : c,
+      );
+      break;
+    }
+
+    case "confirm.consumed": {
+      const id = String(p.id);
+      if (!card.confirmations.some((c) => c.id === id)) break;
+      next.confirmations = card.confirmations.map((c) =>
+        c.id === id ? { ...c, consumedAt: at } : c,
+      );
       break;
     }
 
