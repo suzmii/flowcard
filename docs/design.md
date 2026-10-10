@@ -42,7 +42,8 @@ type Card = {
   issue: IssueRef | null;          // 永远存在，可为 null
   pr: PrRef | null;                // 永远存在，可为 null
   worktree: WorktreeRef | null;    // 永远存在，可为 null
-  session: Session | null;         // 领卡后才有
+  session: Session | null;         // 领卡后才有（agent 会话）
+  runtime: Runtime | null;         // 卡片自己的项目运行时（启动按钮管的就是它）
   partOf?: string;                 // 分片：同 Issue 的兄弟卡
   acceptedAt?: string;             // 已验收（等合并）
 };
@@ -56,6 +57,14 @@ type Session = {
   startedAt: string;
   lastSeenAt: string;
   resumeHint?: string;             // 恢复命令（omp: omp -r <id>）
+};
+
+type Runtime = {
+  status: "stopped" | "starting" | "running" | "failed";
+  pid?: number;                    // 只记自己启动的进程组
+  startedAt?: string;
+  ports?: number[];                // 探活/冲突提示用
+  logPath?: string;
 };
 
 type IssueRef  = { repo: string; number: number; url: string; title?: string; state: "open" | "closed" };
@@ -112,6 +121,25 @@ type WorktreeRef = { path: string; branch: string;
 2. 未通过时卡片停在 `ready`，并给出确切修复动作：`/wt <branch>`（方式 A）或 `/move <path>`（方式 B）+ 在 worktree 里重开会话的命令。
 3. 进入 `working` 之后若 `cwd` 漂出 worktree（`/move` 回主干等）→ 记 `card.cwd.mismatch` 事件，卡片显示警告并回到"未在 worktree"状态（**不改流程状态**，只提示 + 门禁收紧：不许提交、不许 `review`）。
 4. `worktree` 槽位里的 `path`/`branch` 优先**从 cwd 反查**（`git -C <cwd> rev-parse --show-toplevel --abbrev-ref HEAD`），避免人手工填错；期望落在项目仓库的 `.worktrees/` 下，不在则记警告但仍接受。
+
+### 3.2 卡片可以启动自己的项目（运行时）
+
+每张卡片有**一个启动按钮**，启动的是**这张卡片 worktree 里的项目**（dev server / 预览栈之类）。会话是 agent 在干活，运行时是项目在跑——两者都由卡片持有，互不影响。
+
+**每个项目怎么启动是可配置的**：项目仓库内放 `.flowcard.toml`（跟代码一起走、可 review），`[runtime]` 段描述 `cmd`、`cwd`（默认卡片 worktree）、`env`、`ports`、`ready`（按端口或日志正则判就绪）、`singleton`。取不到配置时按钮给出人话错误，而不是崩。
+
+**单例不变式（明确要求）**：启动一张卡的运行时，**先停掉其他卡片已经启着的运行时**（把被停的卡片 id 回给调用方，UI 上要显示出来）。理由很实际：端口、GPU、显存这类资源同时只能给一套栈。`singleton = false` 可关掉（或收窄成"只在同一项目内互斥"）。
+
+**安全边界（硬要求）**：
+
+| 允许 | 禁止 |
+|---|---|
+| 只对 flowcard 自己启动的**进程组**发 `SIGTERM`，宽限期后 `SIGKILL` | 用 `pkill` / 模式匹配去杀别人的进程 |
+| 服务重启/退出时清理自己留下的残留进程 | 杀掉不是自己启动的任何东西 |
+
+**与"多开 subagent"的关系**：会话（含 harness 自己开的 subagent）**可以并行、不受运行时单例限制**；单例只约束"项目进程同时只跑一套"。卡片绑定会话仍然只认 `agentKind === "main"`，subagent 归 harness 自己管。
+
+CLI：`flowcard up <card>` / `flowcard down <card>`；状态变化一样走事件流（`runtime.*`），所以 `rebuild` 之后按钮状态不会漂。
 
 ## 4. 流程状态（看板的列）
 
@@ -244,6 +272,8 @@ flowcard beat   <card> --harness omp --session <id>
 flowcard end    <card> --summary "…"                      # 交回（→ review）
 flowcard accept <card>                                    # 人验收（G3）
 flowcard spawn  <card> --title "…"                        # 同一 Issue 下开新片（新 PR）
+flowcard up     <card>                                  # 启动卡片运行时（会停掉其他卡片已启动的）
+flowcard down   <card>                                  # 停掉卡片运行时
 flowcard cleanup <card> [--apply]                         # 列清理清单；--apply 需先过 G4
 flowcard detect <card>                                    # 从 worktree/分支探测 PR/CI（gh/tea）
 flowcard list / show <card> / issue <repo>#<n>            # 读
@@ -284,8 +314,9 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M0** ✅ | omp 扩展上报 started/heartbeat/ended | 复现：1+3+1 事件，omp `exit 0`（无推理请求） |
 | **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→issue→plan→批准→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示 `/wt <branch>` 或 `/move <path>`）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
 | **M2 看板** | React + Vite + shadcn；列=9 状态；卡片详情六格必要项**空也显示**；按 Issue 聚合多片 | 浏览器完成 M1 全部动作，SSE 实时 |
-| **M3 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
-| **M4 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |
-| **M5 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上 |
+| **M3 运行时** | 每卡启动按钮：项目启动配置（`.flowcard.toml`）、进程组启停与日志、**单例不变式**（启动一张卡就停掉其他卡的运行时）、状态进事件流 | 配好配置的项目能一键起停；启 B 之后 A 的进程确实死了（`ps` 验证）；进程组杀干净 |
+| **M4 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
+| **M5 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |
+| **M6 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上 |
 
-顺序：M1 → M2 → M3 → M4 → M5（M0 已完成）。
+顺序：M1 → M2 → M3 → M4 → M5 → M6（M0、M1 已完成）。
