@@ -10,6 +10,7 @@ import type { ReactNode } from "react";
 import { IssueBinder } from "@/components/detail/IssueBinder";
 import type { CommandRunner } from "@/components/detail/GatePanel";
 import { Badge } from "@/components/ui/badge";
+import type { IssueBase } from "@/lib/projects";
 import type { CardView } from "@/lib/schema";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -68,13 +69,13 @@ function Slot({
 /** 六个必要项目格：空着也必须渲染，并在空槽位旁写明该动作是本地动作还是远程写。 */
 export function SlotGrid({
   card,
-  defaultIssueRepo,
+  issueBase,
   busy,
   onRun,
 }: {
   card: CardView;
-  /** 当前项目的 remote 短形：绑定 Issue 时预填 repo */
-  defaultIssueRepo?: string;
+  /** 当前项目的 Issue 基址：绑定 Issue 时只填数字，链接由模板拼 */
+  issueBase?: IssueBase;
   busy?: string | null;
   onRun?: CommandRunner;
 }) {
@@ -113,7 +114,7 @@ export function SlotGrid({
         ) : onRun ? (
           <IssueBinder
             card={card}
-            defaultRepo={defaultIssueRepo ?? ""}
+            issueBase={issueBase}
             busy={busy ?? null}
             onRun={onRun}
           />

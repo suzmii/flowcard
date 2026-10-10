@@ -6,11 +6,13 @@ import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle,
   Check,
+  CircleDot,
   FolderGit2,
   FolderSearch,
   GitBranch,
   GitCommitHorizontal,
   Loader2,
+  Pencil,
   Plus,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -19,15 +21,32 @@ import { Input } from "@/components/ui/input";
 import {
   fetchCandidates,
   pickProject,
+  projectIssueBase,
   shortRemote,
+  templateHasNumber,
   type CandidateView,
+  type IssueBase,
   type ProjectView,
 } from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
 
-/** 项目元数据一行：remote / 分支 / 最后提交 / 脏文件数。 */
-function ProjectMeta({ project }: { project: ProjectView }) {
+/** 模板输入的占位例子：说清 `{number}` 才是被替换的那一段。 */
+const ISSUE_TEMPLATE_PLACEHOLDER = "https://git.example.com/git/Team/Repo/issues/{number}";
+
+/** 项目元数据一行：remote / 分支 / 最后提交 / 脏文件数 / Issue 基址。 */
+function ProjectMeta({
+  project,
+  onEditIssueBase,
+}: {
+  project: ProjectView;
+  onEditIssueBase?: () => void;
+}) {
   const remote = shortRemote(project.remote);
+  const base = projectIssueBase(project);
+  // 显示去掉协议头，省地方；完整模板挂在 title 上
+  const baseLabel = base.urlTemplate
+    ? `Issue ${base.repo ? `${base.repo} · ` : ""}${base.urlTemplate.replace(/^https?:\/\//, "")}`
+    : "Issue 基址未设置";
 
   return (
     <div className="flex flex-wrap items-center gap-1.5" data-testid="project-meta">
@@ -61,6 +80,30 @@ function ProjectMeta({ project }: { project: ProjectView }) {
           {project.dirtyFiles > 0 ? `${project.dirtyFiles} 个未提交文件` : "工作区干净"}
         </Badge>
       ) : null}
+      <Badge
+        variant={base.urlTemplate ? "outline" : "muted"}
+        data-testid="project-issue-base"
+        className="max-w-[26rem] font-mono"
+        title={
+          base.urlTemplate
+            ? `Issue 基址：${base.repo ?? "（repo 未设，按 remote）"} → ${base.urlTemplate}`
+            : "Issue 基址未设置：绑 Issue 时还得手填完整 url"
+        }
+      >
+        <CircleDot />
+        <span className="truncate">{baseLabel}</span>
+      </Badge>
+      {onEditIssueBase && !project.virtual ? (
+        <Button
+          size="xs"
+          variant="ghost"
+          data-testid="project-issue-base-edit-toggle"
+          onClick={onEditIssueBase}
+        >
+          <Pencil />
+          改 Issue 基址
+        </Button>
+      ) : null}
       {project.virtual ? <Badge variant="muted">合成项目（未归属的卡）</Badge> : null}
     </div>
   );
@@ -74,6 +117,7 @@ export function ProjectSwitcher({
   unavailable,
   onSelect,
   onAdd,
+  onSetIssueBase,
 }: {
   projects: ProjectView[];
   selected: ProjectView | null;
@@ -81,15 +125,44 @@ export function ProjectSwitcher({
   error: string | null;
   unavailable: boolean;
   onSelect: (id: string) => void;
-  onAdd: (path: string) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  onAdd: (
+    path: string,
+    issueBase?: IssueBase,
+  ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  onSetIssueBase: (
+    id: string,
+    input: { repo?: string; urlTemplate?: string; clear?: boolean },
+  ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
 }) {
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
+  const [issueRepo, setIssueRepo] = useState("");
+  const [issueTemplate, setIssueTemplate] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [candidates, setCandidates] = useState<CandidateView[] | null>(null);
   const [candidatesError, setCandidatesError] = useState<string | null>(null);
   const [picking, setPicking] = useState(false);
+  const [editingBase, setEditingBase] = useState(false);
+  const [baseRepo, setBaseRepo] = useState("");
+  const [baseTemplate, setBaseTemplate] = useState("");
+  const [baseBusy, setBaseBusy] = useState(false);
+
+  /** 读「Issue 基址」两个输入框；模板必须带 `{number}`，否则把理由交给调用方展示。 */
+  const readIssueBaseInput = (
+    repoValue: string,
+    templateValue: string,
+  ): { ok: true; base: IssueBase } | { ok: false; message: string } => {
+    const template = templateValue.trim();
+    if (template !== "" && !templateHasNumber(template)) {
+      return { ok: false, message: `Issue 地址模板要含 {number} 占位（例：${ISSUE_TEMPLATE_PLACEHOLDER}）。` };
+    }
+    const repo = repoValue.trim();
+    return {
+      ok: true,
+      base: { ...(repo ? { repo } : {}), ...(template ? { urlTemplate: template } : {}) },
+    };
+  };
 
   // 展开"添加项目"时才去扫候选仓库（省得每次打开看板都扫盘）
   useEffect(() => {
@@ -134,9 +207,14 @@ export function ProjectSwitcher({
   }, [onAdd]);
 
   const addCandidate = async (candidate: CandidateView) => {
+    const read = readIssueBaseInput(issueRepo, issueTemplate);
+    if (!read.ok) {
+      setNotice({ tone: "error", text: read.message });
+      return;
+    }
     setBusy(true);
     setNotice(null);
-    const result = await onAdd(candidate.path);
+    const result = await onAdd(candidate.path, read.base);
     setBusy(false);
     if (result.ok) {
       setNotice({ tone: "ok", text: `已添加项目「${result.project.name}」` });
@@ -153,8 +231,13 @@ export function ProjectSwitcher({
       setNotice({ tone: "error", text: "请填仓库的绝对路径（例如 /home/me/workspace/proj）。" });
       return;
     }
+    const read = readIssueBaseInput(issueRepo, issueTemplate);
+    if (!read.ok) {
+      setNotice({ tone: "error", text: read.message });
+      return;
+    }
     setBusy(true);
-    const result = await onAdd(trimmed);
+    const result = await onAdd(trimmed, read.base);
     setBusy(false);
     if (result.ok) {
       setNotice({ tone: "ok", text: `已添加项目「${result.project.name}」` });
@@ -162,6 +245,44 @@ export function ProjectSwitcher({
       setAdding(false);
     } else {
       setNotice({ tone: "error", text: `添加项目失败：${result.message}` });
+    }
+  };
+
+  /** 打开当前项目的 Issue 基址编辑器，并把现有值灌进输入框。 */
+  const openBaseEditor = (project: ProjectView) => {
+    setEditingBase(true);
+    setBaseRepo(project.issueRepo?.trim() ?? "");
+    setBaseTemplate(project.issueUrlTemplate?.trim() ?? "");
+    setNotice(null);
+  };
+
+  /** 保存当前项目的 Issue 基址；两个框都清空（或点清空）就回到「按 remote 派生」。 */
+  const saveBase = async (clear: boolean) => {
+    if (!selected) return;
+    const repo = baseRepo.trim();
+    const template = baseTemplate.trim();
+    if (!clear && template !== "" && !templateHasNumber(template)) {
+      setNotice({ tone: "error", text: `Issue 地址模板要含 {number} 占位（例：${ISSUE_TEMPLATE_PLACEHOLDER}）。` });
+      return;
+    }
+    // 留空的字段发给服务端会被拒（min(1)），所以只发填了的；两个都空 = 清空
+    const wipe = clear || (repo === "" && template === "");
+    const payload: { repo?: string; urlTemplate?: string; clear?: boolean } = wipe
+      ? { clear: true }
+      : { ...(repo ? { repo } : {}), ...(template ? { urlTemplate: template } : {}) };
+    setBaseBusy(true);
+    const result = await onSetIssueBase(selected.id, payload);
+    setBaseBusy(false);
+    if (result.ok) {
+      setNotice({
+        tone: "ok",
+        text: wipe
+          ? `已清空「${result.project.name}」的 Issue 基址（改回按 remote 派生）`
+          : `已更新「${result.project.name}」的 Issue 基址`,
+      });
+      setEditingBase(false);
+    } else {
+      setNotice({ tone: "error", text: `改 Issue 基址失败：${result.message}` });
     }
   };
 
@@ -200,8 +321,68 @@ export function ProjectSwitcher({
           <Plus />
           添加项目
         </Button>
-        {selected ? <ProjectMeta project={selected} /> : null}
+        {selected ? (
+          <ProjectMeta project={selected} onEditIssueBase={() => openBaseEditor(selected)} />
+        ) : null}
       </div>
+
+      {editingBase && selected ? (
+        <div
+          className="space-y-2 rounded-lg border bg-muted/30 p-2.5"
+          data-testid="project-issue-base-panel"
+        >
+          <div className="text-[11px] text-muted-foreground">
+            改「{selected.name}」的 Issue 基址：绑 Issue 时只填数字，链接由模板拼出来。
+            <span className="ml-1">留空的字段保持不动；两个都清空（或点「清空」）就回到按 remote 派生。</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="text-[11px] text-muted-foreground">Issue 地址模板（{`{number}`} 是占位）</span>
+              <Input
+                data-testid="project-issue-base-input"
+                className="max-w-[34rem]"
+                placeholder={ISSUE_TEMPLATE_PLACEHOLDER}
+                value={baseTemplate}
+                onChange={(event) => setBaseTemplate(event.target.value)}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] text-muted-foreground">repo（owner/name）</span>
+              <Input
+                data-testid="project-issue-base-edit-repo"
+                className="max-w-[16rem]"
+                placeholder="owner/name（留空按 remote）"
+                value={baseRepo}
+                onChange={(event) => setBaseRepo(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="xs"
+              data-testid="project-issue-base-save"
+              disabled={baseBusy}
+              onClick={() => void saveBase(false)}
+            >
+              {baseBusy ? <Loader2 className="animate-spin" /> : null}
+              {baseBusy ? "保存中…" : "保存 Issue 基址"}
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              data-testid="project-issue-base-clear"
+              disabled={baseBusy}
+              onClick={() => void saveBase(true)}
+            >
+              清空（回到按 remote 派生）
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setEditingBase(false)}>
+              取消
+            </Button>
+            <span className="text-[11px] text-muted-foreground">例：{ISSUE_TEMPLATE_PLACEHOLDER}</span>
+          </div>
+        </div>
+      ) : null}
 
       {adding ? (
         <div className="space-y-2 rounded-lg border bg-muted/30 p-2.5" data-testid="project-add-panel">
@@ -254,6 +435,35 @@ export function ProjectSwitcher({
               常见工作目录里没有未添加的 git 仓库{candidatesError ? `（${candidatesError}）` : ""}
             </div>
           )}
+
+          <div className="flex flex-wrap items-center gap-2" data-testid="project-issue-base-field">
+            <label className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="text-[11px] text-muted-foreground">
+                Issue 地址模板（可选 · 只绑 Issue 用，{`{number}`} 会被数字替换）
+              </span>
+              <Input
+                data-testid="project-issue-base-add-input"
+                className="max-w-[34rem]"
+                placeholder={ISSUE_TEMPLATE_PLACEHOLDER}
+                value={issueTemplate}
+                onChange={(event) => setIssueTemplate(event.target.value)}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] text-muted-foreground">repo（可选）</span>
+              <Input
+                data-testid="project-issue-repo-input"
+                className="max-w-[16rem]"
+                placeholder="owner/name（留空按 remote）"
+                value={issueRepo}
+                onChange={(event) => setIssueRepo(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="text-[11px] text-muted-foreground">
+            例：<span className="font-mono">{ISSUE_TEMPLATE_PLACEHOLDER}</span> —— 填了它，之后绑 Issue
+            只要填数字。
+          </div>
 
           <details className="text-[11px]">
             <summary className="cursor-pointer text-muted-foreground">或手动输入仓库绝对路径</summary>

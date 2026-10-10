@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useBoard, type Connection } from "@/lib/useBoard";
 import { useProjects } from "@/lib/useProjects";
-import { shortRemote } from "@/lib/projects";
+import { projectIssueBase } from "@/lib/projects";
 import { clockTime } from "@/lib/utils";
 
 /** 主视图：看板 / 提交图（提交图不重排看板，只切换主区）。 */
@@ -159,6 +159,7 @@ export function App() {
           unavailable={projects.unavailable}
           onSelect={projects.select}
           onAdd={projects.add}
+          onSetIssueBase={projects.setIssueBase}
         />
       </header>
 
@@ -199,7 +200,7 @@ export function App() {
         <CardDetail
           card={selected}
           cards={cards}
-          defaultIssueRepo={shortRemote(currentProject?.remote) ?? ""}
+          issueBase={projectIssueBase(currentProject)}
           onClose={() => setSelectedId(null)}
           onRefresh={board.refresh}
         />

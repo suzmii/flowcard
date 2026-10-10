@@ -3,7 +3,14 @@
  * 服务端的项目列表一定含 `local`（未归属的卡），所以选不上已存 id 时兜回 `local`。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { LOCAL_PROJECT_ID, addProject, fetchProjects, type ProjectView } from "@/lib/projects";
+import {
+  LOCAL_PROJECT_ID,
+  addProject,
+  fetchProjects,
+  setProjectIssueBase,
+  type IssueBase,
+  type ProjectView,
+} from "@/lib/projects";
 
 const STORAGE_KEY = "flowcard.projectId";
 
@@ -35,7 +42,15 @@ export type ProjectsData = {
   unavailable: boolean;
   select: (id: string) => void;
   /** 添加项目：成功返回新项目（并自动选中）；失败返回理由 */
-  add: (path: string) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  add: (
+    path: string,
+    issueBase?: IssueBase,
+  ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  /** 改某个项目的 Issue 基址（`clear` 清空）：成功返回刷新后的项目 */
+  setIssueBase: (
+    id: string,
+    input: { repo?: string; urlTemplate?: string; clear?: boolean },
+  ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
   refresh: () => Promise<void>;
 };
 
@@ -94,8 +109,8 @@ export function useProjects(): ProjectsData {
   }, []);
 
   const add = useCallback<ProjectsData["add"]>(
-    async (path) => {
-      const result = await addProject(path);
+    async (path, issueBase) => {
+      const result = await addProject(path, issueBase);
       if (!result.ok) return { ok: false, message: result.message };
       await refresh();
       select(result.project.id);
@@ -104,7 +119,17 @@ export function useProjects(): ProjectsData {
     [refresh, select],
   );
 
+  const setIssueBase = useCallback<ProjectsData["setIssueBase"]>(
+    async (id, input) => {
+      const result = await setProjectIssueBase(id, input);
+      if (!result.ok) return { ok: false, message: result.message };
+      await refresh();
+      return { ok: true, project: result.project };
+    },
+    [refresh],
+  );
+
   const selected = projects.find((project) => project.id === selectedId) ?? null;
 
-  return { projects, selected, loading, error, unavailable, select, add, refresh };
+  return { projects, selected, loading, error, unavailable, select, add, setIssueBase, refresh };
 }

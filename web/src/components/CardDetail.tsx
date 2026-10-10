@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { postCommand } from "@/lib/api";
 import { STATE_LABELS, STATE_TONE } from "@/lib/contract";
+import type { IssueBase } from "@/lib/projects";
 import type { CardView } from "@/lib/schema";
 import { timeAgo } from "@/lib/utils";
 
@@ -34,14 +35,14 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
 export function CardDetail({
   card,
   cards,
-  defaultIssueRepo,
+  issueBase,
   onClose,
   onRefresh,
 }: {
   card: CardView;
   cards: CardView[];
-  /** 当前项目的 remote 短形：Issue 绑定入口预填 repo */
-  defaultIssueRepo?: string;
+  /** 当前项目的 Issue 基址（repo 短形 + URL 模板）：Issue 绑定入口只填数字就靠它 */
+  issueBase?: IssueBase;
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -157,7 +158,7 @@ export function CardDetail({
           <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
             <SlotGrid
               card={card}
-              defaultIssueRepo={defaultIssueRepo ?? ""}
+              issueBase={issueBase}
               busy={busy}
               onRun={run}
             />
