@@ -450,6 +450,20 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     dedupeKey: z.string().optional(),
   }),
   z.object({
+    cmd: z.literal("triage"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    note: z.string().optional(),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
+    cmd: z.literal("drop"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    reason: z.string().min(1),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
     cmd: z.literal("block"),
     actor: actorSchema,
     card: z.string().min(1),

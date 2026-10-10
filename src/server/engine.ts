@@ -532,6 +532,56 @@ export function runCommand(input: {
       break;
     }
 
+    case "triage": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      if (card.state === "issue") {
+        notes.push("卡片已经是「立 Issue」状态，跳过");
+        break;
+      }
+      if (card.state !== "inbox") {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `卡片当前是 ${card.state}，只有收件箱里的卡需要"确认要做"`,
+          hint: "已经开工的卡请用门禁/会话推进；要放弃用 flowcard drop",
+        });
+      }
+      if (cmd.note) {
+        emit(
+          cmd.card,
+          "card.comment.added",
+          { body: cmd.note },
+          `triage:${cmd.card}:${shortHash(cmd.note)}`,
+        );
+        applyPending();
+      }
+      requestTransition(cmd.card, "issue", `triage:${cmd.card}`);
+      break;
+    }
+
+    case "drop": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      if (card.state === "dropped") {
+        notes.push("卡片已经是放弃状态，跳过");
+        break;
+      }
+      if (card.state === "done") {
+        return fail({ code: "STATE_NOT_ALLOWED", message: "已完成的卡片不能放弃" });
+      }
+      // 放弃是决定，得留痕：理由进评论，状态另记
+      emit(cmd.card, "card.comment.added", { body: `放弃：${cmd.reason}` }, `drop:${cmd.card}:${shortHash(cmd.reason)}`);
+      applyPending();
+      const now2 = get(cmd.card)!;
+      emit(
+        cmd.card,
+        "card.state.changed",
+        { from: now2.state, to: "dropped" },
+        `drop:${cmd.card}:${now2.state}:state`,
+      );
+      break;
+    }
+
     case "block": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });

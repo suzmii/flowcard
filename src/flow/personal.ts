@@ -63,6 +63,8 @@ export const personalFlow = defineFlow({
   ],
 
   requires: {
+    // 收件箱 → 立项：只需人确认要做（这一步就是 triage），没有别的前置
+    "inbox -> issue": [],
     "issue -> ready": ["issue", "planApproved"],
     "ready -> working": ["worktree", "pr", "sessionInWorktree"],
     "working -> review": ["pr", "pushedAtLeastOnce"],
@@ -76,6 +78,13 @@ export const personalFlow = defineFlow({
    * 能不能前进由 requires 决定，缺项就只是记一笔 note，不报错。
    */
   automations: [
+    {
+      // 绑 Issue 就是「立项」这个人类动作：收件箱里的卡一旦绑上 Issue 就该进 `issue` 列
+      name: "issue-bound-advances-to-issue",
+      on: "issue.bound",
+      when: (c) => c.state === "inbox",
+      do: [{ setState: "issue" }],
+    },
     {
       name: "issued-plan-advances-to-ready",
       on: "gate.decided",

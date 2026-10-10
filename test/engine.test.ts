@@ -86,7 +86,8 @@ describe("一条卡片的完整生命周期", () => {
       body: "需求",
       issue: issueRef,
     }).primaryCardId;
-    expect(h.card(id).state).toBe("inbox");
+    // 开卡时就带了 Issue = 已经立项，直接落在 issue 列（绑 Issue 会推进状态）
+    expect(h.card(id).state).toBe("issue");
 
     h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
     expect(h.card(id).state).toBe("issue");
@@ -355,6 +356,67 @@ describe("会话规则", () => {
     });
     expect(beat.events.map((e) => e.type)).toContain("session.cwd.mismatch");
     expect(h.card(id).state).toBe("working");
+  });
+});
+
+describe("首页那一步：确认要做 / 放弃", () => {
+  it("绑定 Issue 就是立项：收件箱自动进「立 Issue」", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "从看板记的需求", body: "" }).primaryCardId;
+    expect(h.card(id).state).toBe("inbox");
+
+    h.run({ cmd: "bindIssue", actor: h.human, card: id, issue: issueRef });
+    expect(h.card(id).state).toBe("issue");
+  });
+
+  it("triage：人确认要做 → 从收件箱进「立 Issue」，备注进评论", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "待确认", body: "" }).primaryCardId;
+
+    h.run({ cmd: "triage", actor: h.human, card: id, note: "这个做" });
+    expect(h.card(id).state).toBe("issue");
+    expect(h.card(id).comments.map((c) => c.body)).toContain("这个做");
+
+    // 再做一次是 no-op，不报错也不重复写
+    const again = h.run({ cmd: "triage", actor: h.human, card: id });
+    expect(again.events).toHaveLength(0);
+    expect(again.notes.join(" ")).toContain("已经是");
+  });
+
+  it("已经开工的卡不能再用 triage 回退", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "x", body: "", issue: issueRef }).primaryCardId;
+    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
+    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
+    expect(h.card(id).state).toBe("ready");
+
+    const out = h.run({ cmd: "triage", actor: h.human, card: id });
+    expect(out.rejection?.code).toBe("STATE_NOT_ALLOWED");
+    expect(h.card(id).state).toBe("ready");
+  });
+
+  it("drop：放弃要留理由；重复放弃是 no-op；已完成的不许放弃", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "不做了", body: "" }).primaryCardId;
+
+    h.run({ cmd: "drop", actor: h.human, card: id, reason: "需求黄了" });
+    expect(h.card(id).state).toBe("dropped");
+    expect(h.card(id).comments.map((c) => c.body)).toContain("放弃：需求黄了");
+
+    const again = h.run({ cmd: "drop", actor: h.human, card: id, reason: "再放弃一次" });
+    expect(again.events).toHaveLength(0);
+    expect(again.notes.join(" ")).toContain("已经是放弃状态");
+  });
+
+  it("丢弃状态也能从任意未完成状态进（含 blocked）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "阻塞后放弃", body: "" }).primaryCardId;
+    h.run({ cmd: "block", actor: h.agent, card: id, reason: "缺东西" });
+    expect(h.card(id).state).toBe("blocked");
+
+    h.run({ cmd: "drop", actor: h.human, card: id, reason: "不做了" });
+    expect(h.card(id).state).toBe("dropped");
+    expect(h.rebuild(id)).toEqual(h.card(id));
   });
 });
 

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { CircleSlash, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
+import { StateActions } from "@/components/detail/StateActions";
 import { CodeChanges } from "@/components/detail/CodeChanges";
 import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
@@ -148,6 +149,10 @@ export function CardDetail({
               <span>阻塞原因：{card.blockedReason}</span>
             </div>
           ) : null}
+
+          <Section title="状态动作" hint="纯人工决定的那两步（其余推进有各自入口）">
+            <StateActions card={card} busy={busy} onRun={run} />
+          </Section>
 
           <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
             <SlotGrid
