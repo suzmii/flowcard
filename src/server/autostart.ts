@@ -17,7 +17,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Card, Project } from "../shared/types.ts";
-import { cardBrief, writeBriefFile } from "./brief.ts";
+import { briefKickoff, writeCardBrief, type BriefWriteIo } from "./brief.ts";
 import type { HostedSessionStatus, HostedSessions } from "./hosted-session.ts";
 
 export type AutostartDeps = {
@@ -30,7 +30,7 @@ export type AutostartDeps = {
   sessions: HostedSessions;
   cli?: string | undefined;
   io?: {
-    writeBrief?: typeof writeBriefFile;
+    writeBrief?: BriefWriteIo["writeBrief"];
   };
 };
 
@@ -75,8 +75,6 @@ async function autostartInner(cardId: string, deps: AutostartDeps): Promise<Auto
     return { status: "skipped", summary: "卡片已有会话在跑，不再重复启动" };
   }
 
-  const doWriteBrief = deps.io?.writeBrief ?? writeBriefFile;
-
   // worktree 还没绑（或目录已经没了）时，会话先起在项目根：AI 读完提示会自己建 worktree 并切进去
   const bound = card.worktree;
   const cwd = bound && existsSync(bound.path) ? bound.path : project.path;
@@ -90,20 +88,16 @@ async function autostartInner(cardId: string, deps: AutostartDeps): Promise<Auto
   // ---- 1) 开工提示：把"当前状态 + 还缺什么"写进文件（**不进 argv**，kickoff 只说去 read 它）
   const fresh = deps.getCard(cardId) ?? card;
   const cli = deps.cli ?? "flowcard";
-  const brief = cardBrief({
+  const briefPath = await writeCardBrief({
+    briefDir: join(deps.dataDir, "briefs"),
     card: fresh,
     project,
     cli,
-    ...(bound ? { worktree: { path: bound.path, branch: bound.branch } } : {}),
+    ...(deps.io?.writeBrief === undefined ? {} : { io: { writeBrief: deps.io.writeBrief } }),
   });
-  const briefPath = join(deps.dataDir, "briefs", `${cardId}.md`);
-  await doWriteBrief(briefPath, brief);
 
   // ---- 2) 起托管会话（cwd 在 worktree 里，或先落在项目根）
-  const started = await deps.sessions.start(cardId, {
-    cwd,
-    kickoff: `开工：第一步先 read \`${briefPath}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`${cli} comment\` 留痕。`,
-  });
+  const started = await deps.sessions.start(cardId, { cwd, kickoff: briefKickoff(briefPath, cli) });
 
   if (!started.ok) {
     const reason = started.error?.message ?? "未知原因";

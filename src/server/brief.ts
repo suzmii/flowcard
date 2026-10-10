@@ -11,7 +11,7 @@
  * 纯函数：只吃 card/project/worktree，输出文本；便于单测与复用（CLI/UI 也能拿它做预览）。
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { Card, CardState, Project } from "../shared/types.ts";
 import { STATE_LABELS } from "../shared/types.ts";
 
@@ -156,4 +156,46 @@ export async function writeBriefFile(
   await (io.mkdir ?? ((p: string) => mkdir(p, { recursive: true })))(dirname(filePath));
   await write(filePath, text);
   return { written: true };
+}
+
+/** 写开工提示的可注入 IO（测试用）：只换"怎么落盘"，内容与路径的规则不变。 */
+export type BriefWriteIo = { writeBrief?: typeof writeBriefFile };
+
+/** 开工提示文件的落点：`<briefDir>/<cardId>.md`（`briefDir` 就是 `<dataDir>/briefs`）。 */
+export function cardBriefPath(briefDir: string, cardId: string): string {
+  return join(briefDir, `${cardId}.md`);
+}
+
+/**
+ * 起会话时投的第一句 prompt（kickoff）：只说一句「先 `read` 那份提示，按待办走」——
+ * 提示全文**不进 argv/系统提示**（见本文件头注释）。自动开工与手动起会话（新会话）用**同一句**。
+ */
+export function briefKickoff(file: string, cli = "flowcard"): string {
+  return `开工：第一步先 read \`${file}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`${cli} comment\` 留痕。`;
+}
+
+/**
+ * 写开工提示（`cardBrief` 的全文 → `<briefDir>/<cardId>.md`），返回文件路径。
+ *
+ * 两个调用方，保证内容完全一致：自动开工（`autostart`，自己写）、`hosted-session` 的 `refreshBrief`
+ * （手动起会话与搬 worktree 都经由它）。写不出去**不吞**——由调用方决定是报错还是静默。
+ */
+export async function writeCardBrief(input: {
+  briefDir: string;
+  card: Card;
+  project?: Project | undefined;
+  cli?: string | undefined;
+  io?: BriefWriteIo | undefined;
+}): Promise<string> {
+  const { card } = input;
+  const worktree = card.worktree;
+  const text = cardBrief({
+    card,
+    ...(input.project === undefined ? {} : { project: input.project }),
+    ...(worktree === null ? {} : { worktree: { path: worktree.path, branch: worktree.branch } }),
+    ...(input.cli === undefined ? {} : { cli: input.cli }),
+  });
+  const file = cardBriefPath(input.briefDir, card.id);
+  await (input.io?.writeBrief ?? writeBriefFile)(file, text);
+  return file;
 }

@@ -9,7 +9,7 @@
  *   所以换目录必须给一份改过头的会话文件，光传 `--cwd` 是白搭。
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -215,7 +215,10 @@ describe("changeCwd：把会话搬进 worktree", () => {
     await log.waitFor(sessionReady(proj));
     const before = sessions.snapshot(id).messages.length;
     expect(before).toBeGreaterThan(0);
-    expect(existsSync(briefFile)).toBe(false); // 还没有人写过开工提示
+    // 起会话时就落好了开工提示（**手动 start 也写**，见 `hosted-session.start` 的 `refreshBrief`）：
+    // 搬完再按新的现状重写同一份（内容不变就不动它，见 `writeBriefFile`）
+    const briefAtStart = readFileSync(briefFile, "utf8");
+    expect(briefAtStart).toContain("## ☑︎ 接下来你要做的");
 
     const moved = await sessions.changeCwd(id, { cwd: wt });
     expect(moved.ok).toBe(true);

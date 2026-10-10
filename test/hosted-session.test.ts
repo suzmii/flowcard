@@ -14,7 +14,9 @@ import { TextDecoder } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import { personalFlow } from "../src/flow/personal.ts";
 import { normalizePath } from "../src/shared/paths.ts";
+import type { Card } from "../src/shared/types.ts";
 import { createApp } from "../src/server/app.ts";
+import { briefKickoff, cardBrief } from "../src/server/brief.ts";
 import {
   createHostedSessions,
   imageMimeType,
@@ -226,6 +228,28 @@ function makeSessions(
       return spawnFake(mode, sessionFile, extraEnv)(opts);
     },
     resolveOmpPath: async () => undefined, // 别真去 `sh -c command -v omp`
+  });
+}
+
+/**
+ * 配了 `briefDir` 的注册表 —— 生产里 `main.ts` 就是这么装的（`<dataDir>/briefs`）。
+ * 手动起会话（`POST .../session/start`）走的就是这条路：先落开工提示文件，新会话再投 kickoff。
+ */
+function makeSessionsWithBriefDir(
+  store: Store,
+  mode: string,
+  briefDir: string,
+  calls: StartRpcOptions[] = [],
+  sessionFile?: string,
+): HostedSessions {
+  return createHostedSessions({
+    store,
+    briefDir,
+    startSession: (opts) => {
+      calls.push(opts);
+      return spawnFake(mode, sessionFile)(opts);
+    },
+    resolveOmpPath: async () => undefined,
   });
 }
 
@@ -885,6 +909,147 @@ describe("多轮对话（同一个子进程接着聊）", () => {
     expect(notice?.type === "notice" ? notice.message : "").toContain(other);
     expect(second.snapshot(id).cwd).toBe(dir);
     await second.stop(id);
+  });
+});
+
+// ---------------------------------------------------------------- 手动起会话：brief 文件 + kickoff
+
+describe("手动起会话（session/start）：brief 总是写、kickoff 只在新会话投", () => {
+  /** 卡片当下的开工提示全文（手动起会话写的必须就是这一份 —— 与自动开工同一个 `cardBrief`）。 */
+  const briefOf = (store: Store, id: string): string => {
+    const card = store.getCard(id) as Card;
+    return cardBrief({ card, project: store.getProject(card.projectId) });
+  };
+  /** 「当前状态」一行会随会话 claim / 结束变（不是这几条测试要验的）：比内容时先摘掉它。 */
+  const withoutState = (text: string): string => text.replace(/^\*\*当前状态\*\*：.*$/m, "");
+
+  it("新会话：先落 brief 文件，第一条 prompt 就是 kickoff（与自动开工同一句）", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const briefDir = join(dir, "data", "briefs");
+    const briefPath = join(briefDir, `${id}.md`);
+    const calls: StartRpcOptions[] = [];
+    const sessions = makeSessionsWithBriefDir(store, "normal", briefDir, calls);
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    // 手动起会话（端点只给 cwd，没人给 kickoff）；起会话**之前**的卡片快照 = 提示里该有的现状
+    const before = store.getCard(id) as Card;
+    const expected = cardBrief({ card: before, project: store.getProject(before.projectId) });
+    expect(await sessions.start(id)).toEqual({ ok: true, status: "starting", cwd: dir });
+
+    // ① 提示文件已经落在那儿，内容与 `cardBrief` 一字不差（claim 要等子进程 ready，此刻还没动过状态）
+    const brief = readFileSync(briefPath, "utf8");
+    expect(brief).toBe(expected);
+    expect(brief).toContain("☑︎ 接下来你要做的");
+
+    // ② 第一条 prompt 就是那句 kickoff（文案与自动开工完全一致，见 `briefKickoff`）
+    const kickoff = briefKickoff(briefPath);
+    expect(kickoff).toBe(
+      `开工：第一步先 read \`${briefPath}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`flowcard comment\` 留痕。`,
+    );
+    const echoed = await log.waitFor((e) => e.type === "message_end" && e.role === "user");
+    expect(echoed.type === "message_end" ? echoed.text : null).toBe(kickoff);
+    expect(calls[0]?.args ?? []).not.toContain("-r"); // 新会话：argv 里没有 `-r`
+    expect(sessions.snapshot(id).messages[0]?.text).toBe(kickoff);
+    await sessions.stop(id);
+  });
+
+  it("续接（-r）：不投 kickoff，但 brief 被刷新成当下的现状", async () => {
+    const { store, dir } = makeStore();
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), dir);
+    const id = openCard(store, dir);
+    const briefDir = join(dir, "data", "briefs");
+    const briefPath = join(briefDir, `${id}.md`);
+
+    // 先手动起一次（新会话）：kickoff 进转录、提示落盘
+    const first = makeSessionsWithBriefDir(store, "normal", briefDir, [], fixture);
+    const firstLog = new EventLog();
+    first.subscribe(id, firstLog.push);
+    await first.start(id);
+    await firstLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    const kickoff = briefKickoff(briefPath);
+    const echoed = await firstLog.waitFor((e) => e.type === "message_end" && e.role === "user");
+    expect(echoed.type === "message_end" ? echoed.text : null).toBe(kickoff);
+    await first.stop(id);
+
+    // 卡片现状变了（多一条推送记录）：提示写的是"当下的现状"，不该是历史
+    const before = readFileSync(briefPath, "utf8");
+    expect(before).not.toContain("已有 1 条推送记录");
+    store.execute({ cmd: "push", actor: HUMAN, card: id, sha: "abc1234" });
+
+    // 再手动起一次：默认 `-r` 续接同一条会话
+    const calls: StartRpcOptions[] = [];
+    const second = makeSessionsWithBriefDir(store, "normal", briefDir, calls, fixture);
+    const log = new EventLog();
+    second.subscribe(id, log.push);
+    await second.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    const args = calls[0]?.args ?? [];
+    expect(args[args.indexOf("-r") + 1]).toBe(fixture); // 真续接了：这次不是新会话
+
+    // 续接**不投** kickoff（上下文里已经躺着它）：显式发一句并等它跑完，转录里 user 就该只有这两条
+    const sent = await second.prompt(id, "接着干");
+    expect(sent.ok).toBe(true);
+    await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-3"));
+    expect(second.snapshot(id).messages.filter((m) => m.role === "user").map((m) => m.text)).toEqual([
+      kickoff,
+      "接着干",
+    ]);
+    expect(log.byType("error")).toEqual([]);
+
+    // 但提示**被刷新**了：按当下的卡片现状重写（内容 = `cardBrief`，状态那行除外）
+    const refreshed = readFileSync(briefPath, "utf8");
+    expect(refreshed).not.toBe(before);
+    expect(refreshed).toContain("已有 1 条推送记录（最新 abc1234）");
+    expect(withoutState(refreshed)).toBe(withoutState(briefOf(store, id)));
+    await second.stop(id);
+  });
+
+  it("HTTP 端点：`POST .../session/start`（端上只给 cwd）就走这条规则", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const briefDir = join(dir, "data", "briefs");
+    const briefPath = join(briefDir, `${id}.md`);
+    const sessions = makeSessionsWithBriefDir(store, "normal", briefDir);
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+    const app = createApp(store, { sessions });
+
+    const res = await app.request(`/api/cards/${id}/session/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()) as unknown).toEqual({ ok: true, status: "starting", cwd: dir });
+
+    // 提示文件已落盘、第一条 prompt 就是 kickoff —— 端上没传任何 brief/kickoff 参数
+    expect(readFileSync(briefPath, "utf8")).toContain("## ☑︎ 接下来你要做的");
+    const echoed = await log.waitFor((e) => e.type === "message_end" && e.role === "user");
+    expect(echoed.type === "message_end" ? echoed.text : null).toBe(briefKickoff(briefPath));
+    await sessions.stop(id);
+  });
+
+  it("autostart 那条路不变：显式 kickoff 照原样投，配了 briefDir 也不会多投一句", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const sessions = makeSessionsWithBriefDir(store, "normal", join(dir, "data", "briefs"));
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    // autostart 的形状：自己写好提示文件 + 自带 kickoff 文案；start 照原样投它
+    const mine = "开工：第一步先 read `/data/briefs/x.md`，按里面的待办走。";
+    await sessions.start(id, { kickoff: mine });
+    const echoed = await log.waitFor((e) => e.type === "message_end" && e.role === "user");
+    expect(echoed.type === "message_end" ? echoed.text : null).toBe(mine);
+    await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-3")); // 这一轮跑完
+
+    const users = sessions.snapshot(id).messages.filter((m) => m.role === "user").map((m) => m.text);
+    expect(users).toEqual([mine]); // 只有这一句：没被再补一句自动生成的
+    // 提示文件也照旧由 flowcard 管着（这次是 start 自己写的）
+    expect(readFileSync(join(dir, "data", "briefs", `${id}.md`), "utf8")).toContain("☑︎ 接下来你要做的");
+    await sessions.stop(id);
   });
 });
 

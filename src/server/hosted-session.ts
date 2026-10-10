@@ -23,7 +23,7 @@ import { basename, dirname, join } from "node:path";
 import { normalizePath } from "../shared/paths.ts";
 import { shortHash } from "../shared/hash.ts";
 import type { Card } from "../shared/types.ts";
-import { cardBrief, writeBriefFile } from "./brief.ts";
+import { briefKickoff, cardBriefPath, writeCardBrief } from "./brief.ts";
 import { resolveOmpPath } from "./launch.ts";
 import { startRpcSession, type OmpEvent, type OmpRpcSession, type StartRpcOptions } from "./omp-rpc.ts";
 import type { SessionToolEvent, Store } from "./store.ts";
@@ -99,7 +99,13 @@ export type SessionImage = { name: string; dataBase64: string };
 export type StartSessionOptions = {
   /** 工作目录；不给就取卡片已绑 worktree，再退项目根。 */
   cwd?: string;
-  /** 起好后立刻发出去的第一条 prompt（"开工"：让 agent 自己去 `read` 开工提示文件）。 */
+  /**
+   * 起好后立刻发出去的第一条 prompt（"开工"：让 agent 自己去 `read` 开工提示文件）。
+   *
+   * 显式给了它 = **故意开一段新的对话**（见 `resolveResumeFile`）：自动开工（`autostart`，它自己
+   * 写好提示文件、自带这句文案）就是这么用的。**手动起会话不给它** —— 那条路要能续接，而且只有
+   * 这次真是全新会话时才该投这句（文案由 `briefKickoff` 生成，见 `start` 里的 `kickoff`）。
+   */
   kickoff?: string;
   /** 追加到 argv 之后的参数（如 `--model`）。 */
   args?: readonly string[];
@@ -186,8 +192,10 @@ export type HostedSessionDeps = {
   /** 追加到 omp argv 之后的参数（默认 `--no-title`：省一次标题模型调用）。 */
   args?: readonly string[];
   /**
-   * 开工提示文件（`<dataDir>/briefs/<card>.md`）所在的目录：`changeCwd` 用它在会话搬进新
-   * worktree 之后把那份提示重写一遍。不给就只搬会话、不改写提示文件。
+   * 开工提示文件（`<dataDir>/briefs/<card>.md`）所在的目录。配了它就等于「flowcard 管这份提示的
+   * 生命周期」：`start()` 先把它写成**当下的**（手动起会话也一样），**这次是全新会话**时再投一句
+   * kickoff 让 agent 自己去 `read`（续接的上下文里已经有那句了，不重复投）；`changeCwd` 搬进新
+   * worktree 之后也用它刷新。不给就只起会话、不碰提示文件。
    */
   briefDir?: string;
   /** omp 上报扩展的绝对路径（`defaultAdapterPath()`）：给了就显式 `-e` 它 —— 心跳/结束仍由适配器兜底。 */
@@ -372,6 +380,8 @@ async function readSessionHead(file: string): Promise<SessionHead | null> {
  * 优先级：
  *   1. 显式 `opts.resume.file`（`changeCwd` 的 handoff 副本）→ 照用；
  *   2. `opts.fresh` 或带 `kickoff`（「开工」= 故意开一段新的）→ 不续接；
+ *      （手动起会话**不带** `kickoff` —— 那条路要能续接，kickoff 由 `start()` 在"这次真是新会话"
+ *      时自己补，见那里的 `kickoff` 计算）
  *   3. 卡片上次的会话文件还在、且**头里的 sessionId 就是卡片绑定的会话、cwd 就是这次要跑的 cwd** → 续接；
  *   4. 其它 → 新会话（把原因写进 `note`；卡片压根没有会话时不说多余的话）。
  *
@@ -929,6 +939,27 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     return ompPathCache ?? undefined;
   };
 
+  /**
+   * 把开工提示文件写成**当下的**（`<briefDir>/<cardId>.md`，内容与自动开工写的完全一致 —— 同一个
+   * `cardBrief`）：手动起会话、搬 worktree（都走 `start()`）共用这一份，kickoff 只说一句「去 read 它」。
+   *
+   * 返回文件路径；没配 `briefDir`（或卡片不在了）返回 `null`。写不出去**不抛**：起会话/搬目录比这份
+   * 文件重要，静默失败可以接受（卡片投影里才有真相）。
+   */
+  const refreshBrief = async (cardId: string): Promise<string | null> => {
+    const briefDir = deps.briefDir;
+    if (briefDir === undefined) return null;
+    const card = store.getCard(cardId);
+    if (!card) return null;
+    const project = store.getProject(card.projectId);
+    await writeCardBrief({
+      briefDir,
+      card,
+      ...(project === undefined ? {} : { project }),
+    }).catch(() => undefined);
+    return cardBriefPath(briefDir, cardId);
+  };
+
   const start = async (cardId: string, opts: StartSessionOptions = {}): Promise<StartSessionResult> => {
     const card = store.getCard(cardId);
     if (!card) {
@@ -966,6 +997,11 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
 
     const ompPath = await resolveOmpPathOnce();
     /**
+     * 开工提示**先落盘**（手动起会话也一样 —— 不再只有自动开工写它）：kickoff 只说一句「去 read 它」，
+     * 文件必须先在那儿。内容永远是"当下"的（续接时也刷新：它描述现状，不是历史）。
+     */
+    const briefFile = await refreshBrief(cardId);
+    /**
      * 续接：`-r <会话文件>`。
      * 真机验过（omp 18.8.7）：**`-r` 时 omp 拿会话文件头里的 `cwd` 当工作目录，`--cwd` 被忽略** ——
      * 换目录必须给一份改过头的会话文件（`writeHandoff`），只传 `--cwd` 是白搭。
@@ -974,6 +1010,14 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
      * 服务重启把托管子进程带走之后，再点「启动会话」接着的是原来的上下文。
      */
     const { file: resumeFile, note: resumeNote } = await resolveResumeFile(card, cwd, opts);
+    /**
+     * 开工那句 prompt（文案见 `briefKickoff`，与自动开工同一句）：**只在这次是全新会话**时投 ——
+     * 判据就是这次没带 `-r`（`resumeFile === null`；"会话文件没了/头对不上而退化成新会话"也算新会话，
+     * 那种情况上下文真的没了，正需要这句）。`-r` 续接的上下文里已经躺着那句、多半也读过那份提示了，
+     * 再投一遍纯属噪音。显式 `opts.kickoff`（自动开工）优先，照原样投，且它本身就会强制新会话。
+     */
+    const kickoff =
+      opts.kickoff ?? (resumeFile === null && briefFile !== null ? briefKickoff(briefFile) : undefined);
     const args = [
       ...(deps.args ?? ["--no-title"]),
       ...(deps.adapterPath === undefined ? [] : ["-e", deps.adapterPath]),
@@ -1019,7 +1063,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     emitState(live);
     // 降级成新会话的原因（文件没了/头对不上）—— 说清一句，别让"上下文丢了"变成看不见的事
     if (resumeNote !== undefined) emit(live, { type: "notice", level: "warning", message: resumeNote });
-    void bringUp(live, opts);
+    void bringUp(live, kickoff === undefined ? opts : { ...opts, kickoff });
 
     return { ok: true, status: "starting", cwd };
   };
@@ -1227,19 +1271,8 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       if (handoff !== null) resume = { file: handoff };
     }
 
-    // 3) 起会话：搬完把开工提示文件按**绑定后的新 worktree** 重写一份（提示不再进系统提示，
-    //    这份文件就是唯一来源；会话（或之后重启的会话）再 `read` 它，看到的才是当下的现状）。
-    if (deps.briefDir !== undefined) {
-      const project = store.getProject(card.projectId);
-      const fresh = store.getCard(cardId) ?? card;
-      const brief = cardBrief({
-        card: fresh,
-        ...(project === undefined ? {} : { project }),
-        ...(fresh.worktree === null ? {} : { worktree: { path: fresh.worktree.path, branch: fresh.worktree.branch } }),
-      });
-      // 提示写不出去不该拖垮「把会话搬进去」这件事本身 —— 静默失败可以接受（卡片投影里有真相）
-      await writeBriefFile(join(deps.briefDir, `${cardId}.md`), brief).catch(() => undefined);
-    }
+    // 3) 起会话：`start()` 会按**当下的卡片现状**重写开工提示（提示不再进系统提示，这份文件就是
+    //    唯一来源；会话（或之后重启的会话）再 `read` 它，看到的才是当下的现状）。
     const started = await start(cardId, { cwd: opts.cwd, ...(resume === null ? {} : { resume }) });
     return {
       ...started,
