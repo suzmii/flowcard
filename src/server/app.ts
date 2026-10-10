@@ -1,9 +1,16 @@
-/** HTTP 接口 + SSE：写入只走 /api/commands（命令），读取走投影。 */
+/** HTTP 接口 + SSE：写入只走 /api/commands（命令），读取走投影；同时把构建好的看板当静态资源发出去。 */
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
+import { serveStatic } from "@hono/node-server/serve-static";
 import { streamSSE } from "hono/streaming";
 import { commandSchema, runtimeActionSchema } from "../shared/types.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
 import type { Store } from "./store.ts";
+
+/** 看板构建产物目录（`npm run web:build` 的 outDir）。 */
+const WEB_DIST = fileURLToPath(new URL("../../web/dist", import.meta.url));
 
 export type AppOptions = { runtime?: RuntimeSupervisor };
 
@@ -131,6 +138,22 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       }
     }),
   );
+
+  // 看板静态资源：注册在 /api 路由之后，不会盖住接口。没构建过就给一条人话提示。
+  if (existsSync(join(WEB_DIST, "index.html"))) {
+    app.use("/*", serveStatic({ root: WEB_DIST }));
+    app.get("*", serveStatic({ path: join(WEB_DIST, "index.html") }));
+  } else {
+    app.get("/", (c) =>
+      c.html(
+        "<!doctype html><meta charset='utf-8'><title>flowcard</title>" +
+          "<body style='font:14px/1.6 system-ui;padding:2rem'>" +
+          "<h1>flowcard</h1><p>看板还没构建。先跑：</p>" +
+          "<pre>npm run web:install &amp;&amp; npm run web:build</pre>" +
+          "<p>然后刷新本页（接口在 <code>/api</code> 下已可用）。</p></body>",
+      ),
+    );
+  }
 
   return app;
 }
