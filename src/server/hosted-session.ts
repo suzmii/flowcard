@@ -16,15 +16,14 @@
  * 重启服务后 `snapshot()` 照样给得出历史。
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { normalizePath } from "../shared/paths.ts";
 import { shortHash } from "../shared/hash.ts";
 import type { Card } from "../shared/types.ts";
-import { cardBrief } from "./brief.ts";
+import { cardBrief, writeBriefFile } from "./brief.ts";
 import { resolveOmpPath } from "./launch.ts";
 import { startRpcSession, type OmpEvent, type OmpRpcSession, type StartRpcOptions } from "./omp-rpc.ts";
 import type { SessionToolEvent, Store } from "./store.ts";
@@ -100,9 +99,7 @@ export type SessionImage = { name: string; dataBase64: string };
 export type StartSessionOptions = {
   /** 工作目录；不给就取卡片已绑 worktree，再退项目根。 */
   cwd?: string;
-  /** 开工提示（卡片现状 + 待办）：作为 `--append-system-prompt` 注入。 */
-  brief?: string;
-  /** 起好后立刻发出去的第一条 prompt（"开工"）。 */
+  /** 起好后立刻发出去的第一条 prompt（"开工"：让 agent 自己去 `read` 开工提示文件）。 */
   kickoff?: string;
   /** 追加到 argv 之后的参数（如 `--model`）。 */
   args?: readonly string[];
@@ -143,51 +140,6 @@ export type ChangeCwdResult = {
   error?: SessionError;
 };
 
-/**
- * `--append-system-prompt` 的值上限：Linux 单个 argv 元素上限 `MAX_ARG_STRLEN` = 128 KiB，
- * 超了 omp 根本起不来（E2BIG），而 flowcard 还会报"已启动会话"。留出余量给别的参数与环境。
- */
-export const MAX_INLINE_BRIEF_BYTES = 96 * 1024;
-
-/** 按 UTF-8 边界截到至多 `limit` 字节（不把多字节字符切成两半）。 */
-function truncateUtf8(text: string, limit: number): string {
-  const bytes = Buffer.from(text, "utf8");
-  if (bytes.length <= limit) return text;
-  let end = limit;
-  // 截断点落在续字节上 = 这个字符跨了边界：往回退到字符边界
-  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end--;
-  return bytes.subarray(0, end).toString("utf8");
-}
-
-/**
- * `--append-system-prompt` 该传什么：
- *   · 小 brief（默认路径）→ 直接传正文（**顺手补个换行**，见下）；
- *   · 超过 argv 上限 → 写成文件，传**文件路径**（omp 的 `resolvePromptInput` 判定规则是
- *     "含不含 `\n`"：含换行当正文，否则先试 `Bun.file(值).text()` —— 所以传路径它自己会读进来；
- *     既不撞 E2BIG，也没有 `$(cat …)` 那套）；
- *   · 连文件都写不出去 → 截断 + 注明全文在哪，**绝不让会话因为提示太长而起不来**。
- *
- * 补换行是为了钉死"这是正文不是路径"：不带换行的短字符串会被 omp 当路径去试读。
- */
-export function briefPromptArg(
-  brief: string,
-  cardId: string,
-  dir: string = join(tmpdir(), "flowcard-briefs"),
-): string {
-  if (Buffer.byteLength(brief, "utf8") <= MAX_INLINE_BRIEF_BYTES) {
-    return brief.includes("\n") ? brief : `${brief}\n`;
-  }
-  const file = join(dir, `${cardId}.md`);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, brief, { mode: 0o600 });
-    return file;
-  } catch {
-    const note = `\n\n…（提示超过 ${MAX_INLINE_BRIEF_BYTES} 字节，已截断：全文看 \`flowcard show ${cardId}\`）`;
-    return `${truncateUtf8(brief, MAX_INLINE_BRIEF_BYTES - Buffer.byteLength(note, "utf8"))}${note}`;
-  }
-}
-
 export type CardChange = { cardId: string; types: string[] };
 export type HostedSessions = {
   start(cardId: string, opts?: StartSessionOptions): Promise<StartSessionResult>;
@@ -197,8 +149,9 @@ export type HostedSessions = {
   /**
    * 把会话搬到新的工作目录（卡片进 worktree 的正规路径）：
    * 停掉当前进程 → 原会话（`-r`，cwd 头改到新目录）续接 → 起来后自己重新 claim（卡片进「实施中」）。
+   * 搬完会把开工提示文件按**新的 worktree** 重写一份（见 `briefDir`）。
    */
-  changeCwd(cardId: string, opts: { cwd: string; brief?: string }): Promise<ChangeCwdResult>;
+  changeCwd(cardId: string, opts: { cwd: string }): Promise<ChangeCwdResult>;
   /**
    * 删掉这张卡的会话：① 在跑就先停掉它的 omp 进程；② 清转录（`session_messages` 这张卡的行）；
    * ③ 落一条 `session.deleted` 把卡片上的会话事实清成 `null`；④ 丢掉进程内的 live 记录。
@@ -232,6 +185,11 @@ export type HostedSessionDeps = {
   resolveOmpPath?: (opts?: { run?: never }) => Promise<string | undefined>;
   /** 追加到 omp argv 之后的参数（默认 `--no-title`：省一次标题模型调用）。 */
   args?: readonly string[];
+  /**
+   * 开工提示文件（`<dataDir>/briefs/<card>.md`）所在的目录：`changeCwd` 用它在会话搬进新
+   * worktree 之后把那份提示重写一遍。不给就只搬会话、不改写提示文件。
+   */
+  briefDir?: string;
   /** omp 上报扩展的绝对路径（`defaultAdapterPath()`）：给了就显式 `-e` 它 —— 心跳/结束仍由适配器兜底。 */
   adapterPath?: string;
   /** 适配器日志目录（按卡片分文件，不再互相覆盖）。 */
@@ -1019,8 +977,8 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     const args = [
       ...(deps.args ?? ["--no-title"]),
       ...(deps.adapterPath === undefined ? [] : ["-e", deps.adapterPath]),
-      // brief 可能是正文，也可能是落盘后的路径（超大提示走路径，见 briefPromptArg）
-      ...(opts.brief === undefined ? [] : ["--append-system-prompt", briefPromptArg(opts.brief, cardId)]),
+      // 开工提示**不进 argv**（每轮请求都要重发的 `--append-system-prompt` 已废）：
+      // 提示落在 `<dataDir>/briefs/<card>.md`，由 kickoff 那一句 prompt 让 agent 自己去 read。
       ...(resumeFile === null ? [] : ["-r", resumeFile]),
       ...(opts.args ?? []),
     ];
@@ -1230,9 +1188,10 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
    * 自己重新 claim（cwd 已在新目录）→ 卡片自动进「实施中」。
    *
    * 原会话没留下会话文件（或文件没了/读不动）就退化成新起一条会话：卡片照样能进「实施中」，
-   * 但 omp 侧的历史断了——这种情况在 `note` 里明说，不静默。
+   * 但 omp 侧的历史断了——这种情况在 `note` 里明说，不静默。搬完顺带把开工提示文件重写一份
+   * （新 worktree 已绑上，提示里的 ☑︎ 待办要跟着变）。
    */
-  const changeCwd = async (cardId: string, opts: { cwd: string; brief?: string }): Promise<ChangeCwdResult> => {
+  const changeCwd = async (cardId: string, opts: { cwd: string }): Promise<ChangeCwdResult> => {
     const card = store.getCard(cardId);
     if (!card) {
       return { ok: false, status: "stopped", resumed: false, error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } };
@@ -1268,17 +1227,20 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       if (handoff !== null) resume = { file: handoff };
     }
 
-    // 3) 起会话：brief 按绑定后的新 worktree 重新生成（调用方没给才自己算）。
-    const project = store.getProject(card.projectId);
-    const fresh = store.getCard(cardId) ?? card;
-    const brief =
-      opts.brief ??
-      cardBrief({
+    // 3) 起会话：搬完把开工提示文件按**绑定后的新 worktree** 重写一份（提示不再进系统提示，
+    //    这份文件就是唯一来源；会话（或之后重启的会话）再 `read` 它，看到的才是当下的现状）。
+    if (deps.briefDir !== undefined) {
+      const project = store.getProject(card.projectId);
+      const fresh = store.getCard(cardId) ?? card;
+      const brief = cardBrief({
         card: fresh,
         ...(project === undefined ? {} : { project }),
         ...(fresh.worktree === null ? {} : { worktree: { path: fresh.worktree.path, branch: fresh.worktree.branch } }),
       });
-    const started = await start(cardId, { cwd: opts.cwd, brief, ...(resume === null ? {} : { resume }) });
+      // 提示写不出去不该拖垮「把会话搬进去」这件事本身 —— 静默失败可以接受（卡片投影里有真相）
+      await writeBriefFile(join(deps.briefDir, `${cardId}.md`), brief).catch(() => undefined);
+    }
+    const started = await start(cardId, { cwd: opts.cwd, ...(resume === null ? {} : { resume }) });
     return {
       ...started,
       ...(previousCwd === undefined ? {} : { previousCwd }),

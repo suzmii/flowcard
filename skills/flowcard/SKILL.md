@@ -28,7 +28,9 @@ flowcard end <card> --summary "做完什么"                       # ④ 交回 
 ```
 
 - **不要**自己编造状态，也别把"卡片状态"当成需要你去推进的流程——你只负责产生事实（worktree/PR/推送/会话）。
-- 会话必须是**在卡片的 worktree 里**跑的那个（`cwd` 不在 worktree 内会被拦）；omp 用 `/wt <分支>` 或 `/move <路径>` 进去。
+- 会话必须是**在卡片的 worktree 里**跑的那个（`cwd` 不在 worktree 内会被拦）。
+  **斜杠命令（`/wt`、`/move`）你执行不了**——要用 `flowcard worktree use <card> --path <worktree>`：
+  它会绑 worktree 并把**当前这段会话**用新 cwd 续接（转录连续、卡片自动进「实施中」）。
 - subagent 会话**不绑卡片**（一张卡只有一个主会话）；它们归 harness 自己管。
 
 # 状态与门禁（只有这四条会拦你）

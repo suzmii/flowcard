@@ -71,22 +71,32 @@ function fakeSessions(outcome: Partial<StartSessionResult> = {}): {
 }
 
 describe("开工提示（brief）", () => {
-  it("把现状与待办都写进去：没 worktree / 没 Issue / 没 PR / 没推送时都是待办", () => {
+  it("只写卡片特有的事实：要件现状 + 待办清单 + 关键绝对路径，skill 覆盖过的通用规矩一个字不留", () => {
     const text = cardBrief({ card: card(), project });
-    expect(text).toContain("卡片 c7");
+    // 卡号 / 状态 / 正文
+    expect(text).toContain("卡片 c7：修一个 bug");
     expect(text).toContain("待开工");
     expect(text).toContain("现象：点开会卡住");
-    expect(text).toContain("先建 worktree");
-    expect(text).toContain("绑上对应的 Issue");
-    expect(text).toContain("开 WIP PR");
+    // 六项交付要件现状
+    expect(text).toContain("## 六项交付要件");
+    expect(text).toContain("| Issue | worktree | WIP PR | 推送 | 验收 | 清理 |");
+    // ☑︎ 待办清单：缺什么列什么
+    expect(text).toContain("## ☑︎ 接下来你要做的");
+    expect(text).toContain("- [ ] **先建 worktree，名字由你起**");
+    expect(text).toContain("- [ ] 绑上对应的 Issue");
+    expect(text).toContain("- [ ] 开 WIP PR");
     expect(text).toContain("flowcard push c7 --sha");
-    // 铁律必须在
-    expect(text).toContain("远程写要人批");
-    expect(text).toContain("会话必须待在 worktree 里");
-    expect(text).toContain("验收、清理只能人点");
+    // 关键绝对路径 + 位置约束
+    expect(text).toContain("`/repo`");
+    expect(text).toContain("在主仓库里改文件不算开工");
+    // 这些是 skill（`~/.agents/skills/flowcard`）已经讲的：brief 里不再重复
+    expect(text).not.toContain("远程写要人批");
+    expect(text).not.toContain("一次授权只覆盖");
+    expect(text).not.toContain("退出码 4");
+    expect(text).not.toContain("## 常用命令");
   });
 
-  it("已完成的步骤标 ✅，未完成的标 ⬜", () => {
+  it("已完成的要件标 [x]，没做的标 [ ]", () => {
     const text = cardBrief({
       card: card({
         issue: { repo: "Team/Repo", number: 742, url: "https://x/742", state: "open" },
@@ -95,10 +105,10 @@ describe("开工提示（brief）", () => {
       }),
       project,
     });
-    expect(text).toMatch(/✅ worktree 已就绪/);
-    expect(text).toMatch(/✅ Issue 已绑：#742/);
-    expect(text).toMatch(/⬜ 开 WIP PR/);
-    expect(text).toMatch(/✅ 已有 1 条推送记录/);
+    expect(text).toMatch(/- \[x\] 会话就待在 worktree 里干活：`\/repo\/\.worktrees\/c7`/);
+    expect(text).toMatch(/- \[x\] Issue 已绑：#742/);
+    expect(text).toMatch(/- \[ \] 开 WIP PR/);
+    expect(text).toMatch(/- \[x\] 已有 1 条推送记录/);
   });
 
   it("正文为空也不崩", () => {
@@ -147,7 +157,7 @@ describe("自动开工编排", () => {
     return base;
   };
 
-  it("正常路径：写提示 → 起托管会话（brief 走系统提示、开工话走第一条 prompt），结论写进评论", async () => {
+  it("正常路径：写提示文件 → 起托管会话（第一条 prompt 就是「去 read 那个文件」），结论写进评论", async () => {
     const d = deps();
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("started");
@@ -155,8 +165,11 @@ describe("自动开工编排", () => {
     expect(outcome.session).toEqual({ ok: true, status: "starting" });
     expect(d.started).toHaveLength(1);
     expect(d.started[0]?.cwd).toBe("/repo");
-    expect(d.started[0]?.brief).toContain("你是 flowcard 卡片 c7 的会话");
-    expect(d.started[0]?.kickoff).toContain("开工：你是卡片 c7 的会话");
+    // 提示不再走 `--append-system-prompt`：start 根本不收 brief 这个参数，kickoff 里给的是**绝对路径**
+    expect(Object.hasOwn(d.started[0] ?? {}, "brief")).toBe(false);
+    expect(outcome.briefPath).toBe("/data/briefs/c7.md");
+    expect(d.started[0]?.kickoff).toContain("先 read `/data/briefs/c7.md`");
+    expect(d.started[0]?.kickoff).toContain("flowcard comment");
     expect(d.calls.some((c) => c.startsWith("comment:c7:已托管会话"))).toBe(true);
   });
 
@@ -193,7 +206,7 @@ describe("自动开工编排", () => {
     expect(fake.started).toHaveLength(0);
   });
 
-  it("提示里把「建 worktree」交回给会话：名字自定 + 一步搬进去（不再让 AI 用斜杠命令）", async () => {
+  it("待办里把「建 worktree」交回给会话：名字自定 + 一步搬进去（不再让 AI 用斜杠命令）", async () => {
     const d = deps();
     const outcome = await autostartCard("c7", d as never);
     const text = cardBrief({ card: card(), project });

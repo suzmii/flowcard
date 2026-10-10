@@ -78,9 +78,10 @@ describe("开卡即开工", () => {
     expect(body.autostart?.cwd).toBe("/tmp/proj");
     expect(started).toHaveLength(1);
     expect(started[0]?.cwd).toBe("/tmp/proj");
-    // 提示词与"开工"那句都进了托管会话
-    expect(started[0]?.brief).toContain("你是 flowcard 卡片 c1 的会话");
-    expect(started[0]?.kickoff).toContain("开工：你是卡片 c1 的会话");
+    // 提示落在文件里（不进 argv），第一条 prompt 只有一个绝对路径指向它
+    expect(Object.hasOwn(started[0] ?? {}, "brief")).toBe(false);
+    expect(started[0]?.kickoff).toContain("先 read `");
+    expect(started[0]?.kickoff).toContain("/briefs/c1.md");
   });
 
   it("起会话失败也不静默：响应里带 summary，卡片上留一条评论", async () => {

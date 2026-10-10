@@ -9,7 +9,7 @@
  *   所以换目录必须给一份改过头的会话文件，光传 `--cwd` 是白搭。
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,7 +129,12 @@ function openCard(store: Store, worktreePath: string): string {
 }
 
 /** 会话注册表：`calls` 记下每次 start 拿到了什么（argv 断言用），`sessionFile` 是假 omp 报的会话文件。 */
-function makeSessions(store: Store, calls: StartRpcOptions[] = [], sessionFile?: string): HostedSessions {
+function makeSessions(
+  store: Store,
+  calls: StartRpcOptions[] = [],
+  sessionFile?: string,
+  briefDir?: string,
+): HostedSessions {
   return createHostedSessions({
     store,
     startSession: (opts) => {
@@ -137,6 +142,7 @@ function makeSessions(store: Store, calls: StartRpcOptions[] = [], sessionFile?:
       return spawnFake(sessionFile)(opts);
     },
     resolveOmpPath: async () => undefined, // 别真去 `sh -c command -v omp`
+    ...(briefDir === undefined ? {} : { briefDir }),
   });
 }
 
@@ -198,7 +204,8 @@ describe("changeCwd：把会话搬进 worktree", () => {
     const fixture = writeSessionFixture(join(dir, "omp-sessions"), proj);
     const id = openCard(store, proj);
     const calls: StartRpcOptions[] = [];
-    const sessions = makeSessions(store, calls, fixture);
+    const briefFile = join(dir, "briefs", `${id}.md`);
+    const sessions = makeSessions(store, calls, fixture, join(dir, "briefs"));
     const log = new EventLog();
     sessions.subscribe(id, log.push);
 
@@ -208,6 +215,7 @@ describe("changeCwd：把会话搬进 worktree", () => {
     await log.waitFor(sessionReady(proj));
     const before = sessions.snapshot(id).messages.length;
     expect(before).toBeGreaterThan(0);
+    expect(existsSync(briefFile)).toBe(false); // 还没有人写过开工提示
 
     const moved = await sessions.changeCwd(id, { cwd: wt });
     expect(moved.ok).toBe(true);
@@ -215,6 +223,11 @@ describe("changeCwd：把会话搬进 worktree", () => {
     expect(moved.previousCwd).toBe(proj);
     expect(moved.cwd).toBe(wt);
     expect(moved.status).toBe("starting");
+
+    // 搬完把开工提示文件重写一份（提示不再进系统提示，这份文件就是唯一来源）
+    const brief = readFileSync(briefFile, "utf8");
+    expect(brief).toContain(`- [x] 会话就待在 worktree 里干活：\`${proj}\``);
+    expect(brief).toContain("## ☑︎ 接下来你要做的");
 
     // 续接文件 = 新目录对应会话目录里的副本，头里的 cwd 已改；原文件没被动过
     const handoff = join(dir, "omp-sessions", normalizePath(wt).replace(/\//g, "-"), "fake-session-1.jsonl");

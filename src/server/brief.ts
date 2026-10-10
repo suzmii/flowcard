@@ -1,6 +1,12 @@
 /**
- * 开工提示（brief）：把"这张卡的现状 + 接下来该做什么"写成一段 markdown，
- * 由启动会话时通过 `--append-system-prompt` 注入，让 AI 一睁眼就知道自己是谁、要干什么。
+ * 开工提示（brief）：把"这张卡的现状 + 还缺什么"写成一段 markdown，落在
+ * `<dataDir>/briefs/<card>.md`；起会话时只发**一句话**让 agent 自己 `read` 它
+ * （不走 `--append-system-prompt`，不必每轮请求重发全文）。
+ *
+ * 只写**卡片特有的事实**：卡号/标题、当前状态、六项交付要件现状、☑︎ 待办清单、
+ * 关键绝对路径（项目根 / worktree）、以及"会话没进 worktree 不算开工"这类**位置**约束。
+ * 通用规矩（远程写要人批、退出码 4、验收/清理只能人点、常用命令清单…）由 skill
+ * `~/.agents/skills/flowcard` 覆盖，这里**不重复**。
  *
  * 纯函数：只吃 card/project/worktree，输出文本；便于单测与复用（CLI/UI 也能拿它做预览）。
  */
@@ -18,19 +24,19 @@ export type BriefInput = {
   cli?: string | undefined;
 };
 
-function line(ok: boolean, text: string): string {
-  return `- ${ok ? "✅" : "⬜"} ${text}`;
+function todo(ok: boolean, text: string): string {
+  return `- ${ok ? "[x]" : "[ ]"} ${text}`;
 }
 
-/** 按卡片现状生成"接下来要做的步骤"。已完成的步骤也要列出（用 ✅ 标出）。 */
-function steps(card: Card, cli: string, worktree: { path: string; branch: string } | undefined): string[] {
+/** 按"还缺哪个要件"生成待办：已完成的也列出来（`[x]`），一眼能看出还剩几件。 */
+function todos(card: Card, cli: string, worktree: { path: string; branch: string } | undefined): string[] {
   const out: string[] = [];
   const wt = worktree ?? card.worktree ?? undefined;
 
   out.push(
     wt
-      ? line(true, `worktree 已就绪：\`${wt.path}\`（分支 \`${wt.branch}\`）——**你就在里面干活，别切到主仓库**`)
-      : line(
+      ? todo(true, `会话就待在 worktree 里干活：\`${wt.path}\`（分支 \`${wt.branch}\`）`)
+      : todo(
           false,
           [
             "**先建 worktree，名字由你起**：目录名与分支名都按这次要干的事取（分支前缀看改动性质——feat / fix / chore / docs / refactor…，跟本仓库惯例走）：",
@@ -40,42 +46,37 @@ function steps(card: Card, cli: string, worktree: { path: string; branch: string
             "  ```",
             "  **斜杠命令你执行不了，别尝试 `/move`、`/wt`**：`worktree use` 会替你做——登记 worktree、停掉当前会话、",
             "  用新目录续接（还是同一条会话，历史都在），新会话起来后自己 claim，卡片随即进「实施中」。",
-            "  会话搬进新目录之前，**在主仓库里改文件不算开工**。",
           ].join("\n"),
         ),
   );
 
   out.push(
     card.issue
-      ? line(
-          true,
-          `Issue 已绑：#${card.issue.number} ${card.issue.url}（干活前先读它，别自己另开一个）`,
-        )
-      : line(
+      ? todo(true, `Issue 已绑：#${card.issue.number} ${card.issue.url}（干活前先读它，别自己另开一个）`)
+      : todo(
           false,
-          `绑上对应的 Issue（**只填编号**）：\`${cli} issue ${card.id} --number <编号>\`；确实没有就跳过，并在评论里写清为什么没有`,
+          `绑上对应的 Issue（**只填编号**）：\`${cli} issue ${card.id} --number <编号>\`；确实没有就在评论里写清为什么没有`,
         ),
   );
 
   out.push(
     card.pr
-      ? line(true, `WIP PR 已绑：#${card.pr.number} ${card.pr.url}（状态 ${card.pr.state}）`)
-      : line(
-          false,
-          `开 WIP PR（**任务一开始就开**）：推分支后 \`${cli} pr ${card.id} --number <编号> --url <链接> --branch <分支>\``,
-        ),
+      ? todo(true, `WIP PR 已绑：#${card.pr.number} ${card.pr.url}（状态 ${card.pr.state}）`)
+      : todo(false, `开 WIP PR（**任务一开始就开**）：推分支后 \`${cli} pr ${card.id} --number <编号> --url <链接> --branch <分支>\``),
   );
 
   out.push(
     card.pushes.length > 0
-      ? line(true, `已有 ${card.pushes.length} 条推送记录（最新 ${card.pushes.at(-1)?.sha.slice(0, 8) ?? ""}）`)
-      : line(
-          false,
-          `推进度要留痕：推送后 \`${cli} push ${card.id} --sha <sha>\`（以后每次 push 都记一条）`,
-        ),
+      ? todo(true, `已有 ${card.pushes.length} 条推送记录（最新 ${card.pushes.at(-1)?.sha.slice(0, 8) ?? ""}）`)
+      : todo(false, `推进度要留痕：推送后 \`${cli} push ${card.id} --sha <sha>\`（以后每次 push 都记一条）`),
   );
 
-  out.push(line(Boolean(card.acceptedAt), "验收与清理由人来做——你只负责把交付要件备齐，然后交回"));
+  out.push(
+    todo(
+      Boolean(card.acceptedAt),
+      `要件备齐就交回：\`${cli} end ${card.id} --summary "做完什么"\` —— 剩下的验收与清理由人来做`,
+    ),
+  );
 
   return out;
 }
@@ -100,54 +101,40 @@ export function cardBrief(input: BriefInput): string {
   const project = input.project;
   const worktree = input.worktree ?? card.worktree ?? undefined;
 
-  const where = [
-    project ? `项目：\`${project.name}\`（${project.path}${project.defaultBranch ? `，默认分支 ${project.defaultBranch}` : ""}）` : null,
-    worktree ? `worktree：\`${worktree.path}\`（分支 \`${worktree.branch}\`）` : null,
+  const paths = [
+    project
+      ? `- 项目根：\`${project.path}\`（${project.name}${project.defaultBranch ? `，默认分支 ${project.defaultBranch}` : ""}）`
+      : null,
+    worktree
+      ? `- worktree：\`${worktree.path}\`（分支 \`${worktree.branch}\`）`
+      : `- worktree：未绑（下面第一条待办就是建它）`,
+    project?.remote ? `- 远端：${project.remote}` : null,
   ]
     .filter((x): x is string => x !== null)
     .join("\n");
 
-  const remote = project?.remote ? `\n远端：${project.remote}` : "";
+  return `# 卡片 ${card.id}：${card.title}
 
-  return `# 你是 flowcard 卡片 ${card.id} 的会话
-
-${where}${remote}
-
-**卡片标题**：${card.title}
 **当前状态**：${STATE_LABELS[card.state as CardState] ?? card.state}
-**正文（你的需求原文）**：
+
+**正文（需求原文）**：
 
 ${card.body.trim() === "" ? "（空）" : card.body.trim()}
+
+## 关键路径
+
+${paths}
 
 ## 六项交付要件
 
 ${checklist(card).join("\n")}
 
-## 接下来你要做的
+## ☑︎ 接下来你要做的
 
-${steps(card, cli, worktree).join("\n")}
+${todos(card, cli, worktree).join("\n")}
 
-## 铁律（违反会被拦或回滚）
-
-1. **远程写要人批，一事一议**：push / 开 PR / 合并 / 远程评论之前先
-   \`${cli} confirm ${card.id} --request --for push --detail "git push -u origin <分支>"\`，
-   人批了再执行，执行完 \`${cli} confirm ${card.id} --consume <id>\`；被驳回就停下问人，别换个说法再申请。
-2. **会话必须待在 worktree 里**（cwd 不在 worktree 内就不算开工）：会话没在里面就用
-   \`${cli} worktree use ${card.id} --path <worktree 路径>\` 搬进去 —— **斜杠命令（\`/wt\`、\`/move\`）你执行不了，别试**；
-   这条命令会停掉当前会话、用新目录续接（同一条会话），别在主仓库改文件。
-3. **验收、清理只能人点**：\`flowcard accept\` / 清理门禁 G4 不是你能代做的；PR 合并前不要拆任何复现环境。
-4. 缺东西时命令会回**退出码 4**，那不是报错：照 JSON 里 \`blocked.missing\` 补齐再重试；同一缺项连拦两次就停下来问人。
-
-## 常用命令
-
-\`\`\`bash
-${cli} show ${card.id}                          # 看当前状态（缺什么它会说）
-${cli} worktree use ${card.id} --path <已建好的 worktree 路径>   # 把会话搬进去（卡片进「实施中」）
-${cli} comment ${card.id} --body "进展/结论"     # 留痕
-${cli} diff ${card.id}                          # 看自己的改动
-${cli} end ${card.id} --summary "做完什么"        # 交回（自动进待验收）
-${cli} block ${card.id} --reason "缺什么"         # 卡住了就明说
-\`\`\`
+**位置**：会话没进 worktree 就不算开工（在主仓库里改文件不算开工）—— 搬进去用
+\`${cli} worktree use ${card.id} --path <worktree 路径>\`（停当前会话、用新目录续接同一条会话）。
 `;
 }
 

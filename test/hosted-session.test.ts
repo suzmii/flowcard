@@ -177,7 +177,7 @@ function spawnFake(mode: string, sessionFile?: string, extraEnv?: NodeJS.Process
     const session = startRpcSession({
       ...opts,
       ompPath: process.execPath,
-      // omp 的真实参数（`-r`/`--append-system-prompt`…）跟着脚本一起透传，假 omp 才看得见它们。
+      // omp 的真实参数（`-r`/`-e`…）跟着脚本一起透传，假 omp 才看得见它们。
       // `--` 不能省：不然 node 会把 `--no-title` 之类当自己的选项，直接报错退出（起不来）。
       argv: ["-e", FAKE_OMP_SOURCE, "--", ...(opts.args ?? [])],
       env: {
@@ -405,6 +405,32 @@ describe("托管会话（假 omp 真管道）", () => {
       "tool",
       "assistant",
     ]);
+  });
+
+  it("起会话不往 argv 塞 --append-system-prompt：kickoff 就是第一条 prompt，里面带 brief 的绝对路径", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const calls: StartRpcOptions[] = [];
+    const sessions = makeSessions(store, "normal", calls);
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    // autostart 实际用的那个路径（`<dataDir>/briefs/<card>.md`）
+    const briefPath = join(dir, "data", "briefs", `${id}.md`);
+    const kickoff = `开工：第一步先 read \`${briefPath}\`，按里面「☑︎ 接下来你要做的」逐步执行。`;
+    await sessions.start(id, { kickoff });
+
+    // argv 里既没有注入用的 flag，也没有提示正文（提示只在文件里）
+    const args = calls[0]?.args ?? [];
+    expect(args).not.toContain("--append-system-prompt");
+    expect(args.some((arg) => arg.includes("接下来你要做的") || arg.includes("# 卡片"))).toBe(false);
+
+    // 第一条 prompt 原样发出去 = 「去 read 那个绝对路径」，效果等同注入一次 tool use
+    const user = await log.waitFor((e) => e.type === "message_end" && e.role === "user");
+    expect(user.type === "message_end" ? user.text : null).toBe(kickoff);
+    expect(kickoff).toContain(briefPath);
+    expect(sessions.snapshot(id).messages[0]?.text).toBe(kickoff);
+    await sessions.stop(id);
   });
 
   it("abort：中断当前一轮，transcript 留下被中断的那一段", async () => {

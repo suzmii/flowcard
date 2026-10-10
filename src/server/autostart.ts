@@ -1,5 +1,6 @@
 /**
- * 「开工」编排：写开工提示 → 起一个**托管会话**（`omp --mode rpc --no-ui` 子进程）并把提示注入进去。
+ * 「开工」编排：写开工提示到文件 → 起一个**托管会话**（`omp --mode rpc --no-ui` 子进程）→ 第一条 prompt
+ * 让会话自己去 `read` 那份提示。
  *
  * 两件事的分工（用户定的，2026-10 起）：
  *   · worktree 由 **AI 自己建**（名字得它按任务起）——写进开工提示的第一步，做没做在清单里看得见；
@@ -7,8 +8,9 @@
  *     登记 worktree、停掉当前会话、用新 cwd `-r` 续接（斜杠命令 `/wt`、`/move` 模型调不了，这条死路已废）。
  * flowcard 负责的是把会话起起来、把「现状 + 待办」喂给它、并在失败时**不静默**地留痕。
  *
- * 提示的注入方式：开工提示作为 `--append-system-prompt` 进 omp 的启动参数（走 argv，不过 shell），
- * 「开工」那句话作为第一条 prompt 发出去 —— 都不需要终端窗口，也不需要 shell 引号转义。
+ * 提示的注入方式（用户定的，2026-10）：开工提示**不占 argv**（`--append-system-prompt` 每轮请求都要
+ * 重发一遍全文，3KB 白白烧着）—— 提示写到 `<dataDir>/briefs/<card>.md`，第一条 prompt 只说一句
+ * 「先 read 这个文件（绝对路径），按里面的待办执行」，效果等同"注入一次 tool use"。都不需要终端窗口。
  *
  * 依赖全部注入，便于单测（不碰真 omp）。
  */
@@ -85,13 +87,14 @@ async function autostartInner(cardId: string, deps: AutostartDeps): Promise<Auto
     );
   }
 
-  // ---- 1) 开工提示：把"当前状态 + 要做的事"写进文件，作为系统提示注入
+  // ---- 1) 开工提示：把"当前状态 + 还缺什么"写进文件（**不进 argv**，kickoff 只说去 read 它）
   const fresh = deps.getCard(cardId) ?? card;
+  const cli = deps.cli ?? "flowcard";
   const brief = cardBrief({
     card: fresh,
     project,
+    cli,
     ...(bound ? { worktree: { path: bound.path, branch: bound.branch } } : {}),
-    ...(deps.cli ? { cli: deps.cli } : {}),
   });
   const briefPath = join(deps.dataDir, "briefs", `${cardId}.md`);
   await doWriteBrief(briefPath, brief);
@@ -99,8 +102,7 @@ async function autostartInner(cardId: string, deps: AutostartDeps): Promise<Auto
   // ---- 2) 起托管会话（cwd 在 worktree 里，或先落在项目根）
   const started = await deps.sessions.start(cardId, {
     cwd,
-    brief,
-    kickoff: `开工：你是卡片 ${cardId} 的会话，先按系统提示里「接下来你要做的」逐步执行，每步用 flowcard comment 留痕。`,
+    kickoff: `开工：第一步先 read \`${briefPath}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`${cli} comment\` 留痕。`,
   });
 
   if (!started.ok) {

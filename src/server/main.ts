@@ -35,6 +35,8 @@ const sessions = createHostedSessions({
   store,
   adapterPath: defaultAdapterPath(),
   logDir: join(dataDir, "logs"),
+  // 开工提示（`<dataDir>/briefs/<card>.md`）：搬进 worktree 之后用它刷新那份提示。
+  briefDir: join(dataDir, "briefs"),
 });
 
 /**
