@@ -99,6 +99,7 @@ async function autostartInner(cardId: string, deps: AutostartDeps): Promise<Auto
   const ompPath = await doResolveOmp();
   const launched: LaunchSessionResult = await doLaunch({
     worktreePath: cwd,
+    cardId,
     harness: "omp",
     ...(ompPath ? { ompPath } : {}),
     ...(deps.adapterPath ? { adapterPath: deps.adapterPath } : {}),

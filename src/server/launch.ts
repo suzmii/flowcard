@@ -130,6 +130,8 @@ export type LaunchSessionResult =
 /** 在用户桌面上开一个终端跑会话（detached，不阻塞服务）。 */
 export async function launchSession(opts: {
   worktreePath: string;
+  /** 卡片 id：塞进环境变量，适配器第一秒就能绑上卡片（不必等 worktree 建好、cwd 能对上） */
+  cardId?: string;
   harness?: string;
   ompPath?: string;
   adapterPath?: string;
@@ -159,7 +161,13 @@ export async function launchSession(opts: {
     ...(opts.kickoff ? { kickoff: opts.kickoff } : {}),
   });
   const argv = terminal.argv({ cwd: opts.worktreePath, command });
-  const env = { ...process.env, ...(opts.env ?? (await sessionGraphicalEnv())) };
+  const flowcardEnv = opts.cardId
+    ? {
+        FLOWCARD_CARD: opts.cardId,
+        FLOWCARD_URL: `http://${process.env.FLOWCARD_HOST ?? "127.0.0.1"}:${process.env.FLOWCARD_PORT ?? "47825"}`,
+      }
+    : {};
+  const env = { ...process.env, ...flowcardEnv, ...(opts.env ?? (await sessionGraphicalEnv())) };
   const spawnFn = opts.spawnFn ?? spawn;
 
   try {

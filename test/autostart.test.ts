@@ -165,6 +165,22 @@ describe("自动开工编排", () => {
     expect(outcome.summary).toContain("未归属");
   });
 
+  it("起会话时把卡片 id 塞进环境，适配器第一秒就能绑卡", async () => {
+    const seen: { cardId?: string }[] = [];
+    const d = deps({
+      io: {
+        launchSession: async (opts: { cardId?: string }) => {
+          seen.push({ ...(opts.cardId ? { cardId: opts.cardId } : {}) });
+          return { ok: true, terminal: "konsole", command: "omp …" };
+        },
+        resolveOmpPath: async () => undefined,
+        writeBrief: async () => ({ written: true }),
+      },
+    });
+    await autostartCard("c7", d as never);
+    expect(seen).toEqual([{ cardId: "c7" }]);
+  });
+
   it("扩展路径由服务端自己算出来（不靠环境变量）", () => {
     const path = defaultAdapterPath();
     expect(path.endsWith("src/adapters/omp/flowcard-omp-adapter.ts")).toBe(true);
