@@ -1,92 +1,41 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Plus, X } from "lucide-react";
+import { BodyComposer } from "@/components/BodyComposer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { postCommand } from "@/lib/api";
+import { LOCAL_PROJECT_ID } from "@/lib/projects";
 import { cn } from "@/lib/utils";
 
-/** Issue 三件套：要么都填，要么都不填（客户端先挡一层，服务端还会再校验一次）。 */
-const ISSUE_FIELDS = ["repo", "number", "url"] as const;
+type Draft = { title: string; body: string };
 
-type Draft = {
-  title: string;
-  body: string;
-  issueRepo: string;
-  issueNumber: string;
-  issueUrl: string;
-  repoPath: string;
-};
+const EMPTY_DRAFT: Draft = { title: "", body: "" };
 
-const EMPTY_DRAFT: Draft = {
-  title: "",
-  body: "",
-  issueRepo: "",
-  issueNumber: "",
-  issueUrl: "",
-  repoPath: "",
-};
-
-/** 校验草稿；返回第一条可读错误（客户端拦不住的交由服务端，原文照样展示）。 */
-function validate(draft: Draft): string | null {
-  if (draft.title.trim() === "") return "标题必填：至少写一句这条需求要干什么。";
-
-  const filled = {
-    repo: draft.issueRepo.trim() !== "",
-    number: draft.issueNumber.trim() !== "",
-    url: draft.issueUrl.trim() !== "",
-  };
-  const filledCount = ISSUE_FIELDS.filter((field) => filled[field]).length;
-  if (filledCount === 0) return null;
-
-  if (filledCount < ISSUE_FIELDS.length) {
-    const missing = ISSUE_FIELDS.filter((field) => !filled[field]);
-    return `Issue 三件套必须成套填写：repo / number / url 要么都填、要么都不填（当前缺 ${missing.join("、")}）。`;
-  }
-
-  const number = Number(draft.issueNumber.trim());
-  if (!Number.isInteger(number) || number <= 0) {
-    return `Issue number 必须是正整数（当前是「${draft.issueNumber.trim()}」）。`;
-  }
-  return null;
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
-  return (
-    <label className="block space-y-1">
-      <span className="flex items-baseline gap-2">
-        <span className="text-xs font-medium">{label}</span>
-        {hint ? <span className="text-[11px] text-muted-foreground">{hint}</span> : null}
-      </span>
-      {children}
-    </label>
-  );
-}
+/** 服务端回的开卡结果（只取要展示的两项）。 */
+type Created = { id: string; title: string | null };
 
 /**
- * 人在看板上自己开卡：填标题（必填）、正文、可选 Issue 三件套、可选 repoPath。
- * 提交走和 CLI 同一条通道（`POST /api/commands` 的 `open`），成功后由 SSE/刷新把新卡带进收件箱。
+ * 人在看板上自己开卡：正文必填（主输入，支持粘贴/拖放图片），标题可选。
+ * 标题留空**不编造** —— 命令里连字段都不带，由服务端从正文派生，回填的最终标题在成功提示里展示。
+ * 卡片归属当前项目（`projectId`）；没选项目时由服务端兜到 `local`。
  */
 export function NewCardDialog({
   open,
   onClose,
   onCreated,
+  projectId,
+  projectName,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: () => Promise<void> | void;
+  projectId: string | null;
+  projectName: string | null;
 }) {
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState<Created | null>(null);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -96,35 +45,28 @@ export function NewCardDialog({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const set = useCallback(
-    <K extends keyof Draft>(key: K, value: Draft[K]) => {
-      setDraft((prev) => ({ ...prev, [key]: value }));
-    },
-    [],
-  );
+  const close = useCallback(() => {
+    setDraft(EMPTY_DRAFT);
+    setError(null);
+    setCreated(null);
+    onClose();
+  }, [onClose]);
 
   const submit = useCallback(async () => {
     setError(null);
-    const invalid = validate(draft);
-    if (invalid) {
-      setError(invalid);
+    if (draft.body.trim() === "") {
+      setError("正文必填：写清要干什么（背景 / 验收标准 / 约束）。");
       return;
     }
 
     const command: Record<string, unknown> = {
       cmd: "open",
       actor: { kind: "human", name: "me" },
-      title: draft.title.trim(),
       body: draft.body,
     };
-    if (draft.issueRepo.trim() !== "") {
-      command.issue = {
-        repo: draft.issueRepo.trim(),
-        number: Number(draft.issueNumber.trim()),
-        url: draft.issueUrl.trim(),
-      };
-    }
-    if (draft.repoPath.trim() !== "") command.repoPath = draft.repoPath.trim();
+    // 标题留空就不带这个字段：派生是服务端的事，前端不猜。
+    if (draft.title.trim() !== "") command.title = draft.title.trim();
+    if (projectId) command.projectId = projectId;
 
     setBusy(true);
     const result = await postCommand(command);
@@ -136,10 +78,10 @@ export function NewCardDialog({
       setError(rejection ? `${rejection.code}：${rejection.message}` : "开卡失败：服务端没有给出原因。");
       return;
     }
+    setCreated({ id: result.card?.id ?? "（服务端未回 id）", title: result.card?.title ?? null });
     setDraft(EMPTY_DRAFT);
     await onCreated();
-    onClose();
-  }, [draft, onClose, onCreated]);
+  }, [draft, onCreated, projectId]);
 
   if (!open) return null;
 
@@ -148,11 +90,11 @@ export function NewCardDialog({
       <div
         className="absolute inset-0 bg-black/30"
         role="presentation"
-        onClick={onClose}
+        onClick={close}
         data-testid="new-card-backdrop"
       />
       <div
-        className="relative flex max-h-full w-full max-w-[32rem] flex-col rounded-xl border bg-background shadow-xl"
+        className="relative flex max-h-full w-full max-w-[34rem] flex-col rounded-xl border bg-background shadow-xl"
         role="dialog"
         aria-modal="true"
         aria-label="新建卡片"
@@ -162,73 +104,61 @@ export function NewCardDialog({
           <Plus className="size-4 text-muted-foreground" />
           <h2 className="text-sm font-semibold">新建卡片</h2>
           <span className="text-[11px] text-muted-foreground">开出来的卡会落在「收件箱」</span>
-          <Button variant="ghost" size="icon" className="ml-auto" onClick={onClose} aria-label="关闭">
+          <Button variant="ghost" size="icon" className="ml-auto" onClick={close} aria-label="关闭">
             <X />
           </Button>
         </header>
 
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
-          <Field label="标题" hint="必填">
+          <div
+            className="flex items-center gap-1.5 rounded-md border bg-muted/40 px-2 py-1.5 text-[11px]"
+            data-testid="new-card-project"
+          >
+            <span className="text-muted-foreground">归属项目</span>
+            <span className="font-medium" data-project-id={projectId ?? LOCAL_PROJECT_ID}>
+              {projectName ?? "未选项目（落到 local，未归属）"}
+            </span>
+          </div>
+
+          {created ? (
+            <div
+              className="space-y-1 rounded-lg border border-emerald-600/30 bg-emerald-50 p-2.5 text-xs text-emerald-900"
+              data-testid="new-card-created"
+            >
+              <div className="font-medium">已开卡 · 服务端给的标题：</div>
+              <div className="break-words text-sm" data-testid="new-card-created-title">
+                {created.title ?? "（服务端没有回标题，以看板上的卡为准）"}
+              </div>
+              <div className="font-mono text-[11px] text-emerald-800/80">{created.id}</div>
+            </div>
+          ) : null}
+
+          <label className="block space-y-1">
+            <span className="flex items-baseline gap-2">
+              <span className="text-xs font-medium">正文</span>
+              <span className="text-[11px] text-muted-foreground">必填 · 主输入</span>
+            </span>
+            <BodyComposer
+              testId="new-card-body"
+              autoFocus
+              value={draft.body}
+              placeholder="背景、验收标准、约束…（图片可直接粘贴 / 拖放，会插入到光标处）"
+              onChange={(next) => setDraft((prev) => ({ ...prev, body: next }))}
+            />
+          </label>
+
+          <label className="block space-y-1">
+            <span className="flex items-baseline gap-2">
+              <span className="text-xs font-medium">标题</span>
+              <span className="text-[11px] text-muted-foreground">可选 · 留空由服务端从正文派生</span>
+            </span>
             <Input
               data-testid="new-card-title"
               value={draft.title}
-              autoFocus
-              placeholder="想干什么？一句话"
-              onChange={(event) => set("title", event.target.value)}
+              placeholder="不填也行"
+              onChange={(event) => setDraft((prev) => ({ ...prev, title: event.target.value }))}
             />
-          </Field>
-
-          <Field label="正文" hint="可选">
-            <Textarea
-              data-testid="new-card-body"
-              value={draft.body}
-              placeholder="背景、验收标准、约束…"
-              onChange={(event) => set("body", event.target.value)}
-            />
-          </Field>
-
-          <fieldset className="space-y-2 rounded-lg border p-2.5">
-            <legend className="px-1 text-[11px] text-muted-foreground">
-              Issue（可选，三件套要么都填要么都不填）
-            </legend>
-            <div className="grid grid-cols-[1fr_auto] gap-2">
-              <Field label="repo">
-                <Input
-                  data-testid="new-card-issue-repo"
-                  value={draft.issueRepo}
-                  placeholder="owner/name"
-                  onChange={(event) => set("issueRepo", event.target.value)}
-                />
-              </Field>
-              <Field label="number">
-                <Input
-                  data-testid="new-card-issue-number"
-                  value={draft.issueNumber}
-                  inputMode="numeric"
-                  placeholder="123"
-                  className="w-24"
-                  onChange={(event) => set("issueNumber", event.target.value)}
-                />
-              </Field>
-            </div>
-            <Field label="url">
-              <Input
-                data-testid="new-card-issue-url"
-                value={draft.issueUrl}
-                placeholder="https://…/issues/123"
-                onChange={(event) => set("issueUrl", event.target.value)}
-              />
-            </Field>
-          </fieldset>
-
-          <Field label="项目仓库路径" hint="可选">
-            <Input
-              data-testid="new-card-repo-path"
-              value={draft.repoPath}
-              placeholder="/home/me/workspace/proj"
-              onChange={(event) => set("repoPath", event.target.value)}
-            />
-          </Field>
+          </label>
 
           {error ? (
             <div
@@ -245,17 +175,30 @@ export function NewCardDialog({
         </div>
 
         <footer className="flex items-center justify-end gap-2 border-t px-4 py-3">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            取消
-          </Button>
-          <Button
-            size="sm"
-            data-testid="new-card-submit"
-            disabled={busy}
-            onClick={() => void submit()}
-          >
-            {busy ? "提交中…" : "开卡"}
-          </Button>
+          {created ? (
+            <>
+              <Button variant="ghost" size="sm" data-testid="new-card-again" onClick={() => setCreated(null)}>
+                再开一张
+              </Button>
+              <Button size="sm" data-testid="new-card-done" onClick={close}>
+                完成
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" size="sm" onClick={close}>
+                取消
+              </Button>
+              <Button
+                size="sm"
+                data-testid="new-card-submit"
+                disabled={busy}
+                onClick={() => void submit()}
+              >
+                {busy ? "提交中…" : "开卡"}
+              </Button>
+            </>
+          )}
         </footer>
       </div>
     </div>

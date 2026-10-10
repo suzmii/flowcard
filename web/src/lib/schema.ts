@@ -101,6 +101,8 @@ export const cardViewSchema = z.looseObject({
   title: z.string(),
   body: z.string(),
   state: z.enum(CARD_STATES),
+  /** 归属项目（`Project.id`）；服务端把没归属的老卡投影成 `local` */
+  projectId: z.string(),
   repoPath: z.string().optional(),
   issue: issueSchema.nullable(),
   pr: prSchema.nullable(),

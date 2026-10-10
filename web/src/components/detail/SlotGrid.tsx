@@ -7,6 +7,8 @@ import {
   UserCheck,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import { IssueBinder } from "@/components/detail/IssueBinder";
+import type { CommandRunner } from "@/components/detail/GatePanel";
 import { Badge } from "@/components/ui/badge";
 import type { CardView } from "@/lib/schema";
 import { cn, timeAgo } from "@/lib/utils";
@@ -52,7 +54,11 @@ function Slot({
         {filled ? (
           children
         ) : (
-          <span className="text-xs text-muted-foreground">空 · {emptyHint}</span>
+          <div className="space-y-1.5">
+            <span className="text-xs text-muted-foreground">空 · {emptyHint}</span>
+            {/* 空槽位也要能就地动作（例：Issue 槽位的「绑定 Issue」） */}
+            {children}
+          </div>
         )}
       </div>
     </div>
@@ -60,7 +66,18 @@ function Slot({
 }
 
 /** 六个必要项目格：空着也必须渲染，并在空槽位旁写明该动作是本地动作还是远程写。 */
-export function SlotGrid({ card }: { card: CardView }) {
+export function SlotGrid({
+  card,
+  defaultIssueRepo,
+  busy,
+  onRun,
+}: {
+  card: CardView;
+  /** 当前项目的 remote 短形：绑定 Issue 时预填 repo */
+  defaultIssueRepo?: string;
+  busy?: string | null;
+  onRun?: CommandRunner;
+}) {
   const latestPush = card.pushes.at(-1);
 
   return (
@@ -70,7 +87,7 @@ export function SlotGrid({ card }: { card: CardView }) {
         icon={<CircleDot className="size-3.5" />}
         kind="remote"
         filled={card.issue !== null}
-        emptyHint="还没建/绑定 issue（先有人在 GitHub 建，再 CLI 绑）"
+        emptyHint="还没建/绑定 issue（先有人在 GitHub 建，再绑）"
       >
         {card.issue ? (
           <div className="space-y-0.5">
@@ -93,6 +110,13 @@ export function SlotGrid({ card }: { card: CardView }) {
               ) : null}
             </div>
           </div>
+        ) : onRun ? (
+          <IssueBinder
+            card={card}
+            defaultRepo={defaultIssueRepo ?? ""}
+            busy={busy ?? null}
+            onRun={onRun}
+          />
         ) : null}
       </Slot>
 

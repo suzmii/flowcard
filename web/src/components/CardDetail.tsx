@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { CircleSlash, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
+import { Markdown } from "@/components/Markdown";
 import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
@@ -27,15 +28,18 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
   );
 }
 
-/** 卡片详情侧栏：六个必要项目格 + 会话 + 门禁 + 运行时。 */
+/** 卡片详情侧栏：六个必要项目格 + 会话 + 门禁 + 运行时 + 正文/评论（markdown）。 */
 export function CardDetail({
   card,
   cards,
+  defaultIssueRepo,
   onClose,
   onRefresh,
 }: {
   card: CardView;
   cards: CardView[];
+  /** 当前项目的 remote 短形：Issue 绑定入口预填 repo */
+  defaultIssueRepo?: string;
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -145,7 +149,12 @@ export function CardDetail({
           ) : null}
 
           <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
-            <SlotGrid card={card} />
+            <SlotGrid
+              card={card}
+              defaultIssueRepo={defaultIssueRepo ?? ""}
+              busy={busy}
+              onRun={run}
+            />
           </Section>
 
           <Section title="会话" hint="cwd 必须落在 worktree 内">
@@ -165,10 +174,30 @@ export function CardDetail({
           </Section>
 
           {card.body ? (
-            <Section title="正文">
-              <pre className="whitespace-pre-wrap rounded-lg border bg-background p-2.5 text-xs">
-                {card.body}
-              </pre>
+            <Section title="正文" hint="markdown（不解析原始 HTML）">
+              <div
+                className="rounded-lg border bg-background p-2.5"
+                data-testid="card-body-markdown"
+              >
+                <Markdown text={card.body} />
+              </div>
+            </Section>
+          ) : null}
+
+          {card.comments.length > 0 ? (
+            <Section title="评论" hint={`${card.comments.length} 条 · markdown`}>
+              <ul className="space-y-2" data-testid="card-comments">
+                {card.comments.map((comment) => (
+                  <li key={comment.id} className="rounded-lg border bg-background p-2.5">
+                    <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <Badge variant="muted">{comment.actor.kind}</Badge>
+                      <span className="font-mono">{comment.actor.name ?? comment.actor.harness ?? "—"}</span>
+                      <span className="ml-auto">{timeAgo(comment.at)}</span>
+                    </div>
+                    <Markdown text={comment.body} />
+                  </li>
+                ))}
+              </ul>
             </Section>
           ) : null}
         </div>

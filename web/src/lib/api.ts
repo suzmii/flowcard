@@ -30,9 +30,44 @@ export class ApiError extends Error {
   }
 }
 
+/** 拼 API 绝对/相对地址：dev 走 vite proxy（相对），生产同源（相对），VITE_FLOWCARD_API 可给绝对前缀。 */
+export function apiUrl(path: string): string {
+  return `${BASE}${path}`;
+}
+
+/** 网络失败（服务不可达）的统一文案；`projects.ts`/`uploads.ts` 也要给出同一句话。 */
+export function unreachableMessage(error: unknown): string {
+  return `连不上 flowcard 服务（${BASE || "同源"}/api）：${String(error)}`;
+}
+
 /** 网络/解析失败统一走这里：服务不可达（code=UNREACHABLE）要能和业务拒绝区分开。 */
 function unreachable(error: unknown): ApiError {
-  return new ApiError(0, "UNREACHABLE", `连不上 flowcard 服务（${BASE || "同源"}/api）：${String(error)}`);
+  return new ApiError(0, "UNREACHABLE", unreachableMessage(error));
+}
+
+/**
+ * 从失败响应里抠出可读文案：服务端会回 `{ error: { code, message, hint } }` 或 `{ rejection }`，
+ * 拿不到就退回 HTTP 码。`projects.ts` / `uploads.ts` 都复用这一处，避免各写一份解析。
+ */
+export async function readErrorBody(res: Response): Promise<string> {
+  const raw: unknown = await res.json().catch(() => null);
+  if (raw && typeof raw === "object") {
+    const body = raw as Record<string, unknown>;
+    for (const key of ["error", "rejection"]) {
+      const value = body[key];
+      if (value && typeof value === "object") {
+        const inner = value as Record<string, unknown>;
+        const message = typeof inner["message"] === "string" ? inner["message"] : null;
+        if (message) {
+          const code = typeof inner["code"] === "string" ? inner["code"] : null;
+          const hint = typeof inner["hint"] === "string" ? `（${inner["hint"]}）` : "";
+          return `${code ? `${code}：` : ""}${message}${hint}`;
+        }
+      }
+    }
+    if (typeof body["message"] === "string") return body["message"];
+  }
+  return `HTTP ${res.status}`;
 }
 
 export async function fetchCards(signal?: AbortSignal): Promise<CardView[]> {
