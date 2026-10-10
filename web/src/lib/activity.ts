@@ -164,3 +164,30 @@ export function cardNextStep(card: CardView): string {
   if (!card.issue) return "绑 Issue（只填编号；可选项，不挡任何推进）";
   return "干活，做完 flowcard end 交回";
 }
+
+/** 卡片右上角那颗灯：只表达"会话在不在干活"，文字交给 tooltip（用户嫌文字徽标丑）。 */
+export type SessionLight = { tone: "running" | "idle" | "lost" | "ended" | "failed"; label: string };
+
+export function sessionLight(card: CardView, now = Date.now()): SessionLight | null {
+  const session = card.session;
+  if (!session) return null; // 没会话就不点灯，最直观
+  const stale = now - Date.parse(session.lastSeenAt) > LIGHT_LOST_AFTER_MS;
+  if (session.state === "running" || session.state === "idle") {
+    const live = session.state === "running" && !stale;
+    if (live) return { tone: "running", label: `${session.harness} 正在干活` };
+    if (session.state === "idle" && !stale) return { tone: "idle", label: `${session.harness} 空闲（等着下一句）` };
+    return { tone: "lost", label: `${session.harness} 失联 ${minutesSince(session.lastSeenAt, now)} 分钟（心跳停了）` };
+  }
+  if (session.state === "ended") return { tone: "ended", label: `${session.harness} 会话已结束` };
+  return { tone: "failed", label: `${session.harness} 会话状态异常：${session.state}` };
+}
+
+/** 灯用的失联阈值：与设计里的 90s TTL 对齐（心跳按 30s 分桶，丢两次就算失联）。 */
+export const LIGHT_LOST_AFTER_MS = 90_000;
+
+/** 这些信号已经由"灯"表达，不再重复成文字徽标。 */
+const LIGHT_KEYS = new Set(["session", "session-cwd", "session-lost", "session-ended", "no-session"]);
+
+export function badgeSignals(card: CardView, now = Date.now()): ActivitySignal[] {
+  return cardActivity(card, now).filter((signal) => !LIGHT_KEYS.has(signal.key));
+}

@@ -7,6 +7,8 @@ import {
   mergeToolOutput,
   parseSessionEvent,
   sessionRowSignals,
+  thinkingSummary,
+  toolSummary,
   type SessionState,
   type SessionView,
 } from "./session.ts";
@@ -155,5 +157,65 @@ describe("sessionRowSignals", () => {
       sessionRowSignals(fact(), live({ status: "starting", lastActivityAt: "2026-10-10T11:05:00.000Z" })),
     ).toEqual({ status: "running", busy: true, at: "2026-10-10T11:05:00.000Z" });
     expect(sessionRowSignals(fact(), live({ busy: true }))?.busy).toBe(true);
+  });
+});
+
+describe("思考块（role=thinking）", () => {
+  it("message 追加 delta、message_end 权威覆盖，与正文同规则但不跨 id", () => {
+    let view = initialSessionView();
+    view = feed(view, "message", { id: "m1:thinking", role: "thinking", textDelta: "先想" });
+    view = feed(view, "message", { id: "m1:thinking", role: "thinking", textDelta: "一下" });
+    view = feed(view, "message", { id: "m1", role: "assistant", textDelta: "好" });
+    expect(view.session.messages.map((m) => [m.role, m.text])).toEqual([
+      ["thinking", "先想一下"],
+      ["assistant", "好"],
+    ]);
+
+    view = feed(view, "message_end", { id: "m1:thinking", role: "thinking", text: "先想一下再说", at: "" });
+    expect(view.session.messages[0]?.text).toBe("先想一下再说");
+    expect(view.session.messages[0]?.role).toBe("thinking");
+  });
+
+  it("认不出的 role 兜底成 assistant（老数据/新 role 都不会整条解析失败）", () => {
+    const event = parseSessionEvent("message", JSON.stringify({ id: "m9", role: "reasoning", textDelta: "x" }));
+    expect(event).toMatchObject({ type: "message", role: "assistant" });
+    expect(parseSessionEvent("message", JSON.stringify({ id: "m9", role: "thinking", textDelta: "x" }))).toMatchObject({
+      type: "message",
+      role: "thinking",
+    });
+  });
+
+  it("GET 快照里的 thinking 行读得回（role 不再被兜底掉）", () => {
+    let view = initialSessionView();
+    view = feed(view, "message_end", { id: "m1:thinking", role: "thinking", text: "想好了", at: "" });
+    const merged = mergeSessionSnapshot(view.session, {
+      status: "ended",
+      cwd: "/tmp/wt",
+      busy: false,
+      messages: [{ id: "m1:thinking", role: "thinking", at: "", text: "想好了" }],
+    });
+    expect(merged.messages.map((m) => [m.role, m.text])).toEqual([["thinking", "想好了"]]);
+  });
+});
+
+describe("折叠头摘要", () => {
+  it("bash 取 args.command（压成一行、超长截断）", () => {
+    expect(toolSummary({ name: "bash", args: '{\n  "command": "ls -la",\n  "i": "x"\n}' })).toBe("ls -la");
+    expect(toolSummary({ name: "bash", args: '{"command": "echo ' + "a".repeat(120) + '"}' })).toBe(
+      `echo ${"a".repeat(75)}…`,
+    );
+  });
+
+  it("其它工具取紧凑的一行 JSON；普通字符串原样；空 args 为空", () => {
+    expect(toolSummary({ name: "read", args: '{\n  "path": "src/a.ts",\n  "limit": 20\n}' })).toBe(
+      '{"path":"src/a.ts","limit":20}',
+    );
+    expect(toolSummary({ name: "wait", args: "just text" })).toBe("just text");
+    expect(toolSummary({ name: "bash", args: "" })).toBe("");
+  });
+
+  it("思考摘要取首行（跳过空行）", () => {
+    expect(thinkingSummary("\n\n第一行想法\n第二行")).toBe("第一行想法");
+    expect(thinkingSummary("")).toBe("");
   });
 });

@@ -56,10 +56,54 @@ function toolText(value: unknown): string {
   }
 }
 
+/** 折叠卡片标题行上「命令/摘要」的字符上限（超出截断加省略号）。 */
+export const BLOCK_SUMMARY_CHARS = 80;
+
+/** 折掉换行与连续空白（标题行只能是一行）。 */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function clipSummary(text: string): string {
+  return text.length <= BLOCK_SUMMARY_CHARS ? text : `${text.slice(0, BLOCK_SUMMARY_CHARS)}…`;
+}
+
+/**
+ * 工具块**折叠头**上的摘要：`bash` 取 `args.command`；其它工具取紧凑的一行 JSON（关键参数全在里面）；
+ * `args` 不是 JSON（普通字符串）就原样压成一行。空 → `""`（渲染层就只显示工具名）。
+ */
+export function toolSummary(tool: { name: string; args: string }): string {
+  const raw = tool.args.trim();
+  if (raw === "") return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return clipSummary(oneLine(raw));
+  }
+  if (typeof parsed === "string") return clipSummary(oneLine(parsed));
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const command = (parsed as Record<string, unknown>)["command"];
+    if (typeof command === "string" && command.trim() !== "") return clipSummary(oneLine(command));
+    try {
+      return clipSummary(oneLine(JSON.stringify(parsed)));
+    } catch {
+      return clipSummary(oneLine(raw));
+    }
+  }
+  return clipSummary(oneLine(raw));
+}
+
+/** 思考块**折叠头**上的首行摘要（跳过空行，截断）。 */
+export function thinkingSummary(text: string): string {
+  const first = text.split("\n").find((line) => line.trim() !== "") ?? "";
+  return clipSummary(oneLine(first));
+}
+
 // ------------------------------------------------------------------ schema
 /** 单个字段坏了不能带塌整块响应：能兜底的一律 `.catch` 兜底。 */
 const statusSchema = z.enum(HOSTED_SESSION_STATUSES).catch("stopped");
-const roleSchema = z.enum(["user", "assistant", "tool"]).catch("assistant");
+const roleSchema = z.enum(["user", "assistant", "tool", "thinking"]).catch("assistant");
 const toolPhaseSchema = z.enum(["start", "update", "end"]).catch("update");
 const optNumber = z.number().optional().catch(undefined);
 const optString = z.string().optional().catch(undefined);

@@ -19,6 +19,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
+  Brain,
   ChevronDown,
   ChevronRight,
   Hand,
@@ -49,6 +50,8 @@ import {
   startSession,
   stopSession,
   subscribeSession,
+  thinkingSummary,
+  toolSummary,
   type SessionImage,
   type SessionMessage,
   type SessionState,
@@ -56,7 +59,12 @@ import {
 } from "@/lib/session";
 import type { CardView } from "@/lib/schema";
 
-const ROLE_LABELS: Record<SessionMessage["role"], string> = { user: "我", assistant: "助手", tool: "工具" };
+const ROLE_LABELS: Record<SessionMessage["role"], string> = {
+  user: "我",
+  assistant: "助手",
+  tool: "工具",
+  thinking: "思考",
+};
 
 /** 工具输出超过这个长度就先折一半（**只影响首屏**，点「展开全部」看全量，绝不截断丢弃）。 */
 const TOOL_PREVIEW_CHARS = 4000;
@@ -94,8 +102,10 @@ async function readBase64(file: File): Promise<string> {
 
 /** 工具调用块：命令名 + 参数摘要 + 输出（等宽、可折叠、可滚动，出错变红）。 */
 function ToolBlock({ tool }: { tool: SessionTool }) {
-  const [open, setOpen] = useState(true);
+  // 默认折叠：标题行已经带「工具名 · 命令摘要」，要完整输出才展开（用户要求）。
+  const [open, setOpen] = useState(false);
   const [full, setFull] = useState(false);
+  const summary = toolSummary(tool);
   const long = tool.output.length > TOOL_PREVIEW_CHARS;
   const shown = long && !full ? tool.output.slice(0, TOOL_PREVIEW_CHARS) : tool.output;
 
@@ -116,9 +126,22 @@ function ToolBlock({ tool }: { tool: SessionTool }) {
       >
         {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
         <SquareTerminal className={cn("size-3.5 shrink-0", tool.isError ? "text-red-700" : "text-muted-foreground")} />
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium">
+        <span className="shrink-0 font-mono text-[11px] font-medium">
           {tool.name === "" ? "工具调用" : tool.name}
         </span>
+        {summary !== "" ? (
+          <>
+            <span className="shrink-0 text-[11px] text-muted-foreground">·</span>
+            <span
+              className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground"
+              data-testid="session-tool-summary"
+            >
+              {summary}
+            </span>
+          </>
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
         {tool.output !== "" ? (
           <span className="shrink-0 text-[10px] text-muted-foreground">{tool.output.length} 字符</span>
         ) : null}
@@ -166,8 +189,52 @@ function ToolBlock({ tool }: { tool: SessionTool }) {
   );
 }
 
+/** 思考块：默认折叠，标题行显示「思考 · 首行摘要」，展开看完整思考（与工具块同一套折叠交互）。 */
+function ThinkingBlock({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const summary = thinkingSummary(text);
+  return (
+    <div className="rounded-md border bg-muted/20" data-testid="session-thinking">
+      <button
+        type="button"
+        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left"
+        aria-expanded={open}
+        onClick={() => setOpen((prev) => !prev)}
+        data-testid="session-thinking-toggle"
+      >
+        {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
+        <Brain className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="shrink-0 text-[11px] font-medium">思考</span>
+        {summary !== "" ? (
+          <>
+            <span className="shrink-0 text-[11px] text-muted-foreground">·</span>
+            <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground" data-testid="session-thinking-summary">
+              {summary}
+            </span>
+          </>
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
+        {text !== "" ? (
+          <span className="shrink-0 text-[10px] text-muted-foreground">{text.length} 字符</span>
+        ) : null}
+      </button>
+
+      {open ? (
+        <pre
+          data-testid="session-thinking-text"
+          className="max-h-64 overflow-auto whitespace-pre-wrap break-words border-t px-2 py-1.5 font-mono text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {text === "" ? "…" : text}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
 function MessageRow({ message }: { message: SessionMessage }) {
   if (message.role === "tool" && message.tool) return <ToolBlock tool={message.tool} />;
+  if (message.role === "thinking") return <ThinkingBlock text={message.text ?? ""} />;
   const mine = message.role === "user";
   return (
     <div

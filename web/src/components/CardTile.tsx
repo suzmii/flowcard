@@ -1,7 +1,7 @@
 import { CircleDot, GitPullRequest, Lock, MessageSquare, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { RUNTIME_TONE, SESSION_STATE_LABELS } from "@/lib/contract";
-import { cardActivity } from "@/lib/activity";
+import { badgeSignals, sessionLight } from "@/lib/activity";
 import type { CardView } from "@/lib/schema";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -10,6 +10,14 @@ const SESSION_TONE: Record<string, string> = {
   running: "bg-emerald-600",
   ended: "bg-slate-400",
   lost: "bg-red-600",
+};
+
+const LIGHT_TONE: Record<string, string> = {
+  running: "bg-emerald-500 animate-pulse",
+  idle: "bg-sky-500",
+  lost: "bg-red-500",
+  ended: "bg-neutral-400",
+  failed: "bg-red-600",
 };
 
 export function CardTile({
@@ -21,7 +29,8 @@ export function CardTile({
   selected: boolean;
   onSelect: (id: string) => void;
 }) {
-  const activity = cardActivity(card);
+  const activity = badgeSignals(card);
+  const light = sessionLight(card);
   const openGates = Object.values(card.gates).filter((gate) => gate.status === "open");
   const runtime = card.runtime ?? null;
   const unreadComments = card.remoteComments.filter((comment) => !comment.read).length;
@@ -31,10 +40,20 @@ export function CardTile({
       type="button"
       onClick={() => onSelect(card.id)}
       className={cn(
-        "w-full shrink-0 rounded-lg border bg-card p-2.5 text-left transition-colors hover:border-foreground/30 hover:bg-accent/40",
+        "relative w-full shrink-0 rounded-lg border bg-card p-2.5 text-left transition-colors hover:border-foreground/30 hover:bg-accent/40",
         selected && "border-foreground/60 ring-2 ring-ring/40",
       )}
     >
+      {light ? (
+        <span
+          className={cn("absolute right-2 top-2 size-2.5 rounded-full ring-2 ring-card", LIGHT_TONE[light.tone])}
+          data-testid="tile-session-light"
+          data-light-tone={light.tone}
+          title={light.label}
+          aria-label={light.label}
+        />
+      ) : null}
+
       <div className="flex items-start gap-2">
         <span
           className="mt-0.5 grid size-5 shrink-0 place-items-center rounded border border-dashed text-[10px] text-muted-foreground"
@@ -50,13 +69,8 @@ export function CardTile({
           <Badge variant="outline" title={`会话 ${card.session.id}（${card.session.cwd}）`}>
             <span className={`size-1.5 rounded-full ${SESSION_TONE[card.session.state] ?? "bg-neutral-400"}`} />
             {card.session.harness}
-            <span className="text-muted-foreground">
-              {SESSION_STATE_LABELS[card.session.state] ?? card.session.state}
-            </span>
           </Badge>
-        ) : (
-          <Badge variant="muted">无会话</Badge>
-        )}
+        ) : null}
 
         {card.issue ? (
           <Badge variant="info" title={card.issue.title ?? card.issue.url}>

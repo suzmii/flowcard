@@ -1,6 +1,6 @@
 /** 「当前在干啥」的推导：优先级、失联判定、下一步文案。纯函数，不需要浏览器。 */
 import { describe, expect, it } from "vitest";
-import { cardActivity, cardNextStep } from "./activity.ts";
+import { cardActivity, cardNextStep, sessionLight } from "./activity.ts";
 import { cardViewSchema } from "./schema.ts";
 
 const NOW = Date.parse("2026-10-10T12:00:00.000Z");
@@ -137,5 +137,13 @@ describe("当前在干啥", () => {
       cardNextStep(card({ state: "review", acceptedAt: "2026-10-10T11:00:00.000Z", pr: { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" } })),
     ).toContain("等合并");
     expect(cardNextStep(card({ state: "merged" }))).toContain("清理");
+  });
+
+  it("右上角的灯：没会话不亮；running 绿；心跳超 90s 变红；ended 灰", () => {
+    expect(sessionLight(card({}), NOW)).toBeNull();
+    expect(sessionLight(card({ session: session() }), NOW)?.tone).toBe("running");
+    expect(sessionLight(card({ session: session({ lastSeenAt: "2026-10-10T11:45:00.000Z" }) }), NOW)?.tone).toBe("lost");
+    expect(sessionLight(card({ session: session({ state: "ended" }) }), NOW)?.tone).toBe("ended");
+    expect(sessionLight(card({ session: session({ state: "idle", lastSeenAt: "2026-10-10T11:59:40.000Z" }) }), NOW)?.tone).toBe("idle");
   });
 });
