@@ -8,6 +8,8 @@
  * requires 不满足时**不是报错**，而是把缺项回报给调用方（写事件已经落库，状态不动）。
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
+import { isAbsolute, join } from "node:path";
+import { normalizePath } from "../shared/paths.ts";
 import { shortHash } from "../shared/hash.ts";
 import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type IssueRef, type PrRef, type Project, type Rejection, type SyncFactIn } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
@@ -403,8 +405,20 @@ export function runCommand(input: {
     case "worktree": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      const same =
-        card.worktree?.path === cmd.worktree.path && card.worktree?.branch === cmd.worktree.branch;
+      // 统一成绝对路径：会话 cwd 一定是绝对的，相对路径比前缀会永远不相等（卡片就永远进不了实施中）
+      const projectPath = input.getProject?.(card.projectId)?.path;
+      const rawPath = cmd.worktree.path;
+      if (!isAbsolute(rawPath) && !projectPath) {
+        return fail({
+          code: "USAGE_ERROR",
+          message: `worktree 路径 "${rawPath}" 是相对路径，而这张卡没有归属项目可作基准`,
+          hint: "给绝对路径，或先把卡片归属到一个项目（flowcard project add …）",
+        });
+      }
+      const worktree = isAbsolute(rawPath)
+        ? { ...cmd.worktree, path: normalizePath(rawPath) }
+        : { ...cmd.worktree, path: normalizePath(join(projectPath!, rawPath)) };
+      const same = card.worktree?.path === worktree.path && card.worktree?.branch === worktree.branch;
       if (same) {
         // 声明式 setter：值没变就是 no-op（重试天然幂等）
         notes.push("worktree 已经是该值，跳过");
@@ -414,8 +428,8 @@ export function runCommand(input: {
       emit(
         cmd.card,
         "worktree.bound",
-        { worktree: cmd.worktree },
-        `worktree:${cmd.card}:${shortHash(cmd.worktree.path)}:${cmd.worktree.branch}:from:${card.worktree?.branch ?? "-"}`,
+        { worktree },
+        `worktree:${cmd.card}:${shortHash(worktree.path)}:${worktree.branch}:from:${card.worktree?.branch ?? "-"}`,
       );
       break;
     }

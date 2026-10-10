@@ -264,6 +264,58 @@ describe("声明式 setter 的幂等语义", () => {
   });
 });
 
+describe("worktree 路径统一成绝对（相对路径会让 cwd 校验永远失败）", () => {
+  const project = {
+    id: "proj-1",
+    name: "demo",
+    path: "/repo",
+    defaultBranch: "master",
+    addedAt: "2026-10-10T00:00:00.000Z",
+    lastSeenAt: "2026-10-10T00:00:00.000Z",
+  };
+
+  it("相对路径按项目根解析成绝对路径，会话 cwd 才比得上", () => {
+    const h = createHarness({ projects: [project] });
+    const id = h.run({ cmd: "open", actor: h.human, title: "相对路径", body: "", projectId: "proj-1" }).primaryCardId;
+    h.run({
+      cmd: "worktree",
+      actor: h.agent,
+      card: id,
+      worktree: { path: ".worktrees/x", branch: "fix/x", source: "harness" },
+    });
+    expect(h.card(id).worktree?.path).toBe("/repo/.worktrees/x");
+
+    // 会话 cwd 是绝对的 → 现在能比上了
+    h.run({ cmd: "claim", actor: h.agent, card: id, session: { harness: "omp", id: "s1", cwd: "/repo/.worktrees/x/src", agentKind: "main" } });
+    expect(h.card(id).state).toBe("working");
+  });
+
+  it("绝对路径**不会**被再前缀一次（我自己踩过的坑）", () => {
+    const h = createHarness({ projects: [project] });
+    const id = h.run({ cmd: "open", actor: h.human, title: "绝对路径", body: "", projectId: "proj-1" }).primaryCardId;
+    h.run({
+      cmd: "worktree",
+      actor: h.agent,
+      card: id,
+      worktree: { path: "/repo/.worktrees/x", branch: "fix/x", source: "harness" },
+    });
+    expect(h.card(id).worktree?.path).toBe("/repo/.worktrees/x");
+  });
+
+  it("没有项目又给相对路径 → 明确拒绝，不静默存个错的", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "无项目", body: "" }).primaryCardId;
+    const out = h.run({
+      cmd: "worktree",
+      actor: h.agent,
+      card: id,
+      worktree: { path: ".worktrees/x", branch: "fix/x", source: "harness" },
+    });
+    expect(out.rejection?.code).toBe("USAGE_ERROR");
+    expect(h.card(id).worktree).toBeNull();
+  });
+});
+
 describe("会话挪进 worktree 后由心跳推进", () => {
   it("beat 带上的 cwd 落在 worktree 内 → ready 进 working", () => {
     const h = createHarness();
