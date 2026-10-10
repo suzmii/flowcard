@@ -39,7 +39,7 @@ export function emptyCard(id: string, at: string): Card {
     id,
     title: "",
     body: "",
-    state: "inbox",
+    state: "ready",
     projectId: LOCAL_PROJECT_ID,
     issue: null,
     pr: null,
@@ -76,7 +76,8 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
     case "card.opened":
       next.title = String(p.title ?? "");
       next.body = String(p.body ?? "");
-      next.state = "inbox";
+      // 建卡即"我要开始干"：直接落 `ready`（老版本的 inbox/issue 两层中转已删）
+      next.state = "ready";
       // 老事件的 payload 里没有 projectId（升级前开的卡）→ 一律落到合成项目「未归属」。
       next.projectId = typeof p.projectId === "string" && p.projectId !== "" ? p.projectId : LOCAL_PROJECT_ID;
       if (typeof p.repoPath === "string") next.repoPath = p.repoPath;
@@ -84,10 +85,13 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       if (p.issue) next.issue = p.issue as IssueRef;
       break;
 
-    case "card.state.changed":
-      next.state = p.to as CardState;
+    case "card.state.changed": {
+      // 投影兼容：老事件里的 `inbox` / `issue` 两层中转已经不存在，一律投影成 `ready`（事件原样保留）。
+      const to = String(p.to ?? "");
+      next.state = to === "inbox" || to === "issue" ? "ready" : (to as CardState);
       if (next.state !== "blocked") delete next.blockedReason;
       break;
+    }
 
     case "card.blocked":
       next.state = "blocked";

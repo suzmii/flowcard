@@ -5,8 +5,6 @@
 import { z } from "zod";
 
 export const CARD_STATES = [
-  "inbox",
-  "issue",
   "ready",
   "working",
   "review",
@@ -18,8 +16,6 @@ export const CARD_STATES = [
 export type CardState = (typeof CARD_STATES)[number];
 
 export const STATE_LABELS: Record<CardState, string> = {
-  inbox: "收件箱",
-  issue: "立 Issue",
   ready: "待开工",
   working: "实施中",
   review: "待验收",
@@ -394,13 +390,6 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     dedupeKey: z.string().optional(),
   }),
   z.object({
-    cmd: z.literal("plan"),
-    actor: actorSchema,
-    card: z.string().min(1),
-    body: z.string().min(1),
-    dedupeKey: z.string().optional(),
-  }),
-  z.object({
     cmd: z.literal("decideGate"),
     actor: actorSchema,
     card: z.string().min(1),
@@ -466,13 +455,6 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     actor: actorSchema,
     card: z.string().min(1),
     reason: z.string().optional(),
-    dedupeKey: z.string().optional(),
-  }),
-  z.object({
-    cmd: z.literal("triage"),
-    actor: actorSchema,
-    card: z.string().min(1),
-    note: z.string().optional(),
     dedupeKey: z.string().optional(),
   }),
   z.object({

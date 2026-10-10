@@ -266,32 +266,6 @@ export function runCommand(input: {
       break;
     }
 
-    case "plan": {
-      const card = get(cmd.card);
-      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      if (card.state === "inbox") {
-        emit(cmd.card, "card.state.changed", { from: "inbox", to: "issue" }, `plan:${cmd.card}#state`);
-        applyPending();
-      }
-      const after = get(cmd.card)!;
-      const open = gateOpen(after, "G1");
-      if (open) {
-        return fail({
-          code: "GATE_PENDING",
-          message: `门禁 ${open} 还没决策，不能重复申请 G1`,
-          hint: `先 flowcard gate ${cmd.card} --gate ${open} --approve|--reject`,
-        });
-      }
-      emit(
-        cmd.card,
-        "card.comment.added",
-        { body: cmd.body, commentId: `plan-${cmd.card}` },
-        `plan-comment:${cmd.card}`,
-      );
-      emit(cmd.card, "gate.requested", { gate: "G1", kind: "approve", title: "批准方案" }, `gate:${cmd.card}:G1`);
-      break;
-    }
-
     case "decideGate": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
@@ -299,27 +273,6 @@ export function runCommand(input: {
       if (!gate) return fail({ code: "NOT_FOUND", message: `门禁 ${cmd.gate} 不存在` });
       if (gate.status !== "open") {
         return fail({ code: "STATE_NOT_ALLOWED", message: `门禁 ${cmd.gate} 已经是 ${gate.status}` });
-      }
-      const spec = flow.gates.find((g) => g.id === cmd.gate);
-      if (gate.kind === "approve" && cmd.decision === "approved" && spec) {
-        // 按"这一票已投"的口径校验：否则 planApproved 自身永远算缺项，永远批不了。
-        const projected = applyEvent(card, {
-          at: now,
-          actor: cmd.actor,
-          cardId: cmd.card,
-          type: "gate.decided",
-          payload: { gate: cmd.gate, decision: "approved" },
-          dedupeKey: "guard",
-        });
-        const missing = missingRequirements(flow, spec.on[0], spec.on[1], projected);
-        if (missing.length > 0) {
-          return fail({
-            code: "MISSING_REQUIREMENT",
-            message: `还缺必要条件，不能批准（${spec.on[0]} -> ${spec.on[1]}）`,
-            missing,
-            hint: describeMissing(flow, missing).join("；"),
-          });
-        }
       }
       emit(
         cmd.card,
@@ -591,33 +544,6 @@ export function runCommand(input: {
       break;
     }
 
-    case "triage": {
-      const card = get(cmd.card);
-      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      if (card.state === "issue") {
-        notes.push("卡片已经是「立 Issue」状态，跳过");
-        break;
-      }
-      if (card.state !== "inbox") {
-        return fail({
-          code: "STATE_NOT_ALLOWED",
-          message: `卡片当前是 ${card.state}，只有收件箱里的卡需要"确认要做"`,
-          hint: "已经开工的卡请用门禁/会话推进；要放弃用 flowcard drop",
-        });
-      }
-      if (cmd.note) {
-        emit(
-          cmd.card,
-          "card.comment.added",
-          { body: cmd.note },
-          `triage:${cmd.card}:${shortHash(cmd.note)}`,
-        );
-        applyPending();
-      }
-      requestTransition(cmd.card, "issue", `triage:${cmd.card}`);
-      break;
-    }
-
     case "drop": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
@@ -764,20 +690,6 @@ export function runCommand(input: {
         },
         `spawn:${cmd.card}:${shortHash(cmd.title)}`,
       );
-      if (parent.issue) {
-        emit(
-          id,
-          "issue.bound",
-          { issue: parent.issue },
-          `spawn-issue:${cmd.card}:${shortHash(cmd.title)}`,
-        );
-        emit(
-          id,
-          "card.state.changed",
-          { from: "inbox", to: "issue" },
-          `spawn-state:${cmd.card}:${shortHash(cmd.title)}`,
-        );
-      }
       emit(
         cmd.card,
         "card.spawned",

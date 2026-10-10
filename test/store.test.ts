@@ -49,11 +49,6 @@ describe("存储", () => {
       "2026-10-10T00:00:00.000Z",
     ).outcome.primaryCardId;
 
-    store.execute({ cmd: "plan", actor: HUMAN, card: id, body: "方案" }, "2026-10-10T00:00:01.000Z");
-    store.execute(
-      { cmd: "decideGate", actor: HUMAN, card: id, gate: "G1", decision: "approved" },
-      "2026-10-10T00:00:02.000Z",
-    );
     store.execute({ cmd: "worktree", actor: HUMAN, card: id, worktree }, "2026-10-10T00:00:03.000Z");
     store.execute({ cmd: "bindPr", actor: HUMAN, card: id, pr }, "2026-10-10T00:00:04.000Z");
     store.execute(
@@ -117,6 +112,30 @@ describe("存储", () => {
     expect(card?.confirmations).toEqual([]);
     expect(card?.title).toBe("老库");
     second.close();
+  });
+
+  it("投影兼容：老事件里的 inbox / issue 一律折成 ready（事件原样保留、rebuild 一致）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "flowcard-legacy-state-"));
+    const store = createStore({ dataDir: dir, flow: personalFlow });
+
+    // 直接写"老版本"的事件：建卡落在 inbox，人 triage 推进到 issue —— 这两个状态现在已经不存在
+    const db = new DatabaseSync(join(dir, "flowcard.sqlite"));
+    const insert = db.prepare(
+      "INSERT INTO events (id, at, actor, card_id, type, payload, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    const old = JSON.stringify({ kind: "human", name: "old" });
+    insert.run("e1", "2026-10-09T00:00:00.000Z", old, "c9", "card.opened", JSON.stringify({ title: "老卡", body: "" }), "legacy-open");
+    insert.run("e2", "2026-10-09T00:00:01.000Z", old, "c9", "card.state.changed", JSON.stringify({ from: "inbox", to: "issue" }), "legacy-triage");
+    db.close();
+
+    expect(store.rebuild()).toBeGreaterThan(0);
+    const card = store.getCard("c9");
+    expect(card?.state).toBe("ready");
+    // 老事件原样留在日志里（只影响投影，不删历史）
+    expect(store.listEvents().filter((e) => e.cardId === "c9")).toHaveLength(2);
+    expect(store.rebuild()).toBeGreaterThan(0);
+    expect(store.getCard("c9")).toEqual(card);
+    store.close();
   });
 
   it("重启后卡片仍在（事件落盘）", () => {

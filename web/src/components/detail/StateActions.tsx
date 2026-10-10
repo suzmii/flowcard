@@ -1,11 +1,9 @@
 /**
- * 卡片上的"人工推进"动作：目前只有两步是纯人工决定的——
- *   · 收件箱里的卡：「确认要做」（triage）→ 进「立 Issue」列
- *   · 任意未完成的卡：「放弃」（drop，必须写理由，理由进评论留痕）
- * 其余推进都有各自的入口（绑 Issue 自动立项、门禁批准、会话 claim 自动开工、验收、清理）。
+ * 卡片上的"人工推进"动作：**只剩「放弃这条」**（drop，必须写理由，理由进评论留痕）。
+ * 其余推进都由事实自动完成（绑 worktree / 起会话自动开工、推送、PR 合并、验收、清理）。
  */
 import { useState } from "react";
-import { CheckCircle2, CircleSlash, Inbox } from "lucide-react";
+import { CircleSlash } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { CardView } from "@/lib/schema";
@@ -21,47 +19,17 @@ export function StateActions({
   busy: string | null;
   onRun: StateActionsRunner;
 }) {
-  const [note, setNote] = useState("");
   const [reason, setReason] = useState("");
   const [confirmDrop, setConfirmDrop] = useState(false);
 
-  const inInbox = card.state === "inbox";
   const finished = card.state === "done" || card.state === "dropped";
-  if (!inInbox && finished) return null;
+  if (finished) return null;
 
   const human = { kind: "human", name: "me" } as const;
 
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="state-actions">
-      {inInbox ? (
-        <>
-          <Button
-            size="xs"
-            data-testid="state-triage"
-            disabled={busy !== null}
-            onClick={() =>
-              void onRun("确认要做", {
-                cmd: "triage",
-                actor: human,
-                card: card.id,
-                ...(note.trim() ? { note: note.trim() } : {}),
-              })
-            }
-          >
-            <Inbox />
-            确认要做（去立项）
-          </Button>
-          <Input
-            data-testid="state-triage-note"
-            className="h-7 max-w-[20rem] text-xs"
-            placeholder="备注（可选，会记进评论）"
-            value={note}
-            onChange={(event) => setNote(event.target.value)}
-          />
-        </>
-      ) : null}
-
-      {finished ? null : confirmDrop ? (
+      {confirmDrop ? (
         <span className="flex flex-wrap items-center gap-2" data-testid="state-drop-form">
           <Input
             data-testid="state-drop-reason"
@@ -104,13 +72,6 @@ export function StateActions({
           放弃这条
         </Button>
       )}
-
-      {inInbox ? (
-        <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
-          <CheckCircle2 className="size-3" />
-          也可以直接绑 Issue：绑上就自动进「立 Issue」列
-        </span>
-      ) : null}
     </div>
   );
 }

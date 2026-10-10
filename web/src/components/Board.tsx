@@ -4,15 +4,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { CARD_STATES, STATE_LABELS, STATE_TONE, type CardState } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 
-/** 每列空态文案，避免九列都写「暂无卡片」。 */
+/** 每列空态文案，避免七列都写「暂无卡片」。 */
 const EMPTY_HINTS: Record<CardState, string> = {
-  inbox: "还没有人登记的活儿",
-  issue: "没有等待立 Issue 的卡",
-  ready: "没有等待开工的卡",
-  working: "没有正在实施的卡",
+  ready: "还没有卡",
+  working: "没有实施中的卡",
   review: "没有等待验收的卡",
   merged: "没有待清理的卡",
-  done: "还没有收尾完成的卡",
+  done: "还没有完成的卡",
   blocked: "没有阻塞的卡",
   dropped: "没有放弃的卡",
 };

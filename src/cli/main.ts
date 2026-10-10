@@ -304,13 +304,6 @@ async function build(): Promise<Command> {
         die(2, "issue 需要 --number <数字>（或 --issue <owner/repo>#<n>）；repo/url 不给就用项目基址补");
       return { cmd: "bindIssue", actor: actor(), card, ...issue };
     }
-    case "plan":
-      return {
-        cmd: "plan",
-        actor: actor(),
-        card: requireCard(),
-        body: opt("body") ?? die(2, "plan 需要 --body"),
-      };
     case "gate": {
       const card = requireCard();
       const gate = opt("gate") ?? die(2, "gate 需要 --gate <id>");
@@ -447,13 +440,6 @@ async function build(): Promise<Command> {
         card: requireCard(),
         ...(opt("reason") ? { reason: opt("reason")! } : {}),
       };
-    case "triage":
-      return {
-        cmd: "triage",
-        actor: actor(),
-        card: requireCard(),
-        ...(opt("body") ? { note: opt("body")! } : {}),
-      };
     case "drop":
       return {
         cmd: "drop",
@@ -508,7 +494,7 @@ async function build(): Promise<Command> {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock triage drop probe cleanup comment spawn up down diff review detect list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect list show`);
   }
 }
 
@@ -689,7 +675,7 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock triage drop probe cleanup comment spawn up down diff review detect list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect list show" })}\n`);
     process.exit(0);
   }
 

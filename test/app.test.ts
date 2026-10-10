@@ -43,28 +43,14 @@ async function post(app: ReturnType<typeof createApp>, body: unknown) {
 }
 
 describe("HTTP 接口", () => {
-  it("走完一条完整链路（含状态码与幂等计数）", async () => {
+  it("走完一条完整链路（含状态码、非法命令与幂等计数）", async () => {
     const { app } = harness();
     const opened = await post(app, { cmd: "open", actor: HUMAN, title: "接口链路", body: "" });
     expect(opened.status).toBe(200);
     const id = opened.data.card?.id ?? "";
     expect(id).not.toBe("");
-
-    const planned = await post(app, { cmd: "plan", actor: HUMAN, card: id, body: "方案" });
-    expect(planned.status).toBe(200);
-    expect(planned.data.card?.state).toBe("issue");
-
-    // 没绑 Issue → 门禁拒绝，且什么都没写
-    const rejected = await post(app, {
-      cmd: "decideGate",
-      actor: HUMAN,
-      card: id,
-      gate: "G1",
-      decision: "approved",
-    });
-    expect(rejected.status).toBe(409);
-    expect(rejected.data.rejection?.code).toBe("MISSING_REQUIREMENT");
-    expect(rejected.data.inserted).toBe(0);
+    // 建卡即 ready：没有额外的中转层
+    expect(opened.data.card?.state).toBe("ready");
 
     const bound = await post(app, {
       cmd: "bindIssue",
@@ -75,16 +61,39 @@ describe("HTTP 接口", () => {
       url: "http://i/1",
     });
     expect(bound.status).toBe(200);
+    expect(bound.data.card?.state).toBe("ready");
 
-    const approved = await post(app, {
-      cmd: "decideGate",
+    // 已删掉的命令（plan / triage）现在只是非法输入
+    for (const cmd of ["plan", "triage"]) {
+      const gone = await post(app, { cmd, actor: HUMAN, card: id, body: "x" });
+      expect(gone.status).toBe(400);
+      expect(gone.data.rejection?.code).toBe("USAGE_ERROR");
+      expect(gone.data.inserted).toBe(0);
+    }
+
+    const worktree = {
+      path: "/w/card",
+      branch: "feat/x",
+      source: "flowcard" as const,
+    };
+    const wt = await post(app, { cmd: "worktree", actor: HUMAN, card: id, worktree });
+    expect(wt.status).toBe(200);
+    // 同一条事实命令重发不写第二条事件（幂等靠 dedupeKey）
+    const first = await post(app, { cmd: "comment", actor: HUMAN, card: id, body: "同一条评论" });
+    const again = await post(app, { cmd: "comment", actor: HUMAN, card: id, body: "同一条评论" });
+    expect(first.data.inserted).toBe(1);
+    expect(again.data.inserted).toBe(0);
+    expect(again.data.duplicates).toBeGreaterThan(0);
+
+    // 会话进入 worktree → 自动 working（不需要任何人工批准）
+    const claimed = await post(app, {
+      cmd: "claim",
       actor: HUMAN,
       card: id,
-      gate: "G1",
-      decision: "approved",
+      session: { harness: "omp", id: "s1", cwd: "/w/card/x", agentKind: "main" },
     });
-    expect(approved.status).toBe(200);
-    expect(approved.data.card?.state).toBe("ready");
+    expect(claimed.status).toBe(200);
+    expect(claimed.data.card?.state).toBe("working");
   });
 
   it("非法 body 回 400 且给出人话原因", async () => {
@@ -113,9 +122,7 @@ describe("HTTP 接口", () => {
     });
     const id = opened.data.card?.id ?? "";
 
-    // 先走到 ready（Issue + 方案批准 + worktree + PR），这样 claim 才可能触发转换
-    await post(app, { cmd: "plan", actor: HUMAN, card: id, body: "方案" });
-    await post(app, { cmd: "decideGate", actor: HUMAN, card: id, gate: "G1", decision: "approved" });
+    // 建卡即 ready（Issue 只是槽位）：建好 worktree 后，会话没进去就不算开工
     await post(app, {
       cmd: "worktree",
       actor: HUMAN,

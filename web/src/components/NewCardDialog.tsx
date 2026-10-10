@@ -103,7 +103,7 @@ export function NewCardDialog({
         <header className="flex items-center gap-2 border-b px-4 py-3">
           <Plus className="size-4 text-muted-foreground" />
           <h2 className="text-sm font-semibold">新建卡片</h2>
-          <span className="text-[11px] text-muted-foreground">开出来的卡会落在「收件箱」</span>
+          <span className="text-[11px] text-muted-foreground">创建即开工：卡直接落在「待开工」</span>
           <Button variant="ghost" size="icon" className="ml-auto" onClick={close} aria-label="关闭">
             <X />
           </Button>

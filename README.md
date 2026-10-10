@@ -32,11 +32,9 @@ node src/cli/main.ts project add ~/workspace/myrepo     # 先登记项目（看�
 node src/cli/main.ts open --body "## 修好登录页…"        # 建卡：标题可选（服务端按正文派生），项目按 cwd 解析
 node src/cli/main.ts attach ~/shot.png                  # 传图，打印 ![](/api/attachments/<id>) 直接贴进正文
 node src/cli/main.ts open --title "做点事" --issue myrepo#12 --url https://…/issues/12
-node src/cli/main.ts plan c1 --body "方案：改哪、怎么改、怎么验收"
-node src/cli/main.ts gate c1 --gate G1 --approve        # 人来批
 node src/cli/main.ts worktree c1 --path .worktrees/x --branch feat/x
-node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch feat/x
 node src/cli/main.ts claim c1 --harness omp --session <id> --cwd .worktrees/x
+node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch feat/x
 node src/cli/main.ts push c1 --sha <sha>
 node src/cli/main.ts confirm c1 --request --for push --detail "git push -u origin feat/x"
 node src/cli/main.ts confirm c1 --list                  # 人看完 detail 再批：只覆盖这一次动作
@@ -58,7 +56,7 @@ node src/cli/main.ts review c1 --list                    # 看评论与判定（
 
 ## 卡片上的四项交付要件（永远是槽位，空着也显示）
 
-Issue → worktree+分支 → WIP PR → 推送记录 → 验收 → 清理。硬门禁：未绑 Issue 不许开工、无 worktree/PR 不许进 `review`、**会话没进 worktree 不算开工**、PR 未合并不许进 `merged`、未清理不许 `done`、**PR 合并前绝不清理**。
+Issue → worktree+分支 → WIP PR → 推送记录 → 验收 → 清理。硬门禁：**建卡即 `ready`（Issue 不是开工前置）**、**会话没进 worktree 不算开工**、无 PR 或没推送不许进 `review`（PR 挡交付、不挡开工）、人未验收或 PR 未合并不许进 `merged`、未清理不许 `done`、**PR 合并前绝不清理**。人只做三件事：远程写授权、验收、清理确认。
 
 ## 接 omp（会话自动上报）
 

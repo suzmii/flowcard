@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createHarness, issueRef, prRef, worktreeRef } from "./harness.ts";
+import { createHarness, issueRef, prRef, worktreeRef, type Harness } from "./harness.ts";
 import type { Project } from "../src/shared/types.ts";
 
 const INSIDE = `${worktreeRef.path}/packages/app`;
@@ -17,23 +17,34 @@ const PROJECT: Project = {
 };
 
 describe("流程硬门禁", () => {
-  it("无 Issue 时不许批准方案（G1 缺项被拦）", () => {
+  it("open 直接落 ready：带不带 Issue 都能马上开工（没有 G1 方案批准这道门）", () => {
     const h = createHarness();
-    const opened = h.run({ cmd: "open", actor: h.human, title: "做点事", body: "" });
-    const id = opened.primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
+    // 不带 Issue 开卡 → 直接 ready（老流程里会停在 inbox，要穿过 triage / 立 Issue / G1 三层）
+    const plain = h.run({ cmd: "open", actor: h.human, title: "做点事", body: "" });
+    expect(plain.rejection).toBeUndefined();
+    expect(h.card(plain.primaryCardId).state).toBe("ready");
+    expect(h.card(plain.primaryCardId).issue).toBeNull();
 
-    const decided = h.run({
-      cmd: "decideGate",
+    // 带 Issue 开卡也直接 ready（Issue 只是必要项目，不是开工前置）
+    const withIssue = h.run({
+      cmd: "open",
       actor: h.human,
-      card: id,
-      gate: "G1",
-      decision: "approved",
+      title: "带 Issue 的卡",
+      body: "",
+      issue: issueRef,
     });
+    expect(h.card(withIssue.primaryCardId).state).toBe("ready");
 
-    expect(decided.rejection?.code).toBe("MISSING_REQUIREMENT");
-    expect(decided.rejection?.missing).toContain("issue");
-    expect(h.card(id).state).toBe("issue");
+    // 开完卡直接建 worktree + 会话进去 → 自动开工，全程不需要任何人工批准
+    const id = plain.primaryCardId;
+    h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    h.run({
+      cmd: "claim",
+      actor: h.agent,
+      card: id,
+      session: { harness: "omp", id: "sess-1", agentKind: "main", cwd: INSIDE },
+    });
+    expect(h.card(id).state).toBe("working");
   });
 
   it("会话没进 worktree 就不算开工（ready 卡住并回报缺项）", () => {
@@ -45,8 +56,6 @@ describe("流程硬门禁", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
 
@@ -73,8 +82,6 @@ describe("流程硬门禁", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -89,7 +96,7 @@ describe("流程硬门禁", () => {
 });
 
 describe("一条卡片的完整生命周期", () => {
-  it("open → plan → 批 → worktree → PR → claim → push → end → merged → 验收 → 清理 → done", () => {
+  it("open（ready）→ worktree → claim → PR → push → end → merged → 验收 → 清理 → done", () => {
     const h = createHarness();
     const id = h.run({
       cmd: "open",
@@ -98,18 +105,11 @@ describe("一条卡片的完整生命周期", () => {
       body: "需求",
       issue: issueRef,
     }).primaryCardId;
-    // 开卡时就带了 Issue = 已经立项，直接落在 issue 列（绑 Issue 会推进状态）
-    expect(h.card(id).state).toBe("issue");
-
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    expect(h.card(id).state).toBe("issue");
-    expect(h.card(id).gates.G1?.status).toBe("open");
-
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
+    // 建卡即 ready：不再经 inbox / triage / 立 Issue / G1
     expect(h.card(id).state).toBe("ready");
+    expect(Object.keys(h.card(id).gates)).toHaveLength(0);
 
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
-    h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
       cmd: "claim",
       actor: h.agent,
@@ -118,6 +118,7 @@ describe("一条卡片的完整生命周期", () => {
     });
     expect(h.card(id).state).toBe("working");
 
+    h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({ cmd: "push", actor: h.agent, card: id, sha: "abc123" });
     h.run({ cmd: "end", actor: h.agent, card: id, sessionId: "sess-1", summary: "做完了" });
     expect(h.card(id).state).toBe("review");
@@ -164,8 +165,6 @@ describe("一条卡片的完整生命周期", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
 
@@ -188,8 +187,6 @@ describe("一条卡片的完整生命周期", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -277,8 +274,6 @@ describe("会话规则", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -318,8 +313,6 @@ describe("会话规则", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -349,8 +342,6 @@ describe("会话规则", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -371,40 +362,37 @@ describe("会话规则", () => {
   });
 });
 
-describe("首页那一步：确认要做 / 放弃", () => {
-  it("绑定 Issue 就是立项：收件箱自动进「立 Issue」", () => {
+describe("建卡即开工 / 放弃（没有中转层）", () => {
+  it("建卡直接 ready；绑 Issue 只是填槽位，不改状态", () => {
     const h = createHarness();
     const id = h.run({ cmd: "open", actor: h.human, title: "从看板记的需求", body: "" }).primaryCardId;
-    expect(h.card(id).state).toBe("inbox");
-
-    h.run({ cmd: "bindIssue", actor: h.human, card: id, number: issueRef.number, repo: issueRef.repo, url: issueRef.url });
-    expect(h.card(id).state).toBe("issue");
-  });
-
-  it("triage：人确认要做 → 从收件箱进「立 Issue」，备注进评论", () => {
-    const h = createHarness();
-    const id = h.run({ cmd: "open", actor: h.human, title: "待确认", body: "" }).primaryCardId;
-
-    h.run({ cmd: "triage", actor: h.human, card: id, note: "这个做" });
-    expect(h.card(id).state).toBe("issue");
-    expect(h.card(id).comments.map((c) => c.body)).toContain("这个做");
-
-    // 再做一次是 no-op，不报错也不重复写
-    const again = h.run({ cmd: "triage", actor: h.human, card: id });
-    expect(again.events).toHaveLength(0);
-    expect(again.notes.join(" ")).toContain("已经是");
-  });
-
-  it("已经开工的卡不能再用 triage 回退", () => {
-    const h = createHarness();
-    const id = h.run({ cmd: "open", actor: h.human, title: "x", body: "", issue: issueRef }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     expect(h.card(id).state).toBe("ready");
 
-    const out = h.run({ cmd: "triage", actor: h.human, card: id });
-    expect(out.rejection?.code).toBe("STATE_NOT_ALLOWED");
+    h.run({
+      cmd: "bindIssue",
+      actor: h.human,
+      card: id,
+      number: issueRef.number,
+      repo: issueRef.repo,
+      url: issueRef.url,
+    });
+    expect(h.card(id).issue?.number).toBe(issueRef.number);
     expect(h.card(id).state).toBe("ready");
+  });
+
+  it("建卡后不需要任何人工确认就能开工（worktree + 会话 → working）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "马上开工", body: "" }).primaryCardId;
+
+    h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    h.run({
+      cmd: "claim",
+      actor: h.agent,
+      card: id,
+      session: { harness: "omp", id: "sess-1", agentKind: "main", cwd: INSIDE },
+    });
+    expect(h.card(id).state).toBe("working");
+    expect(h.rebuild(id)).toEqual(h.card(id));
   });
 
   it("drop：放弃要留理由；重复放弃是 no-op；已完成的不许放弃", () => {
@@ -455,7 +443,8 @@ describe("大需求拆多片", () => {
     expect(child).not.toBe(parent);
     expect(h.card(child).issue?.number).toBe(42);
     expect(h.card(child).partOf).toBe(parent);
-    expect(h.card(child).state).toBe("issue");
+    // 子卡也是建卡即 ready（不再落到「立 Issue」那一层）
+    expect(h.card(child).state).toBe("ready");
     expect(h.card(parent).spawned).toEqual([child]);
   });
 });
@@ -470,8 +459,6 @@ describe("阻塞与投影一致性", () => {
       body: "",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -499,8 +486,6 @@ describe("阻塞与投影一致性", () => {
       body: "body",
       issue: issueRef,
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
     h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
     h.run({
@@ -535,11 +520,11 @@ describe("Issue 基址：绑 Issue 只填编号", () => {
       url: "https://gitea.example.com/git/owner/repo/issues/742",
       state: "open",
     });
-    // 绑 Issue 就是立项（自动节点照旧生效）
-    expect(h.card(id).state).toBe("issue");
+    // 绑 Issue 只填槽位，不推进状态（卡一直是 ready）
+    expect(h.card(id).state).toBe("ready");
     // 事件里存的是补齐后的完整 IssueRef → 从零重放得到同一张卡
     expect(h.rebuild(id).issue).toEqual(h.card(id).issue);
-    expect(h.rebuild(id).state).toBe("issue");
+    expect(h.rebuild(id).state).toBe("ready");
 
     const again = h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 742 });
     expect(again.events).toHaveLength(0);
@@ -596,7 +581,7 @@ describe("Issue 基址：绑 Issue 只填编号", () => {
     expect(h.card(id).issue?.url).toBe(
       "https://gitea.example.com/git/owner/repo/issues/742",
     );
-    expect(h.card(id).state).toBe("issue");
+    expect(h.card(id).state).toBe("ready");
     expect(h.rebuild(id).issue).toEqual(h.card(id).issue);
 
     // 开卡时显式 url 覆盖模板
@@ -643,5 +628,82 @@ describe("Issue 基址：绑 Issue 只填编号", () => {
     });
     expect(out.rejection).toBeUndefined();
     expect(h.card(id).issue?.url).toBe(issueRef.url);
+  });
+});
+
+describe("交付要件（防回归）", () => {
+  /** 建卡 → worktree → 会话进 worktree，一路推到 working。 */
+  const driveToWorking = (h: Harness, title: string): string => {
+    const id = h.run({ cmd: "open", actor: h.human, title, body: "" }).primaryCardId;
+    h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    h.run({
+      cmd: "claim",
+      actor: h.agent,
+      card: id,
+      session: { harness: "omp", id: "sess-1", agentKind: "main", cwd: INSIDE },
+    });
+    expect(h.card(id).state).toBe("working");
+    return id;
+  };
+
+  it("working -> review 仍要求 PR + 至少一次推送：没补齐就停在 working", () => {
+    const h = createHarness();
+
+    // ① PR、推送都没有
+    const bare = driveToWorking(h, "没交付要件");
+    const endedBare = h.run({ cmd: "end", actor: h.agent, card: bare, sessionId: "sess-1" });
+    expect(h.card(bare).state).toBe("working");
+    expect(endedBare.blocked?.transition).toBe("working -> review");
+    expect(endedBare.blocked?.missing).toEqual(["pr", "pushedAtLeastOnce"]);
+    // 事实照样落库：会话结束不能因为状态没前进就丢
+    expect(h.card(bare).session?.state).toBe("ended");
+
+    // ② 有 PR 但一次都没推
+    const prOnly = driveToWorking(h, "只开了 PR");
+    h.run({ cmd: "bindPr", actor: h.agent, card: prOnly, pr: prRef });
+    const endedPrOnly = h.run({ cmd: "end", actor: h.agent, card: prOnly, sessionId: "sess-1" });
+    expect(endedPrOnly.blocked?.missing).toEqual(["pushedAtLeastOnce"]);
+    expect(h.card(prOnly).state).toBe("working");
+  });
+
+  it("验收语义不变：accept 不改 state；review -> merged 需要 accepted + prMerged", () => {
+    const h = createHarness();
+    /** 推到 review：PR + 一次推送 + 交回。 */
+    const driveToReview = (title: string): string => {
+      const id = driveToWorking(h, title);
+      h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
+      h.run({ cmd: "push", actor: h.agent, card: id, sha: "a1" });
+      h.run({ cmd: "end", actor: h.agent, card: id, sessionId: "sess-1" });
+      expect(h.card(id).state).toBe("review");
+      return id;
+    };
+
+    // 人验收了但 PR 还没合并 → 状态不动，只记下验收事实
+    const accepted = driveToReview("先验收");
+    h.run({ cmd: "accept", actor: h.human, card: accepted });
+    expect(h.card(accepted).acceptedAt).toBeDefined();
+    expect(h.card(accepted).gates.G3?.status).toBe("approved");
+    expect(h.card(accepted).state).toBe("review");
+
+    // PR 合并后才前进（accepted + prMerged 齐了）
+    h.run({
+      cmd: "probePr",
+      actor: { kind: "system" },
+      card: accepted,
+      pr: { ...prRef, state: "merged" },
+    });
+    expect(h.card(accepted).state).toBe("merged");
+    expect(h.card(accepted).gates.G4?.status).toBe("open");
+
+    // 反向：PR 合并了但没人验收 → 不许进 merged
+    const unaccepted = driveToReview("没人验收");
+    h.run({
+      cmd: "probePr",
+      actor: { kind: "system" },
+      card: unaccepted,
+      pr: { ...prRef, state: "merged" },
+    });
+    expect(h.card(unaccepted).state).toBe("review");
+    expect(h.card(unaccepted).acceptedAt).toBeUndefined();
   });
 });

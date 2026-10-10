@@ -24,8 +24,6 @@ export type {
 
 /** 与 CARD_STATES 同序，看板列顺序即此顺序。 */
 export const CARD_STATES = [
-  "inbox",
-  "issue",
   "ready",
   "working",
   "review",
@@ -36,8 +34,6 @@ export const CARD_STATES = [
 ] as const satisfies readonly CardState[];
 
 export const STATE_LABELS: Record<CardState, string> = {
-  inbox: "收件箱",
-  issue: "立 Issue",
   ready: "待开工",
   working: "实施中",
   review: "待验收",
@@ -49,8 +45,6 @@ export const STATE_LABELS: Record<CardState, string> = {
 
 /** 运行时的进度点颜色对应的中文名。 */
 export const STATE_TONE: Record<CardState, string> = {
-  inbox: "bg-slate-400",
-  issue: "bg-sky-500",
   ready: "bg-amber-500",
   working: "bg-blue-600",
   review: "bg-violet-500",

@@ -151,7 +151,7 @@ export function CardDetail({
             </div>
           ) : null}
 
-          <Section title="状态动作" hint="纯人工决定的那两步（其余推进有各自入口）">
+          <Section title="状态动作" hint="纯人工的只有「放弃这条」（其余推进都由事实自动完成）">
             <StateActions card={card} busy={busy} onRun={run} />
           </Section>
 

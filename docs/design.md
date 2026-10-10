@@ -128,12 +128,14 @@ type Project = {
 
 **绑 Issue 只填编号**：`repo`/`url` 由卡片所属项目的 **Issue 基址**（`issueRepo` / `issueUrlTemplate`，登记项目时按 remote 派生，§2.1）补齐；项目没基址就用 `flowcard project issue-base` 配一次，或这次显式给 `--repo` / `--url`。
 
+**Issue 是必要项目，不是阶段**：`flowcard issue <card> --number N` 只是把槽位填上（顺手也随时能做），**不挡任何动作**——建卡即 `ready`，要开工不需要先绑 Issue。
+
 硬约束（引擎拦截，不是提醒）：
 
-- 未绑 Issue **不许离开 `issue` 列**（即不许开工）。
-- 未建 worktree、未开 PR **不许进入 `review`**。
-- **会话没进 worktree 就不算开工**：`ready → working` 要求 `session.cwd` ⊆ `worktree.path`（见 §3.1）。
-- PR 未 `merged` **不许进入 `merged` 列**。
+- **建卡即开工**：`open` 直接落 `ready`，不做"确认要做 / 方案批准"这类中转。
+- **会话没进 worktree 就不算开工**：`ready → working` 要求 `worktree != null` **且** `session.cwd` ⊆ `worktree.path`（见 §3.1）；**PR 不挡开工**。
+- 未开 PR、一条推送都没有 **不许进入 `review`**（这是交付要件：PR 挡交付，不挡开工）。
+- 必须由人**明确验收**，且 PR 已 `merged`，**才允许进入 `merged` 列**。
 - 未清理 **不许 `done`**。
 - **PR 合并前绝不清理**：`merged` 之前的任何清理动作一律拒绝。
 
@@ -185,13 +187,13 @@ CLI：`flowcard up <card>` / `flowcard down <card>`；状态变化一样走事�
 
 ## 4. 流程状态（看板的列）
 
+**人只做三件事：远程写授权、验收、清理确认；其余状态由事实自动推进。**
+
 | 状态 | 含义 | 出口条件 |
 |---|---|---|
-| `inbox` | 收件箱：原始需求刚进来 | 人确认要做 → `issue` |
-| `issue` | **立 Issue**（建或查已有），并写清问题原因与思路 | 门禁 G1：方案批准 **且** `issue != null` → `ready` |
-| `ready` | 待开工（Issue 已绑，方案已批） | agent 领卡：建 worktree + WIP PR **并把会话移进 worktree**（`/wt` 或 `/move`，远程写走 G2）→ `working` |
-| `working` | 实施中（worktree + PR 已建，多次推送） | 会话结束 / agent 交回 → `review` |
-| `review` | 待验收（子徽标：待验收 / 已验收待合并） | 门禁 G3 验收 → 等 PR merged；探测到 merged → `merged` |
+| `ready` | 待开工（建卡即此状态，Issue 可有可无） | 建好 worktree **并把会话移进 worktree**（`/wt` 或 `/move`，远程写走 G2）→ `working` |
+| `working` | 实施中（worktree 已建、会话在里面干活，多次推送） | 会话结束 / agent 交回 → `review`（`end` 要求 PR 已开 + 至少一次推送） |
+| `review` | 待验收（子徽标：待验收 / 已验收待合并） | 人验收（G3）+ 探测到 PR `merged` → `merged` |
 | `merged` | 已合并，**待清理**（此处验证现场必须完整保留） | 门禁 G4：报告清理清单 → 同意 → 执行 → `done` |
 | `done` | 完成（现场已清理） | — |
 | `blocked` | 卡住（必须写明缺什么） | 前置补齐 → `working` |
@@ -199,36 +201,37 @@ CLI：`flowcard up <card>` / `flowcard down <card>`；状态变化一样走事�
 
 ```mermaid
 stateDiagram-v2
-  [*] --> inbox
-  inbox --> issue: 人确认要做
-  issue --> ready: 门禁G1 方案批准 + Issue已绑
-  ready --> working: agent领卡（自动建 worktree + WIP PR）
-  working --> blocked: 缺前置
+  [*] --> ready
+  ready --> working: 建 worktree + 会话进入 worktree（自动）
+  ready --> blocked: 卡住
   blocked --> working: 前置补齐
-  working --> review: 会话结束（自动）
+  working --> review: 会话结束（自动；要求 PR + 一次推送）
   review --> working: 打回
   review --> merged: 人验收 + PR merged（自动探测）
   merged --> done: 门禁G4 清理确认并执行
-  inbox --> dropped
-  issue --> dropped
+  ready --> dropped
+  working --> dropped
 ```
+
+老库里的 `inbox` / `issue` 事件**原样保留**，只是投影时一律折成 `ready`（`PROJECTION_VERSION` v5 触发一次 rebuild）。
 
 **大需求拆多片**：agent 可以在同一边界内**自己新建卡片**（`flowcard spawn`），新卡自动继承 `issue`、带 `partOf` 指向原卡、并要求它自己开一个新 PR。看板上按 Issue 分组显示"这个 Issue 下有哪几片、每片什么状态"。
 
 ## 5. 门禁（人工节点）
 
+**只剩两道流程门禁（G3 验收、G4 清理）**；远程写是凭据（G2），不是流程节点。
+
 | 门禁 | 位置 | 批什么 |
 |---|---|---|
-| `G1 approve` | `issue → ready` | 方案（原因、改法、验收）批准后才许开工 |
 | `G2 confirm` | 任何**远程写**：建 Issue、push、开/改 PR、远程评论、合并 | **一事一议**：一次授权只覆盖一次动作，`detail` 带上将要执行的确切命令/URL |
-| `G3 review` | `review → 等合并` | 明确验收（不看内容不算过） |
+| `G3 review` | `review → merged` | 明确验收（不看内容不算过），且 PR 已合并 |
 | `G4 cleanup` | `merged → done` | 先报告"删什么、为什么现在可以删、对应 PR 状态"，同意后才执行 |
 
-约定：一张卡同一时刻**最多一个未决门禁**；门禁带 `requestedBy`、`payload`、`decision`（approved/rejected + 理由）。
+约定：一张卡同一时刻**最多一个未决流程门禁**；门禁带 `requestedBy`、`payload`、`decision`（approved/rejected + 理由）。
 
 ### 5.1 G2 是凭据，不是流程节点
 
-上面那条「最多一个未决」只管 G1/G3/G4。**G2 不占 `card.gates`，单独放 `card.confirmations`**：它是「这一次操作」的一次性授权，可以有多条、有历史、可以重复申请。
+上面那条「最多一个未决」只管 G3/G4。**G2 不占 `card.gates`，单独放 `card.confirmations`**：它是「这一次操作」的一次性授权，可以有多条、有历史、可以重复申请。
 
 ```
 agent: requestConfirm{action, detail}   → confirm.requested（pending，detail = 将执行的确切命令/URL）
@@ -274,24 +277,23 @@ session.cwd.mismatch
 import { defineFlow } from "../shared/flow.ts";
 
 export default defineFlow({
-  states: ["inbox", "issue", "ready", "working", "review", "merged", "done", "blocked", "dropped"],
+  states: ["ready", "working", "review", "merged", "done", "blocked", "dropped"],
 
-  gates: [
-    { id: "G1", on: ["issue", "ready"],     kind: "approve", title: "批准方案" },
-    { id: "G3", on: ["review", "merged"],   kind: "review",  title: "验收", requires: ["pr"] },
-    { id: "G4", on: ["merged", "done"],     kind: "cleanup", title: "清理确认", report: ["worktree", "branch"] },
+  gates: [                          // 只剩两道流程门禁；远程写是凭据（G2），不在 gates 里
+    { id: "G3", on: ["review", "merged"], kind: "review",  title: "验收" },
+    { id: "G4", on: ["merged", "done"],   kind: "cleanup", title: "清理确认", report: ["worktree.path", "worktree.branch"] },
   ],
 
   requires: {                      // 硬门禁：缺了就拒绝转换，并回一个"缺哪项"的错误
-    "issue -> ready":   ["issue", "planApproved"],
-    "ready -> working": ["worktree", "pr", "sessionInWorktree"],
-    "working -> review": ["pr", "pushedAtLeastOnce"],
-    "review -> merged": ["accepted", "pr.merged"],
-    "merged -> done":   ["cleanupCompleted"],
+    "ready -> working":   ["worktree", "sessionInWorktree"],   // 开工；PR 不挡开工
+    "working -> review":  ["pr", "pushedAtLeastOnce"],         // 交付要件
+    "review -> merged":   ["accepted", "prMerged"],
+    "merged -> done":     ["cleanupCompleted"],
+    "blocked -> working": ["worktree", "sessionInWorktree"],
   },
 
   automations: [
-    { name: "claim",  on: "session.started", when: c => c.state === "ready",
+    { name: "start",  on: "session.started", when: c => c.state === "ready",
       do: [{ setState: "working" }] },
     { name: "back",   on: "session.ended", when: c => c.state === "working",
       do: [{ setState: "review" }] },
@@ -333,12 +335,11 @@ flowcard project add <仓库路径>                             # 登记项目�
 flowcard project list                                     # 全部项目（含「未归属」）
 flowcard project current [--path <路径>]                  # 当前目录属于哪个项目（默认 cwd；解析不到退出码 3）
 flowcard project issue-base <项目 id 或路径> [--repo <owner/repo>] [--template "…{number}"] [--clear]  # 改项目的 Issue 基址（绑 Issue 只填编号）
-flowcard open   [--title "…"] [--body …] [--project <id>] [--issue 742 | --issue <owner/repo>#742] [--url <链接>]  # 开卡（inbox）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local
+flowcard open   [--title "…"] [--body …] [--project <id>] [--issue 742 | --issue <owner/repo>#742] [--url <链接>]  # 开卡（落 ready）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local；带 Issue 就顺手绑
 flowcard attach <图片> [--name <文件名>]                    # 传图（png/jpg/jpeg/gif/webp ≤10MB），打印 markdown 直接贴进正文/评论
-flowcard issue  <card> --number 742 [--repo …] [--url …]   # 绑 Issue（→ issue 列）：只填编号，repo/url 由项目基址补
-flowcard plan   <card> --body "方案…"                     # 写方案并申请 G1
+flowcard issue  <card> --number 742 [--repo …] [--url …]   # 绑 Issue 槽位（只填编号，repo/url 由项目基址补）；这是必要项目，不是阶段
 flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
-flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 领卡；不给 card 时服务端按 cwd 反查
+flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 会话进入卡片（不给 card 时服务端按 cwd 反查）→ 自动进 working
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
 flowcard confirm <card> --request --for push --detail "git push -u origin feat/x"  # 申请一次远程写确认（G2）
@@ -400,8 +401,8 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0** ✅ | omp 扩展上报 started/heartbeat/ended | 复现：1+3+1 事件，omp `exit 0`（无推理请求） |
-| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→issue→plan→批准→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示 `/wt <branch>` 或 `/move <path>`）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
-| **M2 看板** | React + Vite + shadcn；列=9 状态；卡片详情六格必要项**空也显示**；按 Issue 聚合多片 | 浏览器完成 M1 全部动作，SSE 实时 |
+| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示 `/wt <branch>` 或 `/move <path>`）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
+| **M2 看板** | React + Vite + shadcn；列=7 状态；卡片详情六格必要项**空也显示**；按 Issue 聚合多片 | 浏览器完成 M1 全部动作，SSE 实时 |
 | **M3 运行时** | 每卡启动按钮：项目启动配置（`.flowcard.toml`）、进程组启停与日志、**单例不变式**（启动一张卡就停掉其他卡的运行时）、状态进事件流 | 配好配置的项目能一键起停；启 B 之后 A 的进程确实死了（`ps` 验证）；进程组杀干净 |
 | **M4 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
 | **M5 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |

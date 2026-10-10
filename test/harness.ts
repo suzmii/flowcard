@@ -10,9 +10,20 @@ import type { Card, Command, CwdClaimResolution, Project } from "../src/shared/t
 const HUMAN = { kind: "human" as const, name: "you" };
 const AGENT = { kind: "agent" as const, harness: "omp", sessionId: "sess-1" };
 
+/** 测试驱动器的契约：`createHarness` 的返回值，按名字导出给各测试文件引用。 */
+export type Harness = {
+  run: (cmd: Command) => CommandOutcome;
+  card: (id: string) => Card;
+  cards: Map<string, Card>;
+  allEvents: NewEvent[];
+  rebuild: (id: string) => Card;
+  human: typeof HUMAN;
+  agent: typeof AGENT;
+};
+
 export function createHarness(
   opts: { resolveCardByCwd?: (cwd: string) => CwdClaimResolution; projects?: Project[] } = {},
-) {
+): Harness {
   const cards = new Map<string, Card>();
   const allEvents: NewEvent[] = [];
   let counter = 0;

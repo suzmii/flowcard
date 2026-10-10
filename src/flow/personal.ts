@@ -1,6 +1,9 @@
 /**
  * 个人流程：就是 skill 里那套规矩的可执行版本。
  * 每个 requires 都是一条"缺了就拦住"的硬门禁；每个 autoTransitions 都靠 requires 决定放不放行。
+ *
+ * 人只做三件事：远程写授权（G2 confirmations）、验收（G3）、清理确认（G4）；
+ * 其余状态由事实（绑 worktree、起会话、推送、PR 合并）自动推进 —— 建卡即 `ready`，没有中间层。
  */
 import { defineFlow, sessionInsideWorktree } from "../shared/flow.ts";
 import { CARD_STATES } from "../shared/types.ts";
@@ -11,23 +14,17 @@ export const personalFlow = defineFlow({
   states: CARD_STATES,
 
   requirements: [
-    { id: "issue", describe: "卡片必须绑定 Issue（建或查已有）", check: (c) => c.issue !== null },
-    {
-      id: "planApproved",
-      describe: "方案必须经人批准（门禁 G1）",
-      check: (c) => c.gates.G1?.status === "approved",
-    },
     {
       id: "worktree",
       describe: "必须建好 worktree 与分支（.worktrees/<名字>，feat/* 或 fix/*）",
       check: (c) => c.worktree !== null,
     },
-    { id: "pr", describe: "必须开 WIP PR（任务一开始就建）", check: (c) => c.pr !== null },
     {
       id: "sessionInWorktree",
       describe: "会话必须已经进入 worktree 里工作（omp 用 /wt <branch> 或 /move <path>）",
       check: sessionInsideWorktree,
     },
+    { id: "pr", describe: "必须开 WIP PR（交付要件，不挡开工）", check: (c) => c.pr !== null },
     {
       id: "pushedAtLeastOnce",
       describe: "至少要有一次推送记录（进度要能每天看到）",
@@ -51,7 +48,6 @@ export const personalFlow = defineFlow({
   ],
 
   gates: [
-    { id: "G1", on: ["issue", "ready"], kind: "approve", title: "批准方案" },
     { id: "G3", on: ["review", "merged"], kind: "review", title: "验收" },
     {
       id: "G4",
@@ -63,14 +59,12 @@ export const personalFlow = defineFlow({
   ],
 
   requires: {
-    // 收件箱 → 立项：只需人确认要做（这一步就是 triage），没有别的前置
-    "inbox -> issue": [],
-    "issue -> ready": ["issue", "planApproved"],
-    "ready -> working": ["worktree", "pr", "sessionInWorktree"],
+    // 开工：只要 worktree 建好、会话真的在里面干活 —— PR 是交付要件，不挡开工
+    "ready -> working": ["worktree", "sessionInWorktree"],
     "working -> review": ["pr", "pushedAtLeastOnce"],
     "review -> merged": ["accepted", "prMerged"],
     "merged -> done": ["cleanupCompleted"],
-    "blocked -> working": ["worktree", "pr", "sessionInWorktree"],
+    "blocked -> working": ["worktree", "sessionInWorktree"],
   },
 
   /**
@@ -78,25 +72,6 @@ export const personalFlow = defineFlow({
    * 能不能前进由 requires 决定，缺项就只是记一笔 note，不报错。
    */
   automations: [
-    {
-      // 绑 Issue 就是「立项」这个人类动作：收件箱里的卡一旦绑上 Issue 就该进 `issue` 列
-      name: "issue-bound-advances-to-issue",
-      on: "issue.bound",
-      when: (c) => c.state === "inbox",
-      do: [{ setState: "issue" }],
-    },
-    {
-      name: "issued-plan-advances-to-ready",
-      on: "gate.decided",
-      when: (c) => c.state === "issue",
-      do: [{ setState: "ready" }],
-    },
-    {
-      name: "pr-bound-advances-to-working",
-      on: "pr.bound",
-      when: (c) => c.state === "ready",
-      do: [{ setState: "working" }],
-    },
     {
       name: "worktree-bound-advances-to-working",
       on: "worktree.bound",

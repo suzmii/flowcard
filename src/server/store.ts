@@ -103,8 +103,10 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  *
  * v3：卡片新增 `projectId`（老事件没有 → 投影成 `local`），所以必须重放一遍。
  * v4：卡片新增 `review` 槽位（行级评审注释 + 判定），老投影里没有 → 重放补上。
+ * v5：状态从 9 个缩到 7 个（删 `inbox` / `issue` 两层中转）→ 老事件里的这两个状态投影成 `ready`，
+ *     建卡直接落 `ready`，所以形态变了、必须重放。
  */
-export const PROJECTION_VERSION = "4";
+export const PROJECTION_VERSION = "5";
 
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */

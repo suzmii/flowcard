@@ -76,7 +76,7 @@ describe("按 cwd 解析 claim 的卡片（纯函数）", () => {
 });
 
 describe("store：claim 不带 card 走真实解析", () => {
-  it("从 cwd 认领卡片，并把 cwd 记进会话", () => {
+  it("从 cwd 反查出卡片，并把 cwd 记进会话", () => {
     const store = createStore({
       dataDir: mkdtempSync(join(tmpdir(), "flowcard-resolve-")),
       flow: personalFlow,
@@ -95,8 +95,6 @@ describe("store：claim 不带 card 走真实解析", () => {
       },
       AT,
     ).outcome.primaryCardId;
-    store.execute({ cmd: "plan", actor: AGENT, card: id, body: "方案" }, AT);
-    store.execute({ cmd: "decideGate", actor: HUMAN, card: id, gate: "G1", decision: "approved" }, AT);
     store.execute(
       { cmd: "worktree", actor: AGENT, card: id, worktree: { path: worktreePath, branch: "feat/x", source: "flowcard" } },
       AT,
@@ -170,8 +168,6 @@ describe("engine：解析只在没给 card 时发生", () => {
       body: "",
       issue: { repo: "r", number: 1, url: "http://i/1", state: "open" },
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({
       cmd: "worktree",
       actor: h.agent,
@@ -208,8 +204,6 @@ describe("engine：解析只在没给 card 时发生", () => {
       body: "",
       issue: { repo: "r", number: 1, url: "http://i/1", state: "open" },
     }).primaryCardId;
-    h.run({ cmd: "plan", actor: h.agent, card: id, body: "方案" });
-    h.run({ cmd: "decideGate", actor: h.human, card: id, gate: "G1", decision: "approved" });
     h.run({
       cmd: "worktree",
       actor: h.agent,
