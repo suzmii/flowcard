@@ -46,6 +46,19 @@ export function hasLiveSession(card: Card): boolean {
 }
 
 export async function autostartCard(cardId: string, deps: AutostartDeps): Promise<AutostartOutcome> {
+  try {
+    return await autostartInner(cardId, deps);
+  } catch (error) {
+    // 开卡是主流程，自动开工是"顺手做的事"：这里绝不能让请求 500
+    const detail = error instanceof Error ? error.message : String(error);
+    await deps
+      .comment(cardId, `自动开工时出了意外（已忽略，不影响卡片）：${detail}`)
+      .catch(() => undefined);
+    return { status: "failed", summary: `自动开工异常：${detail}` };
+  }
+}
+
+async function autostartInner(cardId: string, deps: AutostartDeps): Promise<AutostartOutcome> {
   const card = deps.getCard(cardId);
   if (!card) return { status: "skipped", summary: `卡片 ${cardId} 不存在` };
 

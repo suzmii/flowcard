@@ -4,7 +4,8 @@
  *
  * 纯函数：只吃 card/project/worktree，输出文本；便于单测与复用（CLI/UI 也能拿它做预览）。
  */
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { Card, CardState, Project } from "../shared/types.ts";
 import { STATE_LABELS } from "../shared/types.ts";
 
@@ -150,12 +151,18 @@ ${cli} block ${card.id} --reason "缺什么"         # 卡住了就明说
 export async function writeBriefFile(
   filePath: string,
   text: string,
-  io: { readFile?: (p: string) => Promise<string>; writeFile?: (p: string, t: string) => Promise<void> } = {},
+  io: {
+    readFile?: (p: string) => Promise<string>;
+    writeFile?: (p: string, t: string) => Promise<void>;
+    mkdir?: (p: string) => Promise<void>;
+  } = {},
 ): Promise<{ written: boolean }> {
   const read = io.readFile ?? ((p: string) => readFile(p, "utf8"));
   const write = io.writeFile ?? ((p: string, t: string) => writeFile(p, t, "utf8"));
   const existing = await read(filePath).catch(() => null);
   if (existing === text) return { written: false };
+  // 目录可能还不存在（第一次写），自己建——不该让"开卡"因为一个 mkdir 失败而 500
+  await (io.mkdir ?? ((p: string) => mkdir(p, { recursive: true })))(dirname(filePath));
   await write(filePath, text);
   return { written: true };
 }

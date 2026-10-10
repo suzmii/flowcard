@@ -69,6 +69,7 @@ describe("开工提示（brief）", () => {
         return found;
       },
       writeFile: async (p: string, t: string) => void files.set(p, t),
+      mkdir: async () => undefined,
     };
     expect((await writeBriefFile("/b/c7.md", "hi", io)).written).toBe(true);
     expect((await writeBriefFile("/b/c7.md", "hi", io)).written).toBe(false);
@@ -167,5 +168,39 @@ describe("自动开工编排", () => {
   it("扩展路径由服务端自己算出来（不靠环境变量）", () => {
     const path = defaultAdapterPath();
     expect(path.endsWith("src/adapters/omp/flowcard-omp-adapter.ts")).toBe(true);
+  });
+
+  it("提示文件目录不存在时自己建（第一次开卡的老 bug：ENOENT 把请求打成 500）", async () => {
+    const { writeBriefFile } = await import("../src/server/brief.ts");
+    const files = new Map<string, string>();
+    const made: string[] = [];
+    const io = {
+      readFile: async (p: string) => {
+        const found = files.get(p);
+        if (found === undefined) throw new Error("ENOENT");
+        return found;
+      },
+      writeFile: async (p: string, t: string) => void files.set(p, t),
+      mkdir: async (p: string) => void made.push(p),
+    };
+    const result = await writeBriefFile("/data/briefs/c9.md", "hi", io);
+    expect(result.written).toBe(true);
+    expect(made).toEqual(["/data/briefs"]);
+  });
+
+  it("编排里任何意外都不抛：变成卡片评论 + failed（开卡不能因此 500）", async () => {
+    const d = deps({
+      io: {
+        launchSession: async () => {
+          throw new Error("终端炸了");
+        },
+        resolveOmpPath: async () => undefined,
+        writeBrief: async () => ({ written: true }),
+      },
+    });
+    const outcome = await autostartCard("c7", d as never);
+    expect(outcome.status).toBe("failed");
+    expect(outcome.summary).toContain("终端炸了");
+    expect(d.calls.some((c) => c.includes("自动开工时出了意外"))).toBe(true);
   });
 });
