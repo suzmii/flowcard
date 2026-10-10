@@ -201,6 +201,59 @@ describe("一条卡片的完整生命周期", () => {
   });
 });
 
+describe("声明式 setter 的幂等语义", () => {
+  it("同值重复绑定是 no-op，不写第二条事件", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "同值", body: "" }).primaryCardId;
+
+    const first = h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    const again = h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+
+    expect(first.events.length).toBeGreaterThan(0);
+    expect(again.events).toHaveLength(0);
+    expect(again.notes.join(" ")).toContain("已经是该值");
+    expect(h.card(id).worktree?.branch).toBe("feat/card-1");
+  });
+
+  it("A → B → A 能改回去（历史幂等键不许吞掉恢复写入）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "改回去", body: "" }).primaryCardId;
+
+    h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    h.run({
+      cmd: "worktree",
+      actor: h.agent,
+      card: id,
+      worktree: { ...worktreeRef, branch: "detached" },
+    });
+    expect(h.card(id).worktree?.branch).toBe("detached");
+
+    // 探测把被写坏的值改回来：必须真的写进去
+    const restored = h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    expect(restored.events.map((e) => e.type)).toContain("worktree.bound");
+    expect(h.card(id).worktree?.branch).toBe("feat/card-1");
+    expect(h.rebuild(id)).toEqual(h.card(id));
+  });
+
+  it("PR 状态变化也按前值区分（重复探测不刷事件）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "PR", body: "" }).primaryCardId;
+
+    h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
+    const dup = h.run({ cmd: "bindPr", actor: h.agent, card: id, pr: prRef });
+    expect(dup.events).toHaveLength(0);
+
+    const changed = h.run({
+      cmd: "probePr",
+      actor: { kind: "system" },
+      card: id,
+      pr: { ...prRef, state: "merged" },
+    });
+    expect(changed.events.map((e) => e.type)).toContain("pr.merged");
+    expect(h.card(id).pr?.state).toBe("merged");
+  });
+});
+
 describe("会话规则", () => {
   it("一个卡片同时只能有一个活跃会话", () => {
     const h = createHarness();

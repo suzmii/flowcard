@@ -126,11 +126,17 @@ export function runCommand(input: {
     case "bindIssue": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const sameIssue =
+        card.issue?.repo === cmd.issue.repo && card.issue?.number === cmd.issue.number;
+      if (sameIssue) {
+        notes.push("Issue 已经是该值，跳过");
+        break;
+      }
       emit(
         cmd.card,
         "issue.bound",
         { issue: cmd.issue },
-        `issue:${cmd.card}:${cmd.issue.repo}#${cmd.issue.number}`,
+        `issue:${cmd.card}:${cmd.issue.repo}#${cmd.issue.number}:from:${card.issue ? `${card.issue.repo}#${card.issue.number}` : "-"}`,
       );
       break;
     }
@@ -202,11 +208,19 @@ export function runCommand(input: {
     case "worktree": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const same =
+        card.worktree?.path === cmd.worktree.path && card.worktree?.branch === cmd.worktree.branch;
+      if (same) {
+        // 声明式 setter：值没变就是 no-op（重试天然幂等）
+        notes.push("worktree 已经是该值，跳过");
+        break;
+      }
+      // 幂等键带上"前值"：否则把 A→B 之后再改回 A 时，会被历史上那条 A 的键吞掉
       emit(
         cmd.card,
         "worktree.bound",
         { worktree: cmd.worktree },
-        `worktree:${cmd.card}:${cmd.worktree.branch}`,
+        `worktree:${cmd.card}:${shortHash(cmd.worktree.path)}:${cmd.worktree.branch}:from:${card.worktree?.branch ?? "-"}`,
       );
       break;
     }
@@ -281,7 +295,20 @@ export function runCommand(input: {
     case "bindPr": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      emit(cmd.card, "pr.bound", { pr: cmd.pr }, `pr:${cmd.card}:${cmd.pr.number}`);
+      const samePr =
+        card.pr?.number === cmd.pr.number &&
+        card.pr?.state === cmd.pr.state &&
+        card.pr?.url === cmd.pr.url;
+      if (samePr) {
+        notes.push("PR 已经是该值，跳过");
+        break;
+      }
+      emit(
+        cmd.card,
+        "pr.bound",
+        { pr: cmd.pr },
+        `pr:${cmd.card}:${cmd.pr.number}:${cmd.pr.state}:from:${card.pr ? `${card.pr.number}:${card.pr.state}` : "-"}`,
+      );
       break;
     }
 

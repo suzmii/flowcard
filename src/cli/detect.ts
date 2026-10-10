@@ -135,6 +135,10 @@ export async function runDetect(argv: string[]): Promise<never> {
   const hints: string[] = [];
   if (!result.ok) {
     hints.push(`cwd ${cwd} 不在 git 仓库内：请把会话移进项目仓库的 worktree`);
+  } else if (result.verdict?.detached) {
+    hints.push(
+      `会话所在的 worktree ${result.verdict.path} 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c feat/<名字> 再绑卡`,
+    );
   } else if (!result.worktree) {
     hints.push(
       `会话 cwd 是主仓库 ${result.verdict?.mainRoot ?? "?"}，不是 worktree：请 /wt <branch> 或 /move <worktree 路径>`,
@@ -155,6 +159,7 @@ export async function runDetect(argv: string[]): Promise<never> {
     cwd,
     worktree: result.worktree,
     isWorktree: result.verdict?.isWorktree ?? false,
+    detached: result.verdict?.detached ?? false,
     mainRoot: result.verdict?.mainRoot ?? null,
     pr: result.pr,
     prSource: result.prSource,

@@ -43,7 +43,11 @@
 
 - 会话在主仓库 → `isWorktree=false`，**worktree 槽位留空**并提示「请 `/wt <branch>` 或 `/move <worktree 路径>`」，绝不把主仓库当成 worktree 绑上去；
 - 会话在 `<主仓库>/.worktrees/<名字>`（设计 §3.1 方式 B 的约定）→ 绑为 `{path, branch, source:"flowcard"}`；
-- 会话在别处的 linked worktree → 仍接受，`source` 推断为 `"harness"`（见 §6 限制）。
+- 会话在别处的 linked worktree → 仍接受，`source` 推断为 `"harness"`（见 §9 限制）；
+- **detached HEAD**（`--abbrev-ref HEAD` 返回空或字面量 `HEAD`）→ `branch=null`、`detached=true`、`bindable=null`，
+  **一律不回写 worktree**（首次绑定也不回写，见 §7）。理由：`branch` 是绑卡后开 PR / 清理要用的字段，
+  探测是自动跑的，**自动写绝不能让卡片信息变差**——用 `detached` 覆盖掉原本正确的 `feat/x` 是净损失。
+  此时只给 note/hint：`要绑卡请先在里面 \`git switch -c feat/<名字>\``。
 
 ## 4. PR / CI 探测（可降级）
 
@@ -74,6 +78,7 @@
 | 分支无 upstream | `unpushedCommits=null`（**不 fetch**，只读本地 ref）；退到 `origin/HEAD` 算 `commitsSinceBase` |
 | `cwd` 不在 git 仓库里 | `probe.ok=false` + note；若卡片有 `repoPath` 则退回它探测 |
 | git 输出里没有 worktree（主仓库） | worktree 槽位不回写，给提示 |
+| worktree 处于 **detached HEAD** | worktree 槽位**不回写**（首次绑定也不写），note/hint「先 `git switch -c feat/<名字>`」 |
 | 单个工具命令超时（10 s） | kill 后按失败处理并降级 |
 
 ## 6. 本机 gh / tea 实测状态（2026-10-10）
@@ -95,11 +100,12 @@
 
 `probeCommands(卡片现状, 探测结果)`：
 
-- worktree：探测到 linked worktree 且与卡片现状（path 或 branch）不同 → 发 `worktree`；
+- worktree：探测到**可绑卡的** linked worktree（`bindable != null`，即非主仓库且非 detached HEAD）且与卡片现状（path 或 branch）不同 → 发 `worktree`；
+  主仓库、detached HEAD、以及「与现状一致」都不发 —— **自动回写只会补充或纠正，不会把已有的有效分支写坏**；
 - PR：卡片没 PR 或 PR 号不同 → `bindPr`；同一 PR 但 `state`/`ci` 变了 → `probePr`（merged 会被引擎升级成 `pr.merged`）；
 - 完全一致 → **不发**（再跑一次是空操作）。
 
-拿不到就不发（例如没有 worktree 就不发 `worktree`）；单个命令失败不影响其他命令与卡片完整性。
+拿不到就不发（例如没有 worktree / detached HEAD 就不发 `worktree`）；单个命令失败不影响其他命令与卡片完整性。
 
 ## 8. 用法
 
@@ -110,11 +116,12 @@ node src/cli/detect.ts <card> [--port 47825] [--url http://127.0.0.1:47825] [--c
 # 退出码：0 成功 / 2 用法错 / 3 卡片不存在或服务端拒绝 / 4 缺必要条件（无会话 cwd、cwd 不在仓库）/ 5 服务不可达
 ```
 
-stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / mainRoot / pr / prSource / prProbed / signals / applied / notes / hints`。
+stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / detached / mainRoot / pr / prSource / prProbed / signals / applied / notes / hints`。
 「没有 worktree 或没会话 cwd」时会给出人话 `hint`，例如：
 
 ```
 会话 cwd 是主仓库 /path/to/repo，不是 worktree：请 /wt <branch> 或 /move <worktree 路径>
+会话所在的 worktree /path/to/repo/.worktrees/demo 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c feat/<名字> 再绑卡
 ```
 
 ## 9. 已知限制
@@ -126,13 +133,15 @@ stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / mainRoo
 - **fork 工作流**：`tea`/`gh` 按当前仓库上下文解析；远程指向 fork 而非上游时可能找不到 PR。
 - 自建 Gitea 的 PR URL 可能是 `http://`（本机实测就是），我们是原样记录 URL，不做规范化。
 - `git < 2.31` 不支持 `--path-format=absolute`，已带相对路径兜底，但未在本机（git 2.56）实测。
+- **detached HEAD 的 worktree 不会绑到卡片上**：卡片上的 `worktree.branch` 必须是真分支名（要用来开 PR / 清理）。
+  会话停在 detached HEAD 时只提示、不写卡；想绑就先 `git switch -c feat/<名字>`。
 - 探测只读、不修改卡片：拿不到的信号不会伪造，也不会把卡片搞坏。
 
 ## 10. 复现
 
 ```bash
 npx tsc --noEmit                 # 我的文件不报错
-npx vitest run test/probe.test.ts # 25 个用例：真实临时仓库 + 假 gh/tea
+npx vitest run test/probe.test.ts # 30 个用例：真实临时仓库（含 detached worktree）+ 假 gh/tea
 
 # 端到端（临时实例 + 临时仓库）
 FLOWCARD_DATA_DIR=/tmp/fc-probe FLOWCARD_PORT=47833 npm start

@@ -222,16 +222,28 @@ export function probeOrder(forge: Forge): ["gh" | "tea", "gh" | "tea"] {
 // ---------------------------------------------------------------- worktree 判定（纯）
 
 export type WorktreeVerdict = {
-  /** 可直接绑卡的 worktree 槽位值。 */
-  worktree: WorktreeRef;
-  /** true = 这是一个 linked worktree；false = 主仓库工作区。 */
+  /** worktree 根（`--show-toplevel` 的绝对路径）。 */
+  path: string;
+  /** 分支名；**detached HEAD → null**（没有分支，不能拿来开 PR / 清理）。 */
+  branch: string | null;
+  /** 谁建的（启发式，见 docs/probe.md §9）。 */
+  source: "harness" | "flowcard";
+  /** true = linked worktree；false = 主仓库工作区。 */
   isWorktree: boolean;
+  /** true = 处于 detached HEAD。 */
+  detached: boolean;
   /** 主仓库根（= git-common-dir 的父目录）。 */
   mainRoot: string;
   gitDir: string;
   commonDir: string;
   /** 是否落在约定的 `<主仓库>/.worktrees/` 下。 */
   underWorktreesDir: boolean;
+  /**
+   * 可绑卡的值：**只有 linked worktree 且不在 detached HEAD 时非 null**。
+   * detached worktree 的路径虽然有用，但绑上去分支只会是空的 —— 探测是自动跑的，
+   * 自动写绝不能让卡片信息变差，所以这里直接给 null（不回写）。
+   */
+  bindable: WorktreeRef | null;
 };
 
 /** 路径段比较复用共享实现（单一来源）；probe 内部拿到的路径都是绝对路径。 */
@@ -252,26 +264,30 @@ export function classifyWorktree(input: {
 }): WorktreeVerdict | null {
   const toplevel = input.toplevel.trim();
   if (!toplevel) return null;
-  const root = resolve(toplevel);
+  const path = resolve(toplevel);
   const gitDir = input.gitDir.trim();
-  const commonDir = resolve(input.commonDir.trim() || gitDir || root);
+  const commonDir = resolve(input.commonDir.trim() || gitDir || path);
   const mainRoot = dirname(commonDir);
-  const isWorktree = root !== mainRoot || (gitDir !== "" && resolve(gitDir) !== commonDir);
-  const branch = input.branch.trim() && input.branch.trim() !== "HEAD" ? input.branch.trim() : "";
+  const isWorktree = path !== mainRoot || (gitDir !== "" && resolve(gitDir) !== commonDir);
+  // `--abbrev-ref HEAD` 在 detached HEAD 时返回字面量 "HEAD"；空输出同样按 detached 处理。
+  const rawBranch = input.branch.trim();
+  const detached = rawBranch === "" || rawBranch === "HEAD";
+  const branch = detached ? null : rawBranch;
   const worktreesDir = `${mainRoot}/.worktrees/`;
-  const underWorktreesDir = root.startsWith(worktreesDir);
+  const underWorktreesDir = path.startsWith(worktreesDir);
+  // 谁建的无法真正知道；按 `.worktrees/<名字>` 约定推断（设计 §3.1 方式 B 用这个路径）。
+  const source: WorktreeRef["source"] = underWorktreesDir ? "flowcard" : "harness";
   return {
-    worktree: {
-      path: root,
-      branch: branch || "detached",
-      // 谁建的无法真正知道；按 `.worktrees/<名字>` 约定推断（设计 §3.1 方式 B 用这个路径）。
-      source: underWorktreesDir ? "flowcard" : "harness",
-    },
+    path,
+    branch,
+    source,
     isWorktree,
+    detached,
     mainRoot,
     gitDir,
     commonDir,
     underWorktreesDir,
+    bindable: isWorktree && branch !== null ? { path, branch, source } : null,
   };
 }
 
@@ -627,9 +643,14 @@ export async function probe(cwd: string, opts: ProbeOptions = {}): Promise<Probe
 
   notes.push(...git.notes);
   const verdict = git.verdict;
-  const worktree = verdict?.isWorktree ? verdict.worktree : null;
+  const worktree = verdict?.bindable ?? null;
   if (verdict && !verdict.isWorktree) {
     notes.push(`cwd 是主仓库工作区 ${verdict.mainRoot}，不是 worktree：不绑定 worktree（请在 worktree 里工作）`);
+  } else if (verdict?.detached) {
+    notes.push(
+      `worktree ${verdict.path} 处于 detached HEAD（没有分支）：**不回写 worktree**（避免把卡片上已有的分支覆盖成无效值）；` +
+        `要绑卡请先在里面 \`git switch -c feat/<名字>\``,
+    );
   } else if (verdict && !verdict.underWorktreesDir) {
     notes.push("worktree 不在 .worktrees/ 约定目录下：仍接受（推断 source=harness）");
   }

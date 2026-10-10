@@ -85,7 +85,8 @@ describe("worktree 判定（纯）", () => {
     });
     expect(v?.isWorktree).toBe(false);
     expect(v?.mainRoot).toBe("/w/proj");
-    expect(v?.worktree).toMatchObject({ path: "/w/proj", branch: "main" });
+    expect(v?.bindable).toBeNull(); // 主仓库不算 worktree
+    expect(v).toMatchObject({ path: "/w/proj", branch: "main", isWorktree: false, detached: false });
   });
 
   it("linked worktree 认出来；.worktrees/ 下判为 flowcard 建的", () => {
@@ -98,10 +99,11 @@ describe("worktree 判定（纯）", () => {
     expect(v?.isWorktree).toBe(true);
     expect(v?.mainRoot).toBe("/w/proj");
     expect(v?.underWorktreesDir).toBe(true);
-    expect(v?.worktree).toMatchObject({ path: "/w/proj/.worktrees/card-1", branch: "feat/card-1", source: "flowcard" });
+    expect(v?.bindable).toEqual({ path: "/w/proj/.worktrees/card-1", branch: "feat/card-1", source: "flowcard" });
+    expect(v?.detached).toBe(false);
   });
 
-  it("约定目录之外的 worktree 仍接受（source 推断 harness）；分支 HEAD 显示 detached", () => {
+  it("detached HEAD：branch=null、detached=true、不可绑卡（bindable=null）", () => {
     const v = classifyWorktree({
       toplevel: "/w/other/wt",
       gitDir: "/w/proj/.git/worktrees/wt",
@@ -110,7 +112,12 @@ describe("worktree 判定（纯）", () => {
     });
     expect(v?.isWorktree).toBe(true);
     expect(v?.underWorktreesDir).toBe(false);
-    expect(v?.worktree).toMatchObject({ branch: "detached", source: "harness" });
+    expect(v).toMatchObject({ branch: null, detached: true, source: "harness", bindable: null });
+  });
+
+  it("空分支输出同样按 detached 处理", () => {
+    const v = classifyWorktree({ toplevel: "/w/proj", gitDir: "/w/proj/.git", commonDir: "/w/proj/.git", branch: "" });
+    expect(v).toMatchObject({ branch: null, detached: true, bindable: null });
   });
 
   it("路径前缀按段比较：/w/xy 不算在 /w/x 里", () => {
@@ -282,6 +289,7 @@ describe("PR / CI 解析（纯）", () => {
 let root = "";
 let mainRepo = "";
 let wtPath = "";
+let detachedPath = "";
 let mainBranch = "";
 
 function git(args: string[], cwd: string): string {
@@ -304,6 +312,11 @@ beforeAll(() => {
   mkdirSync(join(mainRepo, ".worktrees"));
   git(["worktree", "add", "-q", ".worktrees/card-1", "feat/card-1"], mainRepo);
   wtPath = join(mainRepo, ".worktrees", "card-1");
+
+  // 一个 detached HEAD 的 worktree（不是任何分支）：回归「不能拿 detached 覆盖已有分支」
+  const headSha = git(["rev-parse", "HEAD"], mainRepo).trim();
+  git(["worktree", "add", "-q", "--detach", ".worktrees/detached", headSha], mainRepo);
+  detachedPath = join(mainRepo, ".worktrees", "detached");
 
   // worktree 里两个提交 + 一个未提交改动
   writeFileSync(join(wtPath, "b.txt"), "b\n");
@@ -340,7 +353,7 @@ describe("真实 git 仓库：主仓库 vs worktree", () => {
     expect(g.ok).toBe(true);
     expect(g.verdict?.isWorktree).toBe(true);
     expect(g.verdict?.underWorktreesDir).toBe(true);
-    expect(g.verdict?.worktree).toMatchObject({
+    expect(g.verdict?.bindable).toEqual({
       path: wtPath,
       branch: "feat/card-1",
       source: "flowcard",
@@ -354,7 +367,7 @@ describe("真实 git 仓库：主仓库 vs worktree", () => {
     mkdirSync(sub, { recursive: true });
     const g = await probeGit(sub);
     expect(g.verdict?.isWorktree).toBe(true);
-    expect(g.verdict?.worktree.path).toBe(wtPath);
+    expect(g.verdict?.bindable?.path).toBe(wtPath);
   });
 
   it("改动文件数与未推送提交数", async () => {
@@ -372,6 +385,35 @@ describe("真实 git 仓库：主仓库 vs worktree", () => {
     const g = await probeGit(plain);
     expect(g.ok).toBe(false);
     expect(g.notes.join("\n")).toContain("不在 git 仓库内");
+  });
+});
+
+describe("detached HEAD 的 worktree：自动写绝不覆盖已有分支（回归）", () => {
+  it("probeGit：detached=true、branch=null、bindable=null，信号里也没有分支", async () => {
+    const g = await probeGit(detachedPath);
+    expect(g.ok).toBe(true);
+    expect(g.verdict).toMatchObject({ isWorktree: true, detached: true, branch: null, bindable: null });
+    expect(g.signals.branch).toBeNull();
+  });
+
+  it("probe：worktree 槽位留空，notes 说明是 detached HEAD 并给出修法", async () => {
+    const result = await probe(detachedPath, { run: silentTools });
+    expect(result.ok).toBe(true);
+    expect(result.worktree).toBeNull();
+    expect(result.notes.join("\n")).toContain("detached HEAD");
+    expect(result.notes.join("\n")).toContain("git switch -c");
+  });
+
+  it("卡片已绑同一路径的 feat/demo → 不产出任何 worktree 命令（保留原分支）", async () => {
+    const result = await probe(detachedPath, { run: silentTools });
+    const existing = { path: detachedPath, branch: "feat/demo", source: "flowcard" as const };
+    expect(probeCommands({ worktree: existing, pr: null }, result)).toEqual([]);
+  });
+
+  it("首次绑定（卡片没有 worktree）→ 同样不绑（只写有价值的字段）", async () => {
+    const result = await probe(detachedPath, { run: silentTools });
+    expect(result.worktree).toBeNull();
+    expect(probeCommands({ worktree: null, pr: null }, result)).toEqual([]);
   });
 });
 
