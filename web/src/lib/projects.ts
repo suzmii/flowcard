@@ -138,3 +138,72 @@ export function projectSummary(project: ProjectView): string[] {
   if (project.virtual) parts.push("合成项目（未归属的卡）");
   return parts;
 }
+
+/** 候选仓库（扫常见工作目录得来）：点一下就能加，省得翻对话框。 */
+const candidateSchema = z.looseObject({
+  path: z.string(),
+  name: z.string(),
+  remote: z.string().optional(),
+  headBranch: z.string().optional(),
+});
+export type CandidateView = z.infer<typeof candidateSchema>;
+
+const candidatesResponseSchema = z.looseObject({
+  roots: z.array(z.string()),
+  candidates: z.array(candidateSchema),
+});
+
+export type CandidatesResult =
+  | { ok: true; roots: string[]; candidates: CandidateView[] }
+  | { ok: false; message: string };
+
+export async function fetchCandidates(signal?: AbortSignal): Promise<CandidatesResult> {
+  let res: Response;
+  try {
+    res = await fetch(apiUrl("/api/projects/candidates"), { signal, headers: { accept: "application/json" } });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    return { ok: false, message: unreachableMessage(error) };
+  }
+  if (!res.ok) return { ok: false, message: `候选仓库接口返回 ${res.status}` };
+  const parsed = candidatesResponseSchema.safeParse(await res.json().catch(() => null));
+  if (!parsed.success) return { ok: false, message: `候选仓库不符合契约：${describeIssues(parsed.error)}` };
+  return { ok: true, roots: parsed.data.roots, candidates: parsed.data.candidates };
+}
+
+export type PickProjectResult =
+  | { ok: true; project: ProjectView; created: boolean }
+  | { ok: false; cancelled: boolean; message: string };
+
+/**
+ * 唤起服务端所在桌面的**原生目录选择器**（浏览器拿不到绝对路径，只能这样）。
+ * 用户取消 / 超时都算正常结果（cancelled: true），不要当错误弹红。
+ */
+export async function pickProject(start?: string, signal?: AbortSignal): Promise<PickProjectResult> {
+  let res: Response;
+  try {
+    res = await fetch(apiUrl("/api/projects/pick"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(start ? { start } : {}),
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    return { ok: false, cancelled: false, message: unreachableMessage(error) };
+  }
+  const body = (await res.json().catch(() => null)) as
+    | { ok?: boolean; status?: string; reason?: string; message?: string | null; project?: unknown; created?: boolean }
+    | null;
+  if (body?.ok === true) {
+    const parsed = projectResponseSchema.safeParse(body);
+    if (!parsed.success) {
+      return { ok: false, cancelled: false, message: `选择项目返回不符合契约：${describeIssues(parsed.error)}` };
+    }
+    return { ok: true, project: parsed.data.project, created: parsed.data.created ?? true };
+  }
+  const reason = body?.reason ?? "failed";
+  if (reason === "user") return { ok: false, cancelled: true, message: "已取消选择" };
+  if (reason === "timeout") return { ok: false, cancelled: true, message: "对话框超时未操作，已取消" };
+  return { ok: false, cancelled: false, message: body?.message ?? `选择项目失败（${reason}）` };
+}

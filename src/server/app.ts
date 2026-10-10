@@ -11,6 +11,9 @@ import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
 import { readProject } from "./projects.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
 import type { Store } from "./store.ts";
+import { pickDirectory } from "./picker.ts";
+import { projectRootsFromEnv } from "./projects.ts";
+import { scanGitRepos } from "./projects.ts";
 
 /** 看板构建产物目录（`npm run web:build` 的 outDir）。 */
 const WEB_DIST = fileURLToPath(new URL("../../web/dist", import.meta.url));
@@ -260,6 +263,36 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       }
     }),
   );
+
+  // 选择项目：候选列表（扫常见工作目录）+ 原生目录选择器（弹到用户桌面）
+  app.get("/api/projects/candidates", async (c) => {
+    const roots = projectRootsFromEnv();
+    const candidates = await scanGitRepos(roots);
+    return c.json({ roots, candidates });
+  });
+
+  app.post("/api/projects/pick", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { start?: string; timeoutMs?: number };
+    const roots = projectRootsFromEnv();
+    const start = body.start ?? roots[0] ?? process.env.HOME ?? "/";
+    const picked = await pickDirectory({
+      startDir: start,
+      ...(typeof body.timeoutMs === "number" ? { timeoutMs: body.timeoutMs } : {}),
+    });
+    if (picked.status !== "picked") {
+      return c.json({ ok: false, status: picked.status, reason: picked.reason, message: picked.message ?? null }, 200);
+    }
+    const read = await readProject(picked.path);
+    if (!read.ok) {
+      return c.json(
+        { ok: false, status: "failed", reason: "not-a-repo", message: read.error.message, path: picked.path },
+        200,
+      );
+    }
+    const { project, created } = store.upsertProject(read.project);
+    broadcast("projects", { project, created });
+    return c.json({ ok: true, status: "picked", path: picked.path, project, created });
+  });
 
   // 看板静态资源：注册在 /api 路由之后，不会盖住接口。没构建过就给一条人话提示。
   if (existsSync(join(WEB_DIST, "index.html"))) {

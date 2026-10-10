@@ -6,7 +6,9 @@
  *
  * id 由仓库根路径派生（目录名 + 短哈希）：同一路径永远同一个 id（幂等），人也能看懂是哪个仓库。
  */
-import { basename } from "node:path";
+import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 import { shortHash } from "../shared/hash.ts";
 import { normalizePath } from "../shared/paths.ts";
 import {
@@ -134,6 +136,63 @@ export async function readProject(
 }
 
 /** `git log -1 --format=%H%x1f%s%x1f%cI` → 提交摘要（字段不齐就返回 null）。 */
+/** 候选项目根目录：`FLOWCARD_PROJECT_ROOTS` 冒号分隔，默认 `~/workspace`。 */
+export function projectRootsFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.FLOWCARD_PROJECT_ROOTS;
+  const roots = raw
+    ? raw.split(":").map((p) => p.trim()).filter(Boolean)
+    : [`${env.HOME ?? homedir()}/workspace`];
+  return roots.map((p) => normalizePath(p));
+}
+
+/** 扫描常见工作目录，找出可直接添加的 git 仓库（给"选择项目"提供候选，省得翻对话框）。 */
+const SCAN_SKIP = new Set(["node_modules", "dist", "target", "build", "vendor", ".git", ".worktrees"]);
+
+export type RepoCandidate = {
+  path: string;
+  name: string;
+  remote?: string;
+  headBranch?: string;
+};
+
+export async function scanGitRepos(
+  roots: string[],
+  opts: { depth?: number; run?: Run } = {},
+): Promise<RepoCandidate[]> {
+  const depth = opts.depth ?? 2;
+  const run = opts.run ?? defaultRun;
+  const found: RepoCandidate[] = [];
+
+  const visit = async (dir: string, level: number): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return; // 不存在/没权限：跳过，不抛
+    }
+    if (entries.some((e) => e.name === ".git")) {
+      const result = await readProject(dir, { run });
+      if (result.ok) {
+        found.push({
+          path: result.project.path,
+          name: result.project.name,
+          ...(result.project.remote ? { remote: result.project.remote } : {}),
+          ...(result.project.headBranch ? { headBranch: result.project.headBranch } : {}),
+        });
+      }
+      return; // 仓库内部不再往下找（嵌套仓库另算）
+    }
+    if (level >= depth) return;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".") || SCAN_SKIP.has(entry.name)) continue;
+      await visit(join(dir, entry.name), level + 1);
+    }
+  };
+
+  for (const root of roots) await visit(root, 0);
+  return found.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function lastCommitOf(stdout: string): Project["lastCommit"] | null {
   const [sha, subject, at] = firstLine(stdout).split("\x1f");
   if (!sha || !at) return null;

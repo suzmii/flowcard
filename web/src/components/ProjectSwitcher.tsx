@@ -2,12 +2,27 @@
  * 顶部项目选择器（看板 Metadata）：显示当前项目名 + 从 git 自动读出来的元数据
  * （remote 短形、当前分支、最后提交、脏文件数），并支持现场添加项目（输入仓库绝对路径）。
  */
-import { useState } from "react";
-import { AlertTriangle, Check, FolderGit2, GitBranch, GitCommitHorizontal, Loader2, Plus } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  Check,
+  FolderGit2,
+  FolderSearch,
+  GitBranch,
+  GitCommitHorizontal,
+  Loader2,
+  Plus,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { shortRemote, type ProjectView } from "@/lib/projects";
+import {
+  fetchCandidates,
+  pickProject,
+  shortRemote,
+  type CandidateView,
+  type ProjectView,
+} from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
 
 /** 项目元数据一行：remote / 分支 / 最后提交 / 脏文件数。 */
@@ -72,6 +87,65 @@ export function ProjectSwitcher({
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  const [candidates, setCandidates] = useState<CandidateView[] | null>(null);
+  const [candidatesError, setCandidatesError] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
+
+  // 展开"添加项目"时才去扫候选仓库（省得每次打开看板都扫盘）
+  useEffect(() => {
+    if (!adding || candidates !== null) return;
+    let alive = true;
+    void fetchCandidates().then((result) => {
+      if (!alive) return;
+      if (result.ok) {
+        setCandidates(result.candidates.filter((c) => !projects.some((p) => p.path === c.path)));
+        setCandidatesError(null);
+      } else {
+        setCandidates([]);
+        setCandidatesError(result.message);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [adding, candidates, projects]);
+
+  /** 唤起服务端桌面上的原生目录选择器（浏览器拿不到绝对路径）。 */
+  const browse = useCallback(async () => {
+    setPicking(true);
+    setNotice(null);
+    const result = await pickProject();
+    setPicking(false);
+    if (!result.ok) {
+      // 取消/超时不是错误，给灰字提示就够
+      if (result.cancelled) setNotice({ tone: "ok", text: result.message });
+      else setNotice({ tone: "error", text: `选择失败：${result.message}` });
+      return;
+    }
+    // 选择器已在服务端把它注册好了；再走一次 onAdd（幂等）以刷新列表并选中
+    const added = await onAdd(result.project.path);
+    if (added.ok) {
+      setNotice({ tone: "ok", text: `已添加项目「${added.project.name}」（来自目录选择器）` });
+      setAdding(false);
+      setCandidates(null);
+    } else {
+      setNotice({ tone: "error", text: `添加项目失败：${added.message}` });
+    }
+  }, [onAdd]);
+
+  const addCandidate = async (candidate: CandidateView) => {
+    setBusy(true);
+    setNotice(null);
+    const result = await onAdd(candidate.path);
+    setBusy(false);
+    if (result.ok) {
+      setNotice({ tone: "ok", text: `已添加项目「${result.project.name}」` });
+      setAdding(false);
+      setCandidates(null);
+    } else {
+      setNotice({ tone: "error", text: `添加项目失败：${result.message}` });
+    }
+  };
 
   const submit = async () => {
     const trimmed = path.trim();
@@ -130,25 +204,76 @@ export function ProjectSwitcher({
       </div>
 
       {adding ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            data-testid="project-path-input"
-            autoFocus
-            className="max-w-[28rem]"
-            placeholder="/home/me/workspace/proj（仓库绝对路径）"
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void submit();
-            }}
-          />
-          <Button size="xs" data-testid="project-add-submit" disabled={busy} onClick={() => void submit()}>
-            {busy ? <Loader2 className="animate-spin" /> : null}
-            {busy ? "读取 git 元数据…" : "添加"}
-          </Button>
-          <span className="text-[11px] text-muted-foreground">
-            服务端会读 remote / 分支 / 最后提交 / 脏文件数
-          </span>
+        <div className="space-y-2 rounded-lg border bg-muted/30 p-2.5" data-testid="project-add-panel">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="xs"
+              variant="outline"
+              data-testid="project-browse"
+              disabled={picking}
+              onClick={() => void browse()}
+            >
+              {picking ? <Loader2 className="animate-spin" /> : <FolderSearch />}
+              {picking ? "等待你在桌面上选择…" : "浏览…（打开文件管理器）"}
+            </Button>
+            <span className="text-[11px] text-muted-foreground">
+              对话框会弹在你桌面上（服务端在同一台机器上唤起）
+            </span>
+          </div>
+
+          {candidates === null ? (
+            <div className="text-[11px] text-muted-foreground" data-testid="project-candidates-loading">
+              正在扫描常见工作目录…
+            </div>
+          ) : candidates.length > 0 ? (
+            <div className="space-y-1" data-testid="project-candidates">
+              <div className="text-[11px] text-muted-foreground">扫描到的仓库（点一下即添加）：</div>
+              <div className="flex flex-wrap gap-1.5">
+                {candidates.map((candidate) => (
+                  <button
+                    key={candidate.path}
+                    type="button"
+                    data-testid={`project-candidate-${candidate.name}`}
+                    title={candidate.path}
+                    disabled={busy}
+                    onClick={() => void addCandidate(candidate)}
+                    className="flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
+                  >
+                    <FolderGit2 className="size-3 text-muted-foreground" />
+                    <span className="font-medium">{candidate.name}</span>
+                    {candidate.remote ? (
+                      <span className="text-muted-foreground">{shortRemote(candidate.remote)}</span>
+                    ) : null}
+                    {candidate.headBranch ? <span className="text-muted-foreground">{candidate.headBranch}</span> : null}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="text-[11px] text-muted-foreground" data-testid="project-candidates-empty">
+              常见工作目录里没有未添加的 git 仓库{candidatesError ? `（${candidatesError}）` : ""}
+            </div>
+          )}
+
+          <details className="text-[11px]">
+            <summary className="cursor-pointer text-muted-foreground">或手动输入仓库绝对路径</summary>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              <Input
+                data-testid="project-path-input"
+                className="max-w-[28rem]"
+                placeholder="/home/me/workspace/proj（仓库绝对路径）"
+                value={path}
+                onChange={(event) => setPath(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submit();
+                }}
+              />
+              <Button size="xs" data-testid="project-add-submit" disabled={busy} onClick={() => void submit()}>
+                {busy ? <Loader2 className="animate-spin" /> : null}
+                {busy ? "读取 git 元数据…" : "添加"}
+              </Button>
+            </div>
+          </details>
         </div>
       ) : null}
 
