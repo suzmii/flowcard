@@ -223,15 +223,15 @@ describe("缺外部事实（git）时退化：只看卡片事实，不猜", () =
 describe("列的定义与判据表（加列只该改 STAGES + STAGE_RULES）", () => {
   it("列（id + 中文标签 + 顺序）就是定稿的九个", () => {
     expect([...STAGES]).toEqual([
-      "dropped",
+      "backlog",
+      "working",
+      "prTodo",
+      "prReview",
+      "review",
+      "merged",
       "done",
       "blocked",
-      "merged",
-      "review",
-      "prReview",
-      "prTodo",
-      "working",
-      "backlog",
+      "dropped",
     ]);
     expect(STAGE_LABELS).toEqual({
       dropped: "放弃",
@@ -246,8 +246,10 @@ describe("列的定义与判据表（加列只该改 STAGES + STAGE_RULES）", (
     });
   });
 
-  it("判据表与列同序同集（列序 = 优先级），兜底列在最后且对任何卡片都成立", () => {
-    expect(STAGE_RULES.map((rule) => rule.stage)).toEqual([...STAGES]);
+  it("判据表与列同集；判据表顺序=匹配优先级（异常/终态在前），与显示顺序独立", () => {
+    // 同集：每条判据产出的列恰好覆盖全部列，不多不少
+    expect(new Set(STAGE_RULES.map((r) => r.stage))).toEqual(new Set(STAGES));
+    expect(STAGE_RULES.length).toBe(STAGES.length);
     expect(new Set(STAGES).size).toBe(STAGES.length);
     expect(STAGE_RULES.at(-1)!.stage).toBe(STAGE_FALLBACK);
     for (const { name, card: c, git } of CASES) {
