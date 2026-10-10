@@ -6,6 +6,12 @@ import { SESSION_STATE_LABELS, type Session } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 import { timeAgo } from "@/lib/utils";
 
+/**
+ * omp 上报扩展的路径。这是"单机自用"的部署事实：flowcard 的仓库就是适配器所在处。
+ * 换成 omp 扩展安装后（`omp install <这个目录>`），会话里就不再需要 `-e` 了。
+ */
+const OMP_ADAPTER_PATH = "~/workspace/flowcard/src/adapters/omp/flowcard-omp-adapter.ts";
+
 const SESSION_TONE: Record<string, "success" | "warning" | "danger" | "muted"> = {
   idle: "muted",
   running: "success",
@@ -34,10 +40,44 @@ export function SessionPanel({ card }: { card: CardView }) {
   const worktree = card.worktree;
 
   if (!session) {
+    // 卡片天生就有"它自己的会话"——只是那次会话还没启动。
+    // 会话是 harness 里的一个真实进程（omp 的 session id 只有它启动时才存在），
+    // flowcard 造不出来，所以这里给的是**确切可复制的启动命令**。
+    const startHere = worktree ? worktree.path : null;
+    const startCommand = startHere ? `cd ${startHere} && omp` : null;
+    const startWithAdapter = startHere
+      ? `cd ${startHere} && omp -e ${OMP_ADAPTER_PATH}`
+      : null;
+
     return (
-      <p className="rounded-lg border border-dashed bg-muted/40 p-2.5 text-xs text-muted-foreground">
-        空 · 还没有会话认领这张卡（认领 = 本地动作：CLI <code className="font-mono">flowcard claim</code>）
-      </p>
+      <div className="space-y-2 rounded-lg border border-dashed bg-muted/40 p-2.5 text-xs">
+        <p className="text-muted-foreground">
+          这张卡的会话<strong className="font-medium text-foreground">还没启动</strong>
+          。会话就是干这活儿的那个 agent 进程——在卡片的 worktree 里启动它，
+          它会自动认到这张卡（按 cwd 解析，不用手填卡片 id）。
+        </p>
+        {startCommand && startWithAdapter ? (
+          <>
+            <div className="flex items-center gap-1.5">
+              <code className="min-w-0 flex-1 truncate rounded bg-background px-1.5 py-1 font-mono">{startCommand}</code>
+              <CopyButton value={startCommand} label="复制启动命令" />
+            </div>
+            <p className="text-muted-foreground">
+              还没把上报扩展装进 omp？那就显式带上它（同样在 worktree 里跑）：
+            </p>
+            <div className="flex items-center gap-1.5">
+              <code className="min-w-0 flex-1 truncate rounded bg-background px-1.5 py-1 font-mono">{startWithAdapter}</code>
+              <CopyButton value={startWithAdapter} label="复制（带扩展）" />
+            </div>
+          </>
+        ) : (
+          <p className="text-muted-foreground">
+            这张卡还没有 worktree：先在「必要项目」里绑一个（
+            <code className="font-mono">flowcard worktree {card.id} --path .worktrees/{card.id} --branch feat/{card.id}</code>
+            ），再回到这里启动会话。
+          </p>
+        )}
+      </div>
     );
   }
 
