@@ -89,7 +89,7 @@
 
 ## 7. 轮询节奏与增量窗口
 
-- **节奏建议 5 分钟**（`setInterval` 或外部 cron；看板场景人的反应时间远大于 5 分钟）。可配 `FLOWCARD_SYNC_INTERVAL_MS`（`0` = 关）。
+- **节奏：5 分钟一轮**，已内置 `setInterval`（接线见 §9.5；看板场景人的反应时间远大于 5 分钟）。可配 `FLOWCARD_SYNC_INTERVAL_MS`（默认 **300000**，`0` = 关）。
 - **增量窗口**：`since = lastSyncAt - 60 s`（重叠 1 分钟防时钟漂移/跨事务漏事件，重复由 `dedupeKey` 吃掉）。`lastSyncAt` 由 store 按项目记住。
 - **成本实测**（2026-10-10，Gitea，50 条/页，响应体大小是实测字节数）：单条 `issues/{n}` ≈ **5.8 KB**、单条 `pulls/{n}` ≈ **17 KB**（PR 对象里嵌套了 head/base 各自的完整 repo 对象）；一页 50 条 issue 列表 ≈ **290 KB**；一页 50 条 PR 列表 ≈ **525 KB**；一页 9 条评论 ≈ **25 KB**。因为 `/pulls` 没有 `since`，一次全量快照会翻满 5 页 ≈ **2.6 MB**，整轮实测 **8.6 s ~ 32 s**（服务端冷热差异；冷的那次就是撞上 `timeout` 降级的原因，见 §8）。所以：
   - 只想跟看板上已绑定的那几张卡 → **优先 `fetchPull`/`fetchIssue` 按号精确读**（每个 ≈ 17 KB / 5.8 KB），根本不拉全量列表；
@@ -124,56 +124,97 @@ facts 首轮      : {issue:12, pr:250, comment:8}      # 未给 opts.numbers
 - **真跑抓到过一个真 bug 并已修**：`AbortSignal.timeout` 如果在**读 body 途中**触发（大页 PR 列表会），旧写法会把拒绝漏成异常抛给调用方 —— 现在是 `defaultHttpGet` 整段 `try`，一律折成 `{ok:false, reason:"timeout"}`；`test/sync.test.ts` 用本地假服务（`/partial` 写完响应头就永不 `end`）把这个分支钉住了。
 - `tea issues ls` 的 JSON 里 `index`/`comments` 是**字符串**、`updated` 是 **UTC**（`2026-10-10T04:58:46Z`），`author` 是**显示名**（「董羽秦」）而不是 login —— 解析时都按字符串处理并归一化时间。
 
-## 9. 接线清单（给 `engine`/`project`/`store`/`app`/`cli`）
+## 9. 接线（已落地：服务端 / CLI / 前端 / 测试）
 
-### 9.1 新增事件类型（`EventType`）
+下面写的是**实际接线方式**（原清单里的"建议"若与这里不同，以这里为准；偏离的地方都在 §9.7 里点明）。
+代码：`src/server/syncer.ts`（一轮同步 + 内置调度器）、`src/server/engine.ts`（`applySync` 命令）、
+`src/server/project.ts`（投影）、`src/server/{store,app,main}.ts`、`src/cli/{sync,main}.ts`、`web/src/**`。
+测试：`test/sync-wire.test.ts`（23 例，全离线：注入假 http / 假 run）。
 
-| fact | 建议事件类型 | payload |
-|---|---|---|
-| `issue.state` | **新增** `"issue.state.changed"` | `{number, state, title, updatedAt}` |
-| `pr.state` | 复用 `"pr.updated"`（`merged:true` 时建议改发既有的 `"pr.merged"`，让引擎走合并那条路） | `{number, state, merged, head, base, url, updatedAt}` |
-| `remote.comment` | **新增** `"remote.comment.added"` | `{id, issueNumber, author, body, at, url}` |
+### 9.1 事件（事实 → 事件：`applySync` 命令）
 
-`dedupeKey = factKey(fact)`（**唯一来源**，不要另起规则）。`actor` 建议用 `{kind:"system"}`（同步是无人的后台动作）。正文 `body` 可能很长（实测有 3 900 字），落库前如要截断，请截断 **payload**，别动 `at`/`id`（幂等键依赖它们）。
+事实进引擎**只有一条路**：`cmd applySync { card, facts: SyncFact[] }`（同步器按编号解析好 `cardId`，一张卡一条命令）。
+引擎把它翻成事件，`actor` 一律 `{kind:"system"}`，`dedupeKey` 一律 `factKey(fact)`（**唯一来源**，同步器不另起规则）：
 
-### 9.2 投影字段（`Card`）
+| fact | 事件 | payload | 幂等键 |
+|---|---|---|---|
+| `issue.state` | **新增** `issue.state.changed` | `{number, state, title, updatedAt}` | `sync:issue:{n}:{updatedAt}` |
+| `pr.state`（`merged:true` 或 `state:"merged"`） | 复用 `pr.merged`（让引擎走合并那条自动节点） | `{pr: PrRef}` | `sync:pr:{n}:{state}:{updatedAt}` |
+| `pr.state`（其余） | 复用 `pr.updated` | `{pr: PrRef}` | 同上 |
+| `remote.comment` | **新增** `remote.comment.added` | `{id, issueNumber, author, body, at, url}` | `sync:comment:{id}` |
 
-- `issue`: 用 `issue.state` 事实更新 `IssueRef.state`（`open`/`closed`）与 `title`。`IssueRef` **没有 `updatedAt` 字段**：无需为它加字段 —— `updatedAt` 只服务幂等键与差异比较。
-- `pr`: `pr.state` 事实更新 `PrRef.state`（`open`/`draft`/`merged`/`closed`）。**注意**：`PrRef.state` 有 `draft`，同步事实只有 `open`/`closed`/`merged` —— 不要把已知的 `draft` 覆盖成 `open`（`applyEvent` 里请保留「事实说 open 且卡片是 draft → 不动 draft」这条）。
-- 评论：`remote.comment.added` 建议投影成**卡片评论里带来源标记**的一条（如 `Comment.actor = {kind:"system", name:"git:lhk229"}`，或新加 `source`），避免与本地评论（`card.comment.added`）混淆。若不想动 `Comment` 结构，退一步：只存事件、不投影。
+- 事实 → `PrRef.state` 的换算写在引擎的纯函数 `nextPrState(pr, fact)` 里，三条规矩（都是为了不拿更弱的信息覆盖更强的已知事实）：
+  1. 事实确认合并 → `merged`；
+  2. 事实说 `open` 而卡片已经是 `draft` → **保留 `draft`**（不能让 draft 降级成 open）；
+  3. 事实是 `closed` 但 `merged` 未知（tea CLI 兜底拿不到这个位）而卡片已知 `merged` → **保留 `merged`**。
+- 评论正文原样落库：实测最长 ~3 900 字（一条事件几 KB），**不做截断**。
+- 编号与卡片对不上就跳过（同步器已按已绑编号过滤，投影层只兜底）。
 
-### 9.3 store 需要记住的
+### 9.2 投影（`PROJECTION_VERSION` → **v6**）
 
-| 键 | 用途 |
+- `issue.state.changed`：只改 `issue.state` / `issue.title`，`repo`/`url` **原样保留**（closed ≠ 清空）。`IssueRef` 不加 `updatedAt`（它只服务幂等键与差异比较）。
+- `remote.comment.added` → **新槽位** `Card.remoteComments: Array<{id, issueNumber, author, body, at, url, read}>`：与本地评论分开存（`card.comments` 是本地事实），同 id 只投影一次。
+- `remote.comments.read`：把 payload `{ids}` 里那些置 `read:true`（只置位，不删记录）。
+- pr 三个事件**不用改投影**：payload 就是完整 `PrRef`（沿用原有 `pr.bound/pr.updated/pr.merged` 分支）。
+
+### 9.3 已读（新命令）
+
+`cmd markRemoteCommentsRead { card, ids? }` → 事件 `remote.comments.read { ids }`（`ids` 不给 = 当前全部未读）。
+**一条未读都没有时不发事件**，所以连着调两次的第二次是空操作（幂等）；幂等键 `remote-read:{card}:{sha1(ids)}`。
+前端在**打开卡片详情**时自动调它（`actor = {kind:"human", name:"看板"}`）。
+
+### 9.4 store 记住的东西（`meta` 表，按项目，**不进事件流**）
+
+键 `sync:{projectId}` → `{ at, degraded, notes, counts, prev?, lastError? }`：
+
+| 字段 | 用途 |
 |---|---|
-| `lastSyncAt`（按 **project**） | `since` 游标的来源（`since = lastSyncAt - 60 s`） |
-| `lastSyncPrev`（可选，按 project） | 上一轮的 `{issues, pulls, commentKeys}` 摘要，喂给 `toFacts(prev, next)`；不存也能跑（靠 `dedupeKey`），存了省引擎调用 |
-| `lastSyncDegraded`（可选） | 上一轮 `degraded[]`，给 UI 提示「数据可能不全」 |
+| `at` | `lastSyncAt`；`since` 游标 = `at - 60 s`（`SINCE_OVERLAP_MS`） |
+| `prev` | 上一轮的 `{issues, pulls, commentKeys}`，喂 `toFacts(prev, next, {numbers})`；丢了也能跑（`dedupeKey` 兜底） |
+| `degraded` / `notes` / `counts` | 给 UI 显示「最后同步 / 本轮数据可能不全」 |
+| `lastError` | 整体没跑成的原因（没凭据等）；成功一轮后清掉 |
 
-同步本身**不需要新的写路径**：它只是产出事实，落库仍走既有的事件追加（`dedupeKey` 已在 `Event` 里）。
+两条自保规则（都有测试钉住）：
+- **值被写坏**（坏 JSON / 形状不对）→ 当"没同步过"，不让一次坏值把同步卡死；
+- **游标只在该前进时前进**：整体没跑成（`reason != null`）→ 完全不动 `at`；**评论端点降级** → 也不动 `at`（那段窗口还没读到，推进等于永久丢掉，下轮重读同一窗口）。
 
-### 9.4 建议的 HTTP 端点与 CLI
+### 9.5 调度（`src/server/syncer.ts` + `src/server/main.ts`）
 
-| 形态 | 名字 | 说明 |
+- `setInterval`，`FLOWCARD_SYNC_INTERVAL_MS` 默认 **300000**（`0` = 关，定时器 `unref()`，不拖住退出）；
+  启动日志会写「同步 每 600s / 已关闭」。
+- 每轮只跑「非虚拟 + 有 remote + **至少一张卡绑了编号**」的项目；上一轮没跑完就跳过这一拍（远程慢时宁可少跑，不排长队）；
+  **启动时不立刻同步**（不拿启动时间赌网络）。
+- 有凭据时一轮的调用面（`test/sync-wire.test.ts` 用注入假 http 钉死）：
+  每个已绑编号一次 `GET /issues/{n}`、`GET /pulls/{n}`（实测 ~5.8 KB / ~17 KB）+ **每仓库一次** `GET /issues/comments?since=…` 后按已绑编号过滤；
+  **断言过：一轮里没有 `/issues?` / `/pulls?` 列表请求**。
+- `--list`（手动）才走 `pollRemote` 的全量列表：实测 250 条 PR ≈ 15 s（对照：3 个精确读一轮 ≈ 5–10 s）。默认路径**不翻列表**。
+
+### 9.6 HTTP / CLI
+
+| 形态 | 名字 | 实际行为 |
 |---|---|---|
-| HTTP | `POST /api/projects/:id/sync` | body `{since?: ISO}`；触发一次只读同步 → `{fetchedAt, since, counts, facts: n, applied: n, degraded, notes}`。**永远不返回 token** |
-| HTTP | `GET /api/projects/:id/sync` | 查 `lastSyncAt` / 上轮结果 / `degraded`（纯读，不触发网络） |
-| CLI | `node src/cli/sync.ts <project-id\|card-id> [--since <ISO>] [--dry-run] [--port 47825]` | 独立入口，跟 `src/cli/detect.ts` 一个套路（**不动 `src/cli/main.ts`**）。退出码建议：`0` 成功 / `2` 用法错 / `3` 项目或卡片不存在 / `4` 无凭据 / `5` 服务不可达 |
-| 后台 | `FLOWCARD_SYNC_INTERVAL_MS`（默认 0=关，建议 300000） | `app`/`main` 里一个 `setInterval`，每轮对**所有有卡片的项目**跑一次 `pollRemote` + `toFacts(prev, next, {numbers})` |
+| HTTP | `POST /api/projects/:id/sync` | body `{since?, list?, dryRun?}` → `SyncRoundReport`：`{projectId, fetchedAt, since, reason, source, counts{issues,pulls,comments}, facts, applied, duplicates, degraded, notes, numbers{issues,pulls}, dryRun, cardIds, types, factList?(dryRun)}` |
+| HTTP | `GET /api/projects/:id/sync` | `{lastSyncAt, degraded, notes, counts, lastError, tracked{issues,pulls}}`（纯读，不联网） |
+| CLI | `node src/cli/sync.ts <项目 id 或路径 \| 卡片 id> [--since ISO] [--list] [--dry-run] [--port]` | 独立入口；`flowcard sync …` 由 `src/cli/main.ts` 转发到它 |
+| 后台 | `FLOWCARD_SYNC_INTERVAL_MS` | 见 §9.5 |
 
-推荐的调用序（一次同步）：
+- **永不返回 token**：`SyncAuth.token` 只进请求头，报告/状态里没有凭据字段（测试断言响应体、事件流、卡片投影里都没有 token 值）。
+- **整体跑不成不是 HTTP 错误**：没凭据/没传输 → 200 + `reason` + `notes`（端点级问题进 `degraded[]`，那不是失败）。
+- 退出码：`0` 成功 / `2` 用法错 / `3` 项目或卡片不存在、remote 认不出 / `4` 无凭据（`no-credentials` / `no-transport`）/ `5` 服务不可达。
+- 项目参数接受三种形态：项目 id、仓库路径（走 `/api/project/current`）、**卡片 id**（用卡片的 `projectId`）。
 
-```ts
-const target = resolveSyncTarget({ remote: project.remote ?? "", teaConfig: readTeaConfig() });
-const snap = await pollRemote({ remote: project.remote ?? "", repoPath: project.path, since });
-if (!snap.ok) return report(snap);                       // no-credentials / no-remote / no-transport
-const numbers = cardsOf(project).flatMap(trackedNumbers); // 看板上有卡片的 issue/PR 编号
-for (const fact of toFacts(prev, snap, { numbers })) {
-  const cardId = cardFor(fact);                          // issueNumber/number → 卡片
-  if (cardId) appendEvent(cardId, eventOf(fact), factKey(fact));   // 幂等键
-}
-store.setLastSync(project.id, { at: snap.fetchedAt, prev: prevFrom(snap), degraded: snap.degraded });
-```
+### 9.7 前端
+
+- **磁贴**：`card.remoteComments` 里未读条数 > 0 → 「N 条新评论」徽标（`data-testid="tile-remote-unread"`）。
+- **详情「远端动态」**：作者 / 时间 / markdown 正文 /「在远端打开」链接 + 已读·未读标记（未读的那条带浅蓝底）；进详情**自动 `markRemoteCommentsRead`** → 磁贴徽标随之清零（幂等：已全读时服务端不发事件）。
+- **项目面板**：「最后同步 刚刚 / 还没同步过 / 同步失败：<reason>」+「本轮数据可能不全（N）」（悬停看每个降级端点的 reason/detail）+「已绑 N issue / M PR」+「立即同步」按钮，结果写在提示行（成功会报这一轮读了什么、落了什么、挡住多少重复）。
+
+### 9.8 与 §9 原清单的偏离（都是接线时定的）
+
+- 新增命令 `markRemoteCommentsRead` + 事件 `remote.comments.read`（原清单只说"通过新命令置位"）；
+- 同步状态进 **`meta` 表**而不是事件流（它是"我们什么时候看过远程"，不是业务事实）；
+- `dryRun`、`list`、`lastError`、「评论降级时卡住游标」、「首次同步没有游标」的提醒，都是接线时补的；
+- 首次同步的坑写在 §10 的最后一条（评论端点没有 `since` 时给的是**最早**一页）。
 
 ## 10. 已知限制
 
@@ -185,12 +226,26 @@ store.setLastSync(project.id, { at: snap.fetchedAt, prev: prevFrom(snap), degrad
 - **删除的条目**：某条 issue/PR 从列表消失（被删/转私有）不会被发现，也不会发「消失」事实。
 - **`toFacts` 的 `prev` 是内存/存储里的快照**：进程重启后 `prev` 若丢了，首轮会重发一遍（被 `dedupeKey` 挡住，不会重复落库）。
 - 自建 Gitea 的 URL 可能是 `http://`（本机实测 PR 的 `html_url` 就是 http）——原样记录，不做规范化、不升级 scheme。
+- **评论端点没有 `since` 时给的是"最早"一页（不是最新）**：接线时真跑发现的 —— 全新项目（还没有 `lastSyncAt`）第一轮拿不到新评论，
+  只会拿到仓库最早的 50 条。对策已在接线里：这一轮的报告会带一句提醒，给人 `--since <ISO>`（或先 `--list`）这条明确出路；
+  第二轮的 `since` 游标一起就正常了。
+- **编号绑错类型**：把 PR 当 issue 绑（例如 #738 其实是 PR）→ `fetchIssue` 会因为响应里带 `pull_request` 而判 `parse-error`，
+  该编号进 `degraded[]` 并在 notes 里说清；把那张卡改绑成 PR 即可（不会瞎猜、不会静默）。
 
 ## 11. 复现
 
 ```bash
-npx tsc --noEmit                  # 我的文件不报错
-npx vitest run test/sync.test.ts  # 31 个用例，全部离线（fixtures + 注入的假 http/tea）
+npx tsc --noEmit                          # 全仓类型干净
+npx vitest run test/sync.test.ts          # 31 个用例（传输层，离线）
+npx vitest run test/sync-wire.test.ts     # 23 个用例（接线层，离线）
+npx vitest run                            # 全量（含上面两个）
+
+# 端到端（只读；临时实例 + 真项目）
+FLOWCARD_DATA_DIR=/tmp/fc-sync-wire FLOWCARD_PORT=47846 npm start &
+node src/cli/main.ts project add ~/workspace/repo
+node src/cli/main.ts open --issue 742 --project <项目 id>
+node src/cli/main.ts sync <项目 id> --since <ISO> --dry-run   # 只打印将产生的事实
+node src/cli/main.ts sync <项目 id> --since <ISO>             # 真落一库（仍然只有 GET）
 
 # 真跑（只读；用 /tmp 下的临时脚本，不往仓库加文件）
 mkdir -p /tmp/fc-sync && cat > /tmp/fc-sync/real.ts <<'EOF'

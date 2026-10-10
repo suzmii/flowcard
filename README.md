@@ -7,6 +7,7 @@
 - omp 会话上报适配器实测与坑：`src/adapters/omp/README.md`
 - git/PR 探测：`docs/probe.md`
 - 提交图与代码评审（只读 + 本地记录）：`docs/design.md` §12
+- 同步（只读轮询 issue/PR 状态与新评论，内置 5 分钟一轮）：`docs/sync.md`
 
 ## 快速开始
 
@@ -38,6 +39,9 @@ node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch <前缀
 node src/cli/main.ts push c1 --sha <sha>
 node src/cli/main.ts confirm c1 --request --for push --detail "git push -u origin <分支>"
 node src/cli/main.ts confirm c1 --list                  # 人看完 detail 再批：只覆盖这一次动作
+node src/cli/main.ts sync repo --since 2026-10-06T00:00:00Z
+                                                        # 只读同步一轮（GET）：issue/PR 状态 + 新评论 → 事件流
+                                                        # --list 走全量列表排查，--dry-run 只打印事实不落库
 node src/cli/main.ts confirm c1 --approve cf1 --reason "看过了"
 node src/cli/main.ts confirm c1 --consume cf1           # agent 执行完回报：这条授权作废
 node src/cli/main.ts end c1 --summary "做完了"

@@ -409,8 +409,9 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M6 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定、**按会话 cwd 自动认卡**）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上（worktree 里启动 omp，不用给卡片 id） |
 | **M7 项目与附件** | 项目 = 看板 Metadata（先选项目再建卡，`repoPath` 由项目解析）；建卡只填正文（标题服务端派生）；图片附件（内容寻址 + 白名单） | `project add` 读真 git 元数据；`open` 不填标题/项目也能落到正确项目与标题；传图后 `GET` 回的字节与 `Content-Type` 与上传一致；老卡片投影成 `local` |
 | **M8 提交图与评审** | 文本提交图（`--graph` 原样 + 多 worktree/卡片叠加）、只读 diff（三点）、行级评论、评审判定（**本地事实，不改状态**）（§12） | 真仓库里 `GET /api/projects/:id/graph` 出提交/分支/worktree 实况；带 worktree 的卡片 diff 出 added/modified/deleted/renamed/binary 与行号；approve 不改 `state`；rebuild 与投影一致 |
+| **M9 同步** | 只读轮询 forge，把 issue/PR 状态与新评论搬进事件流（§13；规格与实测在 `docs/sync.md`） | 真项目跑一轮 → 卡片上出现 `issue.state.changed` / `pr.merged` / 新评论；再跑一轮零差异；磁贴显示「N 条新评论」、详情有「远端动态」 |
 
-顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8（M0、M1–M8 已完成）。
+顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9（M0、M1–M9 已完成）。
 
 ## 12. 提交图与代码评审（第一期：只读 + 本地记录）
 
@@ -466,3 +467,61 @@ Review = {
 - `flowcard diff <card>` 默认打 **JSON 摘要**（文件级 + hunk 头，不含行体）；`--patch` 打 git 的**原始 unified diff 文本**。
 
 投影形态变了 → **`PROJECTION_VERSION` +1（v4）**，启动时自动 rebuild 补上 `review` 槽位。
+
+## 13. 同步（M9）：远端事实自己走进来
+
+卡片绑了 issue/PR 之后，人不必离开看板就能看到远端变了：issue 被改标题/关掉、PR 被合并、远端多了评论。
+规格与实测（含 RSS 为什么不行、每个端点的字节数）在 **`docs/sync.md`**；这一节只讲清**它是什么、怎么调度、为什么不发明新写路径**。
+
+两层实现，与探测（`probe.ts`）同一套路：
+
+- `src/server/sync.ts`：**纯解析 + 只读 IO**（`http` / `run` 可注入）+ 差异函数 `toFacts` + 幂等键 `factKey`；
+- `src/server/syncer.ts`：接线（按项目跑一轮 → 事实 → `applySync` 命令）+ 内置调度器。
+
+### 13.1 事实进事件流，不发明第二套写路径
+
+同步产出的是「要落库的事实」，落库只有一条路：**`applySync` 命令**（一张卡一条，`facts[]`）。
+
+| fact | 事件 | 投影到 |
+|---|---|---|
+| `issue.state` | `issue.state.changed` | `card.issue.state` / `.title`（repo/url 原样保留） |
+| `pr.state`（`merged:true`） | `pr.merged`（复用既有） | `card.pr`（→ 引擎的自动节点把 `review` 推到 `merged`） |
+| `pr.state`（其余） | `pr.updated`（复用既有） | `card.pr` |
+| `remote.comment` | `remote.comment.added` | `card.remoteComments`（新槽位，恒存在） |
+
+- `actor` 一律 `{kind:"system"}`：同步是后台动作，不是人也不是 agent 的意图；
+- `dedupeKey` 一律 `factKey(fact)`（`sync:comment:{id}` / `sync:issue:{n}:{updatedAt}` / `sync:pr:{n}:{state}:{updatedAt}`）——**同一事实重复同步只落一次**，所以同步器把 `prev` 丢了也不会写重；
+- 「不拿更弱的信息覆盖更强的已知事实」写成了引擎里的纯函数 `nextPrState()`：事实说 `open` 而卡片是 `draft` → 保持 `draft`；tea CLI 兜底拿不到 `merged` 位（`null`）而卡片已知 `merged` → 保持 `merged`。
+
+### 13.2 投影与已读
+
+`Card` 新增 `remoteComments: Array<{id, issueNumber, author, body, at, url, read}>`（`PROJECTION_VERSION` → **v6**，启动自动重放补上）。
+远端评论**与本地评论分开存**（`card.comments` 是本地事实），免得两条时间线混在一起。
+
+已读靠新命令 `markRemoteCommentsRead { card, ids? }`（`ids` 不给 = 当前全部未读）→ 事件 `remote.comments.read`。
+一条未读都没有时**不发事件** ⇒ 连着调两次的第二次是空操作（幂等）。前端在**打开卡片详情时**自动调它。
+
+### 13.3 调度：5 分钟一轮，只读已绑定的编号
+
+- 内置 `setInterval`，`FLOWCARD_SYNC_INTERVAL_MS` 默认 **300000**（`0` = 关）；定时器 `unref()`，不拖住退出；
+- 每轮只跑「非虚拟 + 有 remote + **至少一张卡绑了编号**」的项目；上一轮没跑完就跳过这一拍；启动时不立刻同步；
+- 有凭据时的调用面是**定死的**：每个已绑编号一次 `GET /issues/{n}` / `GET /pulls/{n}`（各 ≈5.8 KB / 17 KB）+ **每仓库一次** `GET /issues/comments?since=…` 再按已绑编号过滤；
+- **不翻 `/pulls` 列表**：两家都没有 `since`，5 页 ≈2.6 MB，实测一轮 9–32 s（手动 `flowcard sync --list` 才走这条）；
+- `since = lastSyncAt - 60 s`（重叠窗口防漂移，重复由幂等键吸收）；评论端点降级时**游标不前进**——那一段窗口还没读到，推进就等于永久丢掉；
+- 状态（`lastSyncAt` / 上轮摘要 / 降级）按项目存在 `meta` 表里：它是「我们什么时候看过远程」，不是业务事实，**不进事件流**。
+
+### 13.4 为什么不用 RSS
+
+私有仓库的 Gitea 根本不暴露 feed（`…/repo.rss` 匿名和带 token 都是 **HTTP 404**），而且 feed 条目**没有 `state`、没有 `merged`、没有 `since` 游标**，状态只能从「opened issue / commented on pull request」这类文案里正则猜。REST API 三样都给 —— 详细对照与实测在 `docs/sync.md` §1。
+
+### 13.5 入口与降级
+
+| 形态 | 入口 |
+|---|---|
+| HTTP | `POST /api/projects/:id/sync`（跑一轮，body `{since?, list?, dryRun?}`；**永不返回 token**） / `GET /api/projects/:id/sync`（只读状态，不联网） |
+| CLI | `flowcard sync <项目 id 或路径 \| 卡片 id> [--since ISO] [--list] [--dry-run]` |
+| 后台 | `FLOWCARD_SYNC_INTERVAL_MS`（默认 300000） |
+
+降级**不是失败**：没有可用凭据 → `reason:"no-credentials"` + notes（先退到 `tea` CLI）；某个端点 401/404/超时 → 该端点进 `degraded[]`、其余照常，UI 提示「本轮数据可能不全」。整体没跑成时不推进游标，只记 `lastError`。
+
+**明确不做**：远程写（同步全程只有 `GET`）、自动发现新编号（要发现就手动 `--list`）、评论编辑跟踪、删除条目的「消失」事实（见 `docs/sync.md` §10）。

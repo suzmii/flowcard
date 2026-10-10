@@ -265,6 +265,15 @@ export async function runSyncRound(opts: {
 
   const degraded: Degradation[] = [];
   const notes: string[] = [];
+  /**
+   * 没有游标 = 这个项目从没同步过：评论端点这时只会给**仓库最早**的一页（不是最新的，Gitea 按时间升序），
+   * 所以要如实提醒一句 —— 否则人会以为"同步完了却一条新评论都没有"。
+   */
+  if (since === null && opts.list !== true) {
+    notes.push(
+      "这个项目还没有同步游标：评论只能拿到仓库最早的一页（不是最新的）——给 --since <ISO> 指定窗口，或先跑一次 --list",
+    );
+  }
   let reason: SyncRoundReport["reason"] = null;
   let source: SyncRoundReport["source"] = null;
   let snapshot: SyncSnapshotData = { issues: [], pulls: [], comments: [] };
