@@ -1,0 +1,173 @@
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { CircleSlash, X } from "lucide-react";
+import { CopyButton } from "@/components/CopyButton";
+import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
+import { RuntimePanel } from "@/components/detail/RuntimePanel";
+import { SessionPanel } from "@/components/detail/SessionPanel";
+import { SlotGrid } from "@/components/detail/SlotGrid";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { postCommand } from "@/lib/api";
+import { STATE_LABELS, STATE_TONE } from "@/lib/contract";
+import type { CardView } from "@/lib/schema";
+import { timeAgo } from "@/lib/utils";
+
+type Notice = { tone: "ok" | "error"; text: string; details: string[] } | null;
+
+function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
+  return (
+    <section className="space-y-2">
+      <div className="flex items-baseline gap-2">
+        <h3 className="text-sm font-semibold">{title}</h3>
+        {hint ? <span className="text-[11px] text-muted-foreground">{hint}</span> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** 卡片详情侧栏：六个必要项目格 + 会话 + 门禁 + 运行时。 */
+export function CardDetail({
+  card,
+  cards,
+  onClose,
+  onRefresh,
+}: {
+  card: CardView;
+  cards: CardView[];
+  onClose: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice>(null);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const run: CommandRunner = useCallback(
+    async (label, command) => {
+      setBusy(label);
+      setNotice(null);
+      const result = await postCommand(command);
+      const rejection = result.rejection;
+      if (result.ok) {
+        setNotice({ tone: "ok", text: `${label}成功`, details: result.notes ?? [] });
+      } else {
+        setNotice({
+          tone: "error",
+          text: `${label}失败（${rejection?.code ?? "未知"}）：${rejection?.message ?? "未知错误"}`,
+          details: [...(rejection?.missing ?? []), ...(rejection?.hint ? [rejection.hint] : [])],
+        });
+      }
+      setBusy(null);
+      await onRefresh();
+    },
+    [onRefresh],
+  );
+
+  return (
+    <div className="fixed inset-0 z-40 flex justify-end">
+      <div
+        className="flex-1 bg-black/30"
+        role="presentation"
+        onClick={onClose}
+        data-testid="detail-backdrop"
+      />
+      <aside
+        className="flex h-full w-full max-w-[46rem] flex-col border-l bg-muted/20 shadow-xl"
+        role="dialog"
+        aria-label={`卡片详情 ${card.title}`}
+        data-testid="card-detail"
+      >
+        <header className="flex items-start gap-2 border-b bg-background px-4 py-3">
+          <span className={`mt-1.5 size-2.5 shrink-0 rounded-full ${STATE_TONE[card.state]}`} />
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold leading-snug">{card.title}</h2>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <Badge variant="outline">{STATE_LABELS[card.state]}</Badge>
+              <Badge variant="muted" className="font-mono">
+                {card.id}
+              </Badge>
+              <CopyButton value={card.id} label="复制 id" size="xs" variant="ghost" />
+              <span className="text-xs text-muted-foreground">
+                更新于 {timeAgo(card.updatedAt)}（{card.updatedAt}）
+              </span>
+            </div>
+            {card.repoPath ? (
+              <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                repoPath={card.repoPath}
+              </div>
+            ) : null}
+            {card.partOf ? (
+              <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                partOf={card.partOf} · spawned={card.spawned.length}
+              </div>
+            ) : null}
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭">
+            <X />
+          </Button>
+        </header>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+          {notice ? (
+            <div
+              className={
+                notice.tone === "ok"
+                  ? "rounded-lg border border-emerald-600/30 bg-emerald-50 p-2.5 text-xs text-emerald-800"
+                  : "rounded-lg border border-red-600/30 bg-red-50 p-2.5 text-xs text-red-800"
+              }
+            >
+              <div className="font-medium">{notice.text}</div>
+              {notice.details.length > 0 ? (
+                <ul className="mt-1 space-y-0.5">
+                  {notice.details.map((detail) => (
+                    <li key={detail} className="font-mono">
+                      {detail}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+
+          {card.blockedReason ? (
+            <div className="flex gap-2 rounded-lg border border-red-600/30 bg-red-50 p-2.5 text-xs text-red-800">
+              <CircleSlash className="mt-0.5 size-3.5 shrink-0" />
+              <span>阻塞原因：{card.blockedReason}</span>
+            </div>
+          ) : null}
+
+          <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
+            <SlotGrid card={card} />
+          </Section>
+
+          <Section title="会话" hint="cwd 必须落在 worktree 内">
+            <SessionPanel card={card} />
+          </Section>
+
+          <Section title="门禁" hint="未决门禁可在这里批准/驳回">
+            <GatePanel card={card} busy={busy} onRun={run} />
+          </Section>
+
+          <Section title="运行时" hint="/api/cards/:id/runtime">
+            <RuntimePanel card={card} cards={cards} onRefresh={onRefresh} />
+          </Section>
+
+          {card.body ? (
+            <Section title="正文">
+              <pre className="whitespace-pre-wrap rounded-lg border bg-background p-2.5 text-xs">
+                {card.body}
+              </pre>
+            </Section>
+          ) : null}
+        </div>
+      </aside>
+    </div>
+  );
+}
