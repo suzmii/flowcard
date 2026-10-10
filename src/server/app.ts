@@ -22,7 +22,7 @@ import type { CardGitFacts } from "../shared/stage.ts";
 import { createCardGitFactsCache } from "./card-git.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
-import { approvalHooksEnabled, createApprovalHooks } from "./approval-hooks.ts";
+import { createNotifyHooks, notifyHooksEnabled, notifySelfAuthors, type NotifyCandidate } from "./notify-hooks.ts";
 import { runSyncRound, startSyncScheduler, trackedNumbers } from "./syncer.ts";
 import type { HttpGet } from "./sync.ts";
 import type { Run } from "./probe.ts";
@@ -79,11 +79,12 @@ export type AppOptions = {
    */
   gitFacts?: { run?: Run; ttlMs?: number; now?: () => number };
   /**
-   * 审批 hook：人在看板上批准 / 驳回（`decideGate` / `decideConfirm` / `accept`）之后，
-   * 自动把一条人话通知投给这张卡的托管会话；会话不在线就写卡片评论 + 记 pending，下次会话启动 / 发言时补投。
-   * 不传按环境变量 `FLOWCARD_APPROVAL_HOOKS` 判（默认开，`=0` 关）。
+   * 通知 hook：**审批**（人批准 / 驳回）、**CI 结束**（绑定的 PR 从 pending 变 pass/fail）、
+   * **远端新评论**（绑定的 issue/PR 上有人留言）三类，都自动把一条人话通知投给这张卡的托管会话；
+   * 会话不在线就写卡片评论 + 记 pending，下次会话启动 / 发言时补投。
+   * 不传按环境变量判（`FLOWCARD_NOTIFY_HOOKS=0` 关，默认开；旧的 `FLOWCARD_APPROVAL_HOOKS=0` 同样有效）。
    */
-  approvalHooks?: { enabled: boolean };
+  notifyHooks?: { enabled: boolean };
 };
 
 export function createApp(store: Store, opts: AppOptions = {}) {
@@ -149,19 +150,20 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   };
 
   /**
-   * 审批 hook：人批了 / 驳了 → 自动给这张卡的托管会话投一条人话通知（见 `approval-hooks.ts`）。
-   * 它在 `/api/commands` 成功之后**异步**跑，绝不阻塞审批本身；会话不在线时降级成
-   * 「卡片评论 + 待补投」，等这张卡下次 `session.start` / `prompt` 时补投。
+   * 通知 hook（见 `notify-hooks.ts`）：**审批**（人批了 / 驳了）、**CI 结束**（绑定的 PR 的 CI
+   * 从 pending 变 pass/fail）、**远端新评论**（绑定的 issue/PR 上有人留言）三类，都自动给这张卡的
+   * 托管会话投一条人话通知。它在 `/api/commands` / 同步成功之后**异步**跑，绝不阻塞调用方；
+   * 会话不在线时降级成「卡片评论 + 待补投」，等这张卡下次 `session.start` / `prompt` 时补投。
    */
-  const approvalHooks = createApprovalHooks({
-    enabled: opts.approvalHooks?.enabled ?? approvalHooksEnabled(process.env),
+  const notifyHooks = createNotifyHooks({
+    enabled: opts.notifyHooks?.enabled ?? notifyHooksEnabled(process.env),
     getCard: (id) => store.getCard(id),
     isLive: (id) => sessions.isLive(id),
     prompt: (id, text) => sessions.prompt(id, text),
     comment: (cardId, body) => {
       store.execute({
         cmd: "comment",
-        actor: { kind: "system", name: "approval-hook" },
+        actor: { kind: "system", name: "notify-hook" },
         card: cardId,
         body,
       });
@@ -170,9 +172,18 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       get: (cardId) => store.getApprovalLedger(cardId),
       set: (cardId, ledger) => store.setApprovalLedger(cardId, ledger),
     },
-    // 降级写的那条评论也要让看板看见 —— 它不是审批命令自己产生的事件。
+    // 降级写的那条评论也要让看板看见 —— 它不是命令自己产生的事件。
     notify: (cardId, types) => broadcast("changed", { cardIds: [cardId], types }),
+    selfAuthors: notifySelfAuthors(process.env),
   });
+
+  /**
+   * 同步侧把 CI 结束 / 新评论当候选递过来。**开关关掉时一个都不接**：不接就不读 CI
+   * （少一批远程请求），也就不可能有通知。
+   */
+  const onSyncNotices = notifyHooks.enabled
+    ? (candidates: readonly NotifyCandidate[]): void => notifyHooks.onSync(candidates)
+    : undefined;
 
   // 托管会话里的 claim/end 也是卡片事实（走的就是引擎那条命令通道）→ 和命令一样广播 "changed"。
   sessions.onCard((change) => {
@@ -189,6 +200,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       ...(opts.sync.http ? { http: opts.sync.http } : {}),
       ...(opts.sync.run ? { run: opts.sync.run } : {}),
       ...(opts.sync.teaConfig !== undefined ? { teaConfig: opts.sync.teaConfig } : {}),
+      ...(onSyncNotices ? { notify: onSyncNotices } : {}),
       onReport: (report) => {
         if (report.cardIds.length > 0) {
           broadcast("changed", { cardIds: report.cardIds, types: report.types });
@@ -275,8 +287,8 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       types: result.outcome.events.map((e) => e.type),
     });
 
-    // 审批 hook：人批了 / 驳了 → 自动通知这张卡的托管会话（异步，失败只留痕，不影响这条命令的成败）。
-    approvalHooks.onCommand({ cmd: parsed.data, card: result.card, events: result.inserted });
+    // 通知 hook：人批了 / 驳了（以及同步来的 CI 结束 / 新评论）→ 异步通知托管会话（失败只留痕，不影响命令成败）。
+    notifyHooks.onCommand({ cmd: parsed.data, card: result.card, events: result.inserted });
 
     // 开卡即开工：卡片建好就在桌面上把会话立起来（带开工提示）；失败会自己写到卡片评论上
     let autostart: Awaited<ReturnType<typeof autostartCard>> | undefined;
@@ -381,6 +393,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       ...(parsed.data.since ? { since: parsed.data.since } : {}),
       ...(parsed.data.list !== undefined ? { list: parsed.data.list } : {}),
       ...(parsed.data.dryRun !== undefined ? { dryRun: parsed.data.dryRun } : {}),
+      ...(onSyncNotices ? { notify: onSyncNotices } : {}),
     });
     if (!result.ok) return c.json({ ok: false, error: result.error }, 404);
     // 报告里没有凭据字段（`SyncAuth.token` 从不进返回值）。
@@ -732,8 +745,8 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     const result = await sessions.start(cardId, {
       ...(parsed.data.cwd === undefined ? {} : { cwd: parsed.data.cwd }),
     });
-    // 会话起来了：把攒下的审批通知补投一次（人做决定时会话不在线的那种）。
-    if (result.ok) await approvalHooks.flush(cardId);
+    // 会话起来了：把攒下的通知（审批 / CI 结束 / 新评论）补投一次（当时会话不在线的那种）。
+    if (result.ok) await notifyHooks.flush(cardId);
     // 起不来也不是 5xx：状态就是 `failed`，原因在 `error` 里（前端照着显示）。
     return c.json(result, result.error?.code === "NOT_FOUND" ? 404 : 200);
   });
@@ -755,8 +768,8 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     if (parsed.data.text.trim() === "" && images.length === 0) {
       return c.json({ ok: false, error: { code: "USAGE_ERROR", message: "text 与 images 不能都空" } }, 400);
     }
-    // 先补投攒下的审批通知，再发人这句话：agent 看到的是「人批了什么 → 人又说了什么」。
-    await approvalHooks.flush(cardId);
+    // 先补投攒下的通知，再发人这句话：agent 看到的是「发生了什么 → 人又说了什么」。
+    await notifyHooks.flush(cardId);
     const result = await sessions.prompt(cardId, parsed.data.text, images);
     return c.json(result, result.ok ? 200 : 409);
   });

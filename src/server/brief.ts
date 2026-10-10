@@ -9,11 +9,16 @@
  * `~/.agents/skills/flowcard` 覆盖，这里**不重复**。
  *
  * 纯函数：只吃 card/project/worktree，输出文本；便于单测与复用（CLI/UI 也能拿它做预览）。
+ *
+ * **文案在哪**：本文件只负责"填值"，正文一字不落地躺在 `prompts/brief.md`（kickoff 在
+ * `prompts/kickoff.md`）—— 改文案改那个文件即可，不用动代码、不用重启（见 `prompts/README.md`）。
+ * 占位符清单在 `prompts/README.md`，渲染器是 `./prompts.ts`。
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Card, CardState, Project } from "../shared/types.ts";
 import { STATE_LABELS } from "../shared/types.ts";
+import { renderPrompt } from "./prompts.ts";
 
 export type BriefInput = {
   card: Card;
@@ -113,29 +118,16 @@ export function cardBrief(input: BriefInput): string {
     .filter((x): x is string => x !== null)
     .join("\n");
 
-  return `# 卡片 ${card.id}：${card.title}
-
-**当前状态**：${STATE_LABELS[card.state as CardState] ?? card.state}
-
-**正文（需求原文）**：
-
-${card.body.trim() === "" ? "（空）" : card.body.trim()}
-
-## 关键路径
-
-${paths}
-
-## 六项交付要件
-
-${checklist(card).join("\n")}
-
-## ☑︎ 接下来你要做的
-
-${todos(card, cli, worktree).join("\n")}
-
-**位置**：会话没进 worktree 就不算开工（在主仓库里改文件不算开工）—— 搬进去用
-\`${cli} worktree use ${card.id} --path <worktree 路径>\`（停当前会话、用新目录续接同一条会话）。
-`;
+  return renderPrompt("brief.md", {
+    cardId: card.id,
+    title: card.title,
+    state: STATE_LABELS[card.state as CardState] ?? card.state,
+    body: card.body.trim() === "" ? "（空）" : card.body.trim(),
+    paths,
+    checklist: checklist(card).join("\n"),
+    todos: todos(card, cli, worktree).join("\n"),
+    cli,
+  });
 }
 
 /** 内容不变就不重写（避免每次都改 mtime）。 */
@@ -169,9 +161,10 @@ export function cardBriefPath(briefDir: string, cardId: string): string {
 /**
  * 起会话时投的第一句 prompt（kickoff）：只说一句「先 `read` 那份提示，按待办走」——
  * 提示全文**不进 argv/系统提示**（见本文件头注释）。自动开工与手动起会话（新会话）用**同一句**。
+ * 文案本体在 `prompts/kickoff.md`（`{{briefPath}}` / `{{cli}}`）。
  */
 export function briefKickoff(file: string, cli = "flowcard"): string {
-  return `开工：第一步先 read \`${file}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`${cli} comment\` 留痕。`;
+  return renderPrompt("kickoff.md", { briefPath: file, cli });
 }
 
 /**

@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { personalFlow } from "../src/flow/personal.ts";
 import { createApp } from "../src/server/app.ts";
-import { approvalNotice, approvalSpec, createApprovalHooks, type ApprovalHooks } from "../src/server/approval-hooks.ts";
+import { approvalNotice, approvalSpec, createNotifyHooks, type NotifyHooks } from "../src/server/notify-hooks.ts";
 import { createHostedSessions, type HostedSessions, type SessionEvent } from "../src/server/hosted-session.ts";
 import { defaultSpawn, startRpcSession, type OmpRpcSession, type StartRpcOptions } from "../src/server/omp-rpc.ts";
 import { createStore, type Store } from "../src/server/store.ts";
@@ -253,7 +253,7 @@ type Fake = {
   prompts: { cardId: string; text: string }[];
   comments: string[];
   live: Set<string>;
-  hooks: ApprovalHooks;
+  hooks: NotifyHooks;
 };
 
 function makeFake(opts: { enabled?: boolean } = {}): Fake {
@@ -264,9 +264,9 @@ function makeFake(opts: { enabled?: boolean } = {}): Fake {
     prompts: [],
     comments: [],
     live: new Set<string>(),
-    hooks: undefined as unknown as ApprovalHooks,
+    hooks: undefined as unknown as NotifyHooks,
   };
-  fake.hooks = createApprovalHooks({
+  fake.hooks = createNotifyHooks({
     enabled: opts.enabled ?? true,
     getCard: (id) => store.getCard(id),
     isLive: (id) => fake.live.has(id),
@@ -376,7 +376,7 @@ describe("投递编排", () => {
     fake.live.add(id);
     // 会话"活着"但投不进去（续接失败之类）
     const warnings: string[] = [];
-    const failing = createApprovalHooks({
+    const failing = createNotifyHooks({
       enabled: true,
       getCard: (cid) => fake.store.getCard(cid),
       isLive: () => true,
@@ -568,7 +568,7 @@ describe("端到端：假 omp 会话 + HTTP 上审批", () => {
   it("批准与驳回都会投到会话里；同一决定再点不重复", async () => {
     const { store, dir } = makeStore();
     const sessions = makeSessions(store);
-    const app = createApp(store, { sessions, approvalHooks: { enabled: true } });
+    const app = createApp(store, { sessions, notifyHooks: { enabled: true } });
 
     const id = toReview(store, dir, "merged");
     // 会话真的起来（假 omp 真管道）：cwd 用临时目录，保证存在
@@ -700,7 +700,7 @@ describe("端到端：假 omp 会话 + HTTP 上审批", () => {
     const { store, dir } = makeStore();
     // 假 omp 答完**第 2 轮**（补投通知算第 1 轮）就自己退一次：模拟崩溃 / 服务重启 —— 那种"进程没了"能 `-r` 续接。
     const sessions = makeSessions(store, { die: { marker: join(dir, "died.marker"), afterTurn: 2 } });
-    const app = createApp(store, { sessions, approvalHooks: { enabled: true } });
+    const app = createApp(store, { sessions, notifyHooks: { enabled: true } });
 
     const id = toReview(store, dir, "merged");
     // 人批 G4 时会话还没起来 → 降级：卡片评论 + 待补投

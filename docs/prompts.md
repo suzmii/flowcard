@@ -10,9 +10,9 @@
 | 1 | **kickoff**（起会话第一条 prompt） | `src/server/brief.ts` `briefKickoff()` | 起会话（自动开工 / 手动 start 的**新会话**） | 一句话 |
 | 2 | **brief 全文**（写成文件让 agent `read`） | `src/server/brief.ts` `cardBrief()` | 每次起会话/切 worktree 时刷新文件 | ~1.9KB |
 | 3 | **skill**（模型指令文件，omp 自动加载） | `skills/flowcard/SKILL.md` | 每个会话常驻（软链 `~/.agents/skills/flowcard`） | ~7KB |
-| 4 | **审批通知**（人批准/驳回后投给会话） | `src/server/approval-hooks.ts` `approvalNotice()` | 人在看板上做决定之后（异步、幂等、离线降级） | 每条约 100–300 字 |
+| 4 | **审批通知**（人批准/驳回后投给会话） | `src/server/notify-hooks.ts` `approvalNotice()` | 人在看板上做决定之后（异步、幂等、离线降级） | 每条约 100–300 字 |
 | 5 | **自动开工写回卡片的评论** | `src/server/autostart.ts` | 自动开工时（成功/失败/异常） | 数行 |
-| 6 | **CI 结束 / 新评论通知**（新，在途） | `src/server/approval-hooks.ts`（NotifyHooks 扩展中） | 同步轮询发现状态变化时 | 待定 |
+| 6 | **CI 结束 / 新评论通知** | `src/server/notify-hooks.ts` `ciNotice()` / `commentNotice()` | 同步轮询发现状态变化时 | 每条约 150–300 字 |
 
 ---
 
@@ -279,7 +279,7 @@ flowcard probe <card> --number 7 --state merged …   # 汇报 PR 状态（merge
 
 ## 4. 审批通知（`approvalNotice()`）
 
-`src/server/approval-hooks.ts`：
+`src/server/notify-hooks.ts`：
 
 ```ts
   }
@@ -402,7 +402,7 @@ export function approvalNotice(spec: ApprovalSpec, card: Card): string {
 
 ---
 
-## 6. CI 结束 / 新评论通知（在途）
+## 6. CI 结束 / 新评论通知
 
-`NotifyHooks` 正在 `src/server/approval-hooks.ts` 上加这两个源（复用同一条通道/台账/降级）。
-落盘后我会把这两段文案也逐字补进本节。
+这两个源已经落在 `src/server/notify-hooks.ts`：`ciNotice()` / `commentNotice()`（复用同一条通道 / 台账 / 降级）。
+本节还没有逐字抄文案 —— 抄的时候从这两个函数里取。

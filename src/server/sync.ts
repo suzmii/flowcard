@@ -15,7 +15,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { defaultRun, parseJson, parseRemoteUrl, type Run } from "./probe.ts";
+import { ciFromTeaStatus, defaultRun, parseJson, parseRemoteUrl, type Ci, type Run } from "./probe.ts";
 
 /** 单次 HTTP 超时。同步是后台轮询，宁可降级也不要挂住。 */
 export const HTTP_TIMEOUT_MS = 10_000;
@@ -367,6 +367,18 @@ export function singleUrl(auth: SyncAuth, kind: "issues" | "pulls", number: numb
   return `${auth.apiBase}/repos/${auth.owner}/${auth.repo}/${kind}/${number}`;
 }
 
+/**
+ * 「按 ref 读 CI」的 URL（**只读 GET**）。`ref` 给分支名或 sha 都行（两家都接受分支名）：
+ * 绑定的 PR 上我们只有分支名，所以用 `RawPull.head` 去读，`sha` 从响应里取。
+ *
+ * - `status`：两家的 combined status（Gitea 的 `statuses[]` 就是每个 job，带 `context` / `target_url`）；
+ * - `check-runs`：GitHub Actions 的结论只在这儿（legacy `/status` 看不到它们）。
+ */
+export function ciUrl(auth: SyncAuth, kind: "status" | "check-runs", ref: string): string {
+  const base = `${auth.apiBase}/repos/${auth.owner}/${auth.repo}/commits/${encodeURIComponent(ref)}`;
+  return kind === "check-runs" ? `${base}/check-runs` : `${base}/status`;
+}
+
 // ---------------------------------------------------------------- 响应解析（纯）
 
 export type RawIssue = {
@@ -544,6 +556,131 @@ export function parseCommentList(raw: unknown): RawComment[] {
     if (comment) out.push(comment);
   }
   return out;
+}
+
+// ---------------------------------------------------------------- CI 解析（纯）
+
+/** CI 里的一个 job（**失败时要告诉 agent 是哪个 job 挂了**）。 */
+export type CiJob = { name: string; conclusion: Ci; url: string };
+
+/** 一次「按 ref 读 CI」的结果：`sha` 是**结论属于哪个 commit**（幂等键用它）。 */
+export type CiReading = { sha: string; conclusion: Ci; jobs: CiJob[] };
+
+/** GitHub 的 check run 会有、Gitea 那套没有的取值（`status` + `conclusion` 两段式）。 */
+const GH_CI_FAIL: Record<string, true> = {
+  TIMED_OUT: true,
+  CANCELLED: true,
+  ACTION_REQUIRED: true,
+  STARTUP_FAILURE: true,
+};
+const GH_CI_PENDING: Record<string, true> = {
+  IN_PROGRESS: true,
+  WAITING: true,
+  REQUESTED: true,
+  EXPECTED: true,
+};
+/** 完成了但不算失败的结论（和 `probe.ts` 的 `ciFromGhRollup` 一个口径：只有 fail / 未完成会挡路）。 */
+const GH_CI_PASS: Record<string, true> = { NEUTRAL: true, SKIPPED: true, STALE: true };
+
+/**
+ * 单个 job 的状态 → 归一化结论；认不出来返回 **null**（不猜）。
+ *
+ * Gitea 的 `statuses[].status` 与 GitHub 的 `state` 都是单词取值，直接复用 `probe.ts` 的
+ * 那套映射（`success`/`skipped` → pass，`failure`/`error` → fail，`pending`/`warning` → pending…）；
+ * GitHub 的 check run 是 `status` + `conclusion` 两段式：**结论优先**，`completed` 本身不是结论。
+ */
+export function jobConclusion(status: unknown, conclusion: unknown): Ci | null {
+  for (const raw of [conclusion, status]) {
+    const value = String(raw ?? "").trim().toUpperCase();
+    if (value === "") continue;
+    const known = ciFromTeaStatus(value);
+    if (known) return known;
+    if (GH_CI_FAIL[value] === true) return "fail";
+    if (GH_CI_PENDING[value] === true) return "pending";
+    if (GH_CI_PASS[value] === true) return "pass";
+    // `completed` / `queued` 之类只说"跑到哪一步"，不是结论 → 看另一个字段
+  }
+  return null;
+}
+
+/**
+ * 一组 job（+ 可选的顶层 `state`）→ 归一化结论。**fail 压过一切**；一个 job 都没有 =
+ * 还没有任何 CI 报结论 → `pending`（这样"没开始 → 结束"这个变化才看得见，而不是当成"没有 CI"）。
+ */
+function ciConclusion(jobs: readonly CiJob[], unknownJobs: number, state: Ci | null): Ci {
+  if (jobs.some((job) => job.conclusion === "fail")) return "fail";
+  if (state === "fail") return "fail";
+  if (jobs.length === 0 && unknownJobs === 0) return state ?? "pending";
+  if (jobs.some((job) => job.conclusion === "pending") || unknownJobs > 0) return "pending";
+  if (state === "pending") return "pending";
+  return "pass";
+}
+
+/** 从一堆原始 job 里抠出 `{jobs, unknown}`（名字/链接抠不出来就留空，不伪造）。 */
+function collectJobs(raw: unknown, nameOf: (o: Record<string, unknown>) => string, urlOf: (o: Record<string, unknown>) => string, conclusionOf: (o: Record<string, unknown>) => Ci | null): { jobs: CiJob[]; unknown: number } {
+  const jobs: CiJob[] = [];
+  let unknown = 0;
+  if (!Array.isArray(raw)) return { jobs, unknown };
+  for (const item of raw) {
+    const o = asRecord(item);
+    if (!o) continue;
+    const conclusion = conclusionOf(o);
+    if (conclusion === null) {
+      unknown++;
+      continue;
+    }
+    jobs.push({ name: nameOf(o), conclusion, url: urlOf(o) });
+  }
+  return { jobs, unknown };
+}
+
+/**
+ * combined status 响应（Gitea `/commits/{ref}/status`、GitHub `/commits/{ref}/status`）→ `CiReading`。
+ * 顶层 `state` 是整体结论，`statuses[]` 是每个 job（`context` + `target_url`）。
+ * `sha` 拿不到就返回 null —— 没有 sha 就没法判断"同一轮 CI"，**不投**。
+ */
+export function parseCombinedStatus(raw: unknown): CiReading | null {
+  const o = asRecord(raw);
+  if (!o) return null;
+  const sha = asString(o["sha"]);
+  if (sha === null) return null;
+  const { jobs, unknown } = collectJobs(
+    o["statuses"],
+    (job) => asString(job["context"]) ?? asString(job["name"]) ?? "",
+    (job) => asString(job["target_url"]) ?? asString(job["url"]) ?? "",
+    (job) => jobConclusion(job["status"] ?? job["state"], job["conclusion"]),
+  );
+  const state = jobConclusion(o["state"], null);
+  return { sha, conclusion: ciConclusion(jobs, unknown, state), jobs };
+}
+
+/**
+ * GitHub 的 check-runs 响应（`/commits/{ref}/check-runs`）→ `CiReading`。
+ * 每个 check run 自带 `head_sha`（**结论属于哪个 commit**）；`total_count: 0`（没有 check run）
+ * 返回 **null** —— 调用方据此退回 legacy `/status`（有的仓库 CI 是用 status API 报的）。
+ */
+export function parseCheckRuns(raw: unknown): CiReading | null {
+  const o = asRecord(raw);
+  if (!o) return null;
+  const list = o["check_runs"];
+  if (!Array.isArray(list) || list.length === 0) return null;
+  let sha: string | null = null;
+  for (const item of list) {
+    const rec = asRecord(item);
+    const head = rec === null ? null : asString(rec["head_sha"]);
+    if (head !== null) {
+      sha = head;
+      break;
+    }
+  }
+  if (sha === null) return null;
+  const { jobs, unknown } = collectJobs(
+    list,
+    (job) => asString(job["name"]) ?? "",
+    (job) => asString(job["html_url"]) ?? asString(job["details_url"]) ?? "",
+    (job) => jobConclusion(job["status"], job["conclusion"]),
+  );
+  return { sha, conclusion: ciConclusion(jobs, unknown, null), jobs };
 }
 
 // ---------------------------------------------------------------- tea CLI 兜底（薄 IO）
@@ -853,7 +990,19 @@ export type SyncFact =
 
 export type SyncPrev = {
   issues?: { number: number; state: string; updatedAt?: string }[];
-  pulls?: { number: number; state: string; merged?: boolean | null; updatedAt?: string }[];
+  pulls?: {
+    number: number;
+    state: string;
+    merged?: boolean | null;
+    updatedAt?: string;
+    /**
+     * 上一轮**读到**的 CI：`sha` 是结论属于哪个 commit，`ci` 是归一化结论。
+     * 只给「CI 结束」通知判状态变化用（不是卡片事实，`ci` 落不落卡片由 `probePr` 管）。
+     * 这一对是**上一轮观测**，不是当前轮：读不到时原样留着（否则"pending → 结束"会看不见）。
+     */
+    sha?: string;
+    ci?: Ci;
+  }[];
   /** 已落库的评论幂等键（`sync:comment:{id}`）；不给就靠事件库的 dedupeKey 去重。 */
   commentKeys?: string[];
 };

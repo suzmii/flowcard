@@ -1,26 +1,47 @@
 /**
- * 审批 hook：人在看板上做完决定（批准 / 驳回）之后，**自动把一条人话通知投给这张卡的托管会话** ——
- * 让在另一端干活的 agent 知道"人已经批了 / 人已经驳回了"，不用人再跑去终端里喊一遍。
+ * 通知 hook：把人那边 / 远端发生的事，**投成一条人话消息给这张卡的托管会话**。三个来源共用一套通道：
  *
- * 三条纪律（用户定的）：
- *   1. **不阻塞、不抛错、失败只留痕**：hook 在 `/api/commands` 成功之后异步跑，绝不让审批请求等它；
- *      内部出错只走 `warn`（默认 `console.error`），不改变审批本身的成败。
- *   2. **只投一次**：幂等键 = 那次决定本身（门禁 id + 决定 / 确认 id + 决定 / accept）；
- *      已投递的键与待补投的通知都记在卡片的**投递台账**里（`store` 的 meta 表，不进事件流）。
- *   3. **会话不在线不静默丢**：写一条卡片评论说明这个决定，并把通知记成 pending，
+ *   1. **审批**：人在看板上批准 / 驳回（`decideGate` / `decideConfirm` / `accept`，`actor.kind === "human"`）；
+ *   2. **CI 结束**：绑定的 PR 的 CI 从 `pending` 变成 `pass` / `fail`（失败要带失败的 job 名与链接）；
+ *   3. **远端新评论**：绑定的 issue / PR 上出现新评论（带作者、链接、正文摘要）。
+ *
+ * 三条纪律（用户定的，三类通知都一样）：
+ *   1. **不阻塞、不抛错、失败只留痕**：hook 在命令 / 同步**成功之后**异步跑，绝不让调用方等它；
+ *      内部出错只走 `warn`（默认 `console.error`），不改变命令与同步本身的成败。
+ *   2. **只投一次**：幂等键按来源定（审批 = 那次决定；CI = `ci:<pr>:<sha>:<结论>`；
+ *      评论 = `comment:<issue|pr>:<远端评论 id>`），已投递的键与待补投的通知都记在卡片的
+ *      **投递台账**里（`store` 的 meta 表，key `approval:<card>`，不进事件流）。重复轮询到同一状态不重投。
+ *   3. **会话不在线不静默丢**：写一条卡片评论说明它，并把通知记成 pending，
  *      等这张卡下次 `session.start` / 下一次 `prompt` 时自动补投一次。
  *
- * 谁能触发：`decideGate` / `decideConfirm` / `accept` 三条命令，且 `actor.kind === "human"`。
- * agent 自己在看板外调这三条（比如自动化脚本）不算"人的审批"，不通知自己。
+ * 判定与文案都是**纯函数**（`approvalSpec` / `approvalNotice` / `ciNotice` / `commentNotice` /
+ * `candidateSpec`），IO 只在 `createNotifyHooks` 那个壳里 —— 所以能单独测（`test/notify-hooks.test.ts`）。
  *
- * 文案是**纯函数**（`approvalNotice`），"下一步该做什么"按卡片当前状态给，所以能单独测
- * （见 `test/approval-hooks.test.ts`）。
+ * 开关：`FLOWCARD_NOTIFY_HOOKS=0` 关掉（默认开）；旧的 `FLOWCARD_APPROVAL_HOOKS=0` **仍然有效**
+ * （兼容 —— 它当年只管审批，现在等于总开关），见 `notifyHooksEnabled`。
  */
 import { STATE_LABELS, type Card, type Command } from "../shared/types.ts";
 import type { NewEvent } from "./project.ts";
 import type { ApprovalLedger, ApprovalNotice } from "./store.ts";
+import type { CiJob } from "./sync.ts";
 
-// ---------------------------------------------------------------- 判定（纯）
+// ---------------------------------------------------------------- 通用：一条待投的通知
+
+/** 投递台账里攒下来的通知抬头（分不出它原来是谁的，只说明"还没转达出去"）。 */
+export const NOTIFY_PENDING_PREFIX = "【通知·待转达】";
+/** 审批通知沿用最早那个抬头（只针对审批那一类）。 */
+export const APPROVAL_PENDING_PREFIX = "【审批通知·待转达】";
+
+/** 一条要投给会话的通知（`key` = 幂等键，全局唯一）。 */
+export type NoticeSpec = {
+  key: string;
+  cardId: string;
+  text: string;
+  /** 会话不在线时写那条卡片评论的抬头（默认 `NOTIFY_PENDING_PREFIX`）。 */
+  pendingPrefix?: string;
+};
+
+// ---------------------------------------------------------------- 审批：判定（纯）
 
 /** 一次「人的审批决定」：投给 agent 的那条通知 + 它的幂等键。 */
 export type ApprovalSpec = {
@@ -34,6 +55,7 @@ export type ApprovalSpec = {
   gate?: { id: string };
   /** G2 远程写确认（`id` 形如 `cf1`）：起因、将执行什么，都从卡片上的确认里读。 */
   confirm?: { id: string };
+  pendingPrefix: string;
 };
 
 /**
@@ -52,6 +74,7 @@ export function approvalSpec(cmd: Command, events: readonly NewEvent[]): Approva
       key: `approval:${cmd.card}:accept`,
       cardId: cmd.card,
       decision: "approved",
+      pendingPrefix: APPROVAL_PENDING_PREFIX,
       ...(cmd.reason ? { reason: cmd.reason } : {}),
     };
   }
@@ -67,6 +90,7 @@ export function approvalSpec(cmd: Command, events: readonly NewEvent[]): Approva
       key: `approval:${cmd.card}:gate:${gate}:${decision}`,
       cardId: cmd.card,
       decision,
+      pendingPrefix: APPROVAL_PENDING_PREFIX,
       ...(reason ? { reason } : {}),
       gate: { id: gate },
     };
@@ -83,6 +107,7 @@ export function approvalSpec(cmd: Command, events: readonly NewEvent[]): Approva
       key: `approval:${cmd.card}:confirm:${id}:${decision}`,
       cardId: cmd.card,
       decision,
+      pendingPrefix: APPROVAL_PENDING_PREFIX,
       ...(reason ? { reason } : {}),
       confirm: { id },
     };
@@ -91,7 +116,7 @@ export function approvalSpec(cmd: Command, events: readonly NewEvent[]): Approva
   return null;
 }
 
-// ---------------------------------------------------------------- 文案（纯）
+// ---------------------------------------------------------------- 审批：文案（纯）
 
 /** 理由那一句（没有就不写 —— 别留一个"理由："的空壳让人猜）。 */
 function reasonLine(reason: string | undefined): string {
@@ -211,13 +236,170 @@ export function approvalNotice(spec: ApprovalSpec, card: Card): string {
     .join("\n");
 }
 
+// ---------------------------------------------------------------- 同步侧：候选（纯数据）
+
+/**
+ * 同步轮询算出来的「值得打扰 agent 的事」。**只带事实**：远端没给（网络失败 / 字段缺失）
+ * 就不进这个列表 —— 宁可不说，不要猜。
+ */
+export type NotifyCandidate =
+  | {
+      kind: "ci";
+      cardId: string;
+      /** 结论属于哪个 PR / 哪个 commit（幂等键 = `ci:<pr>:<sha>:<结论>`）。 */
+      pr: { number: number; sha: string; conclusion: "pass" | "fail"; url: string };
+      /** 只带**失败**的 job（名字 + 链接）；空的 = 远端没给 job 明细。 */
+      jobs: readonly CiJob[];
+    }
+  | {
+      kind: "comment";
+      cardId: string;
+      /** `number` = 评论挂在哪个编号上（issue / PR 共用一个号池，按卡片的槽位判它是哪个）。 */
+      comment: { id: number; number: number; author: string; body: string; at: string; url: string };
+    };
+
+// ---------------------------------------------------------------- CI：文案（纯）
+
+/** 失败 job 最多列几个（多了只会计数，别把通知刷成一片 URL）。 */
+export const MAX_LISTED_JOBS = 5;
+
+/** CI 结束 → 给 agent 的人话通知（纯函数）：结论、失败的 job（名字 + 链接）、下一步。 */
+export function ciNotice(input: {
+  cardId: string;
+  pr: { number: number; sha: string; conclusion: "pass" | "fail"; url: string };
+  jobs: readonly CiJob[];
+}): string {
+  const { pr, jobs, cardId } = input;
+  const passed = pr.conclusion === "pass";
+  const sha = pr.sha === "" ? "" : `（commit ${pr.sha.slice(0, 12)}）`;
+  const lines = [
+    `【flowcard 通知】CI 结束了：PR #${pr.number} 的 CI ${passed ? "**通过**（pass）" : "**失败**（fail）"}${sha}。`,
+  ];
+  if (!passed) {
+    const failed = jobs.filter((job) => job.conclusion === "fail");
+    if (failed.length === 0) {
+      lines.push("失败的 job 名远端没给（自己去 PR 页面看详情）。");
+    } else {
+      const listed = failed
+        .slice(0, MAX_LISTED_JOBS)
+        .map((job) => (job.url === "" ? job.name : `${job.name}（${job.url}）`));
+      const rest = failed.length - listed.length;
+      lines.push(`失败 job：${listed.join("、")}${rest > 0 ? `；还有 ${rest} 个没列` : ""}`);
+    }
+  }
+  lines.push(
+    passed
+      ? `下一步：看一下还有没有 review 意见；都处理完就请人验收（看板点「验收」，或 \`flowcard accept ${cardId}\`）。`
+      : "下一步：看一眼失败日志；改完推上去 CI 会重跑。",
+  );
+  if (pr.url !== "") lines.push(`链接：${pr.url}`);
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- 评论：文案 + 跳过自己（纯）
+
+/** 评论摘要上限（超了截断 —— 通知不该变成一份转录）。 */
+export const COMMENT_SUMMARY_MAX = 240;
+
+/** 正文摘要：折掉换行/连续空白（消息里一行读完），超长截断。 */
+export function summarize(text: string, max = COMMENT_SUMMARY_MAX): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean === "") return "（空）";
+  return clean.length <= max ? clean : `${clean.slice(0, max)}…（截断）`;
+}
+
+/** 作者名的比对形态：去 `@`、去空白、小写。 */
+function normAuthor(value: string): string {
+  return value.trim().replace(/^@/, "").toLowerCase();
+}
+
+/**
+ * 这张卡上「自己」的身份集合：会话的 harness / agentKind / id，加上这张卡上 agent 留过的
+ * 名字（harness / sessionId / name）。**人（我）的评论不在里面** —— 人的评论要投。
+ *
+ * `extra` 是额外补充（例如 agent 用的是某个固定的 forge 账号，见 `FLOWCARD_NOTIFY_SELF_AUTHORS`）。
+ */
+export function selfAuthors(card: Card, extra: readonly string[] = []): Set<string> {
+  const out = new Set<string>();
+  const add = (value: string | undefined): void => {
+    if (value === undefined) return;
+    const name = normAuthor(value);
+    if (name !== "") out.add(name);
+  };
+  add(card.session?.harness);
+  add(card.session?.agentKind);
+  add(card.session?.id);
+  for (const comment of card.comments) {
+    if (comment.actor.kind !== "agent") continue;
+    add(comment.actor.name);
+    add(comment.actor.harness);
+    add(comment.actor.sessionId);
+  }
+  for (const value of extra) add(value);
+  return out;
+}
+
+/** 这条远端评论是不是"自己发的"（自己回的评论不该把自己吵醒）。作者名空 = 认不出，不当自己。 */
+export function isSelfComment(card: Card, author: string, extra: readonly string[] = []): boolean {
+  const name = normAuthor(author);
+  return name !== "" && selfAuthors(card, extra).has(name);
+}
+
+/** 新评论 → 给 agent 的人话通知（纯函数）：谁、在哪、链接、正文摘要。 */
+export function commentNotice(input: {
+  cardId: string;
+  kind: "issue" | "pr";
+  comment: { number: number; author: string; body: string; at: string; url: string };
+}): string {
+  const { comment, kind, cardId } = input;
+  const who = comment.author === "" ? "有人" : comment.author;
+  const where = kind === "pr" ? `PR #${comment.number}` : `Issue #${comment.number}`;
+  const lines = [`【flowcard 通知】${who} 在${where}上留言了。`];
+  if (comment.url !== "") lines.push(`链接：${comment.url}`);
+  lines.push(`正文（摘要）：${summarize(comment.body)}`);
+  lines.push(
+    `下一步：读一遍再决定要不要回 —— 要回就在远端评论（或 \`flowcard comment ${cardId} --body "…"\` 记一句本地说明）。`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * 一个同步候选 → 一条待投的通知；**不该投的返回 null**：
+ *   · 评论是自己发的（作者 == 这张卡的 agent 身份）→ 不投；
+ *   · 卡片不在 / 编号对不上槽位 → 调用方先过滤，这里只在评论路由上兜底。
+ */
+export function candidateSpec(
+  candidate: NotifyCandidate,
+  card: Card,
+  extraSelf: readonly string[] = [],
+): NoticeSpec | null {
+  if (candidate.kind === "ci") {
+    const { pr, jobs } = candidate;
+    return {
+      key: `ci:${pr.number}:${pr.sha}:${pr.conclusion}`,
+      cardId: candidate.cardId,
+      text: ciNotice({ cardId: candidate.cardId, pr, jobs }),
+      pendingPrefix: NOTIFY_PENDING_PREFIX,
+    };
+  }
+  const { comment } = candidate;
+  if (isSelfComment(card, comment.author, extraSelf)) return null;
+  const kind: "issue" | "pr" = card.pr?.number === comment.number ? "pr" : "issue";
+  return {
+    key: `comment:${kind}:${comment.id}`,
+    cardId: candidate.cardId,
+    text: commentNotice({ cardId: candidate.cardId, kind, comment }),
+    pendingPrefix: NOTIFY_PENDING_PREFIX,
+  };
+}
+
 // ---------------------------------------------------------------- 投递（带 IO）
 
 /** 会话投递的最小依赖（`HostedSessions.prompt` 的形状）。 */
 export type NoticeDelivery = { ok: boolean; error?: { code?: string; message?: string } };
 
-export type ApprovalHookDeps = {
-  /** 开关：`FLOWCARD_APPROVAL_HOOKS=0` 关（默认开）。关掉时所有方法都是空操作。 */
+export type NotifyHookDeps = {
+  /** 开关：`FLOWCARD_NOTIFY_HOOKS=0` 关（默认开）。关掉时所有方法都是空操作。 */
   enabled: boolean;
   getCard: (id: string) => Card | undefined;
   /** 这张卡的托管会话现在活着吗（活着就直接投，省一次评论）。 */
@@ -238,14 +420,18 @@ export type ApprovalHookDeps = {
   now?: () => string;
   /** 每张卡最多记多少个已投递的幂等键（超出丢最老的）。 */
   maxDelivered?: number;
+  /** 额外算作「自己」的远端作者名（`FLOWCARD_NOTIFY_SELF_AUTHORS`，逗号分隔）。 */
+  selfAuthors?: readonly string[];
 };
 
-export type ApprovalHooks = {
+export type NotifyHooks = {
   /**
    * 命令成功后调它：**不 await**（内部自己排队投递），失败只留痕。
    * `events` 传真的落库了的那些（`store.execute` 的 `inserted`）。
    */
   onCommand: (input: { cmd: Command; card: Card | undefined; events: readonly NewEvent[] }) => void;
+  /** 同步一轮算出来的候选（CI 结束 / 新评论）：**不 await**，同一张卡串行。 */
+  onSync: (candidates: readonly NotifyCandidate[]) => void;
   /** 会话起来 / 要发言之前补投 pending（返回这次补投了几条）。同一张卡的投递串行。 */
   flush: (cardId: string) => Promise<number>;
   /** 测试用：等所有在飞的投递结束。 */
@@ -254,17 +440,34 @@ export type ApprovalHooks = {
 };
 
 /** `FLOWCARD_APPROVAL_HOOKS=0` 关掉（默认开）—— 与 `FLOWCARD_AUTOSTART` 一个写法。 */
-export function approvalHooksEnabled(env: Record<string, string | undefined>): boolean {
+function approvalHooksEnabled(env: Record<string, string | undefined>): boolean {
   return (env.FLOWCARD_APPROVAL_HOOKS ?? "").trim() !== "0";
+}
+
+/**
+ * 通知 hook 的总开关：`FLOWCARD_NOTIFY_HOOKS=0` 关（默认开）。
+ * 旧的 `FLOWCARD_APPROVAL_HOOKS=0` 仍然有效 —— 它当年只管审批，现在等于同一件事（兼容保留）。
+ */
+export function notifyHooksEnabled(env: Record<string, string | undefined>): boolean {
+  return approvalHooksEnabled(env) && (env.FLOWCARD_NOTIFY_HOOKS ?? "").trim() !== "0";
+}
+
+/** `FLOWCARD_NOTIFY_SELF_AUTHORS=a,b`：额外算「自己」的远端作者名（可选）。 */
+export function notifySelfAuthors(env: Record<string, string | undefined>): string[] {
+  return (env.FLOWCARD_NOTIFY_SELF_AUTHORS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value !== "");
 }
 
 const DEFAULT_MAX_DELIVERED = 500;
 const MAX_PENDING = 50;
 
-export function createApprovalHooks(deps: ApprovalHookDeps): ApprovalHooks {
-  const warn = deps.warn ?? ((message: string) => console.error(`[approval-hook] ${message}`));
+export function createNotifyHooks(deps: NotifyHookDeps): NotifyHooks {
+  const warn = deps.warn ?? ((message: string) => console.error(`[notify-hook] ${message}`));
   const now = deps.now ?? (() => new Date().toISOString());
   const maxDelivered = deps.maxDelivered ?? DEFAULT_MAX_DELIVERED;
+  const extraSelf = deps.selfAuthors ?? [];
 
   const inflight = new Set<Promise<unknown>>();
   /** 每张卡一条串行链：`flush` 与投递都在改同一份台账，别让它们互相覆盖。 */
@@ -309,47 +512,36 @@ export function createApprovalHooks(deps: ApprovalHookDeps): ApprovalHooks {
     deps.ledger.set(cardId, { ...ledger, delivered });
   };
 
-  /** 降级：记 pending + 写一条评论（会话不在线时，评论就是这个决定唯一的可见痕迹）。 */
-  const degrade = (spec: ApprovalSpec, text: string): void => {
+  /** 降级：记 pending + 写一条评论（会话不在线时，评论就是这条通知唯一的可见痕迹）。 */
+  const degrade = (spec: NoticeSpec): void => {
     const ledger = deps.ledger.get(spec.cardId);
     if (!ledger.pending.some((p) => p.key === spec.key)) {
-      const notice: ApprovalNotice = { key: spec.key, text, at: now() };
+      const notice: ApprovalNotice = { key: spec.key, text: spec.text, at: now() };
       deps.ledger.set(spec.cardId, {
         ...ledger,
         pending: [...ledger.pending, notice].slice(-MAX_PENDING),
       });
     }
     try {
-      deps.comment(spec.cardId, `【审批通知·待转达】${text}`);
+      const prefix = spec.pendingPrefix ?? NOTIFY_PENDING_PREFIX;
+      deps.comment(spec.cardId, `${prefix}${spec.text}`);
       deps.notify?.(spec.cardId, ["card.comment.added"]);
     } catch (error) {
       warn(`写卡片评论失败（卡片 ${spec.cardId}）：${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
-  const run = async (input: {
-    cmd: Command;
-    card: Card | undefined;
-    events: readonly NewEvent[];
-  }): Promise<void> => {
-    if (!deps.enabled) return;
-    const spec = approvalSpec(input.cmd, input.events);
-    if (!spec) return;
-    const card = input.card ?? deps.getCard(spec.cardId);
-    if (!card) {
-      warn(`卡片 ${spec.cardId} 不在，跳过审批通知`);
-      return;
-    }
+  /** 投一条（或降级留痕）。同一张卡串行，幂等键查一遍台账。 */
+  const enqueue = async (spec: NoticeSpec): Promise<void> => {
     await serialize(spec.cardId, async () => {
       const ledger = deps.ledger.get(spec.cardId);
-      // 幂等：同一个决定（已投出去、或还在队列里等补投）只打扰 agent 一次。
+      // 幂等：同一条通知（已投出去、或还在队列里等补投）只打扰 agent 一次。
       if (ledger.delivered.includes(spec.key) || ledger.pending.some((p) => p.key === spec.key)) return;
-      const text = approvalNotice(spec, card);
-      if (deps.isLive(spec.cardId) && (await deliver(spec.cardId, text))) {
+      if (deps.isLive(spec.cardId) && (await deliver(spec.cardId, spec.text))) {
         markDelivered(spec.cardId, spec.key);
         return;
       }
-      degrade(spec, text);
+      degrade(spec);
     });
   };
 
@@ -385,7 +577,36 @@ export function createApprovalHooks(deps: ApprovalHookDeps): ApprovalHooks {
   return {
     enabled: deps.enabled,
     onCommand: (input) => {
-      track(run(input));
+      if (!deps.enabled) return;
+      track(
+        (async () => {
+          const spec = approvalSpec(input.cmd, input.events);
+          if (!spec) return;
+          const card = input.card ?? deps.getCard(spec.cardId);
+          if (!card) {
+            warn(`卡片 ${spec.cardId} 不在，跳过审批通知`);
+            return;
+          }
+          await enqueue({ ...spec, text: approvalNotice(spec, card) });
+        })(),
+      );
+    },
+    onSync: (candidates) => {
+      if (!deps.enabled) return;
+      track(
+        (async () => {
+          for (const candidate of candidates) {
+            const card = deps.getCard(candidate.cardId);
+            if (!card) {
+              warn(`卡片 ${candidate.cardId} 不在，跳过 ${candidate.kind} 通知`);
+              continue;
+            }
+            const spec = candidateSpec(candidate, card, extraSelf);
+            if (!spec) continue; // 自己发的评论：不投
+            await enqueue(spec);
+          }
+        })(),
+      );
     },
     flush: (cardId) => track(flush(cardId)),
     settle: async () => {

@@ -3,7 +3,9 @@
  *
  * **一轮同步的调用面是定死的**（省的是带宽与时间，见 `docs/sync.md` §7 的实测）：
  *   1. 卡片已绑定的编号 → 精确读 `GET /issues/{n}`、`GET /pulls/{n}`（各 ~6–17 KB）；
- *   2. 评论增量 → **每仓库一次** `GET /issues/comments?since=…`，回来按已绑编号过滤。
+ *   2. 评论增量 → **每仓库一次** `GET /issues/comments?since=…`，回来按已绑编号过滤；
+ *   3. **只在接了通知 hook 时**：每个已绑 PR 一次只读的 CI 读 —— 给「CI 结束」通知判状态变化用
+ *      （`opts.notify` 不给就没有这一次请求；读不到只留 `notes`，不进 `degraded[]`）。
  * **不翻 `/pulls` 列表**（两家都没有 `since`，5 页 ≈2.6 MB / 9–32 s）；列表路径只在手动 `--list` 时走。
  *
  * 事实落库只有一条路：`applySync` 命令（引擎翻成事件 + 跑自动节点），幂等键 = `factKey(fact)`。
@@ -14,17 +16,21 @@ import { parseJson, type Run } from "./probe.ts";
 import type { ProjectSyncState, Store } from "./store.ts";
 import {
   authHeaders,
+  ciUrl,
   defaultHttpGet,
   endpointUrl,
   fetchIssue,
   fetchPull,
   MAX_PAGES,
   PAGE_LIMIT,
+  parseCheckRuns,
+  parseCombinedStatus,
   parseCommentList,
   pollRemote,
   readTeaConfig,
   resolveSyncTarget,
   toFacts,
+  type CiReading,
   type Degradation,
   type HttpGet,
   type RawComment,
@@ -35,6 +41,7 @@ import {
   type SyncPrev,
   type SyncSnapshotData,
 } from "./sync.ts";
+import type { NotifyCandidate } from "./notify-hooks.ts";
 
 /** `since` 游标往回让 1 分钟：重叠窗口吃掉时钟漂移/跨事务漏事件，重复由幂等键吸收。 */
 export const SINCE_OVERLAP_MS = 60_000;
@@ -112,16 +119,25 @@ function cardsByNumber(cards: readonly Card[]): Map<number, string> {
   return map;
 }
 
-/** 快照 → 下一轮的 `prev`（喂 `toFacts` 省掉无谓的引擎调用；丢了也能靠幂等键跑）。 */
-function prevFrom(snapshot: SyncSnapshotData): SyncPrev {
+/**
+ * 快照 → 下一轮的 `prev`（喂 `toFacts` 省掉无谓的引擎调用；丢了也能靠幂等键跑）。
+ *
+ * `ci` 是本轮**读到**的 CI（按 PR 编号）：只给「CI 结束」通知判状态变化用。
+ * 读不到的那一轮调用方会把上一轮的值**原样带过来**（别把 `pending` 抹成未知）。
+ */
+function prevFrom(snapshot: SyncSnapshotData, ci: ReadonlyMap<number, CiReading> = new Map()): SyncPrev {
   return {
     issues: snapshot.issues.map((i) => ({ number: i.number, state: i.state, updatedAt: i.updatedAt })),
-    pulls: snapshot.pulls.map((p) => ({
-      number: p.number,
-      state: p.state,
-      merged: p.merged,
-      updatedAt: p.updatedAt,
-    })),
+    pulls: snapshot.pulls.map((p) => {
+      const known = ci.get(p.number);
+      return {
+        number: p.number,
+        state: p.state,
+        merged: p.merged,
+        updatedAt: p.updatedAt,
+        ...(known ? { sha: known.sha, ci: known.conclusion } : {}),
+      };
+    }),
     commentKeys: snapshot.comments.map((c) => `sync:comment:${c.id}`),
   };
 }
@@ -272,6 +288,64 @@ async function readComments(
 }
 
 /**
+ * 一张 PR 的 CI 读取结果：读不到（网络失败 / 字段缺失）就是 `null` —— **不投事实**，
+ * 调用方也就不会为它发通知，并且会把上一轮记下的 CI 原样带过这一轮。
+ */
+type CiReadOutcome = { reading: CiReading | null; note: string | null };
+
+/**
+ * 按 **PR 源分支**读一次 CI（只读 GET）。
+ *
+ * - Gitea：`/commits/{ref}/status`（combined status，`statuses[]` 就是每个 job）；
+ * - GitHub：先 `/commits/{ref}/check-runs`（Actions 的结论只在这儿），没有 check run
+ *   （`total_count: 0`）再退回 legacy `/commits/{ref}/status`（有的仓库用 status API 报 CI）。
+ *
+ * `ref` 用分支名（响应里带 `sha`，那才是"这份结论属于哪个 commit"）。
+ */
+async function readCiOne(auth: SyncAuth, pull: RawPull, http: HttpGet): Promise<CiReadOutcome> {
+  const ref = pull.head;
+  if (ref === "") return { reading: null, note: `#${pull.number} 的源分支没读到：CI 没法按 ref 读` };
+  const headers = authHeaders(auth);
+  const attempts: { kind: "status" | "check-runs"; label: string }[] =
+    auth.forge === "github"
+      ? [
+          { kind: "check-runs", label: "check-runs" },
+          { kind: "status", label: "status" },
+        ]
+      : [{ kind: "status", label: "status" }];
+  let failure: string | null = null;
+  for (const attempt of attempts) {
+    const outcome = await http(ciUrl(auth, attempt.kind, ref), headers);
+    if (!outcome.ok) {
+      failure ??= `${attempt.label} ${outcome.reason}`;
+      continue;
+    }
+    const raw = parseJson(outcome.text);
+    const reading = attempt.kind === "check-runs" ? parseCheckRuns(raw) : parseCombinedStatus(raw);
+    if (reading) return { reading, note: null };
+    failure ??= `${attempt.label} 响应认不出来`;
+  }
+  return { reading: null, note: `#${pull.number} 的 CI 没读到（${failure ?? "未知原因"}）` };
+}
+
+/** 已绑 PR 各读一次 CI（并发，按编号归位）。整轮只有 GET，没有远程写。 */
+async function readCi(
+  auth: SyncAuth,
+  pulls: readonly RawPull[],
+  http: HttpGet,
+): Promise<{ readings: Map<number, CiReading>; notes: string[] }> {
+  const outcomes = await Promise.all(pulls.map((pull) => readCiOne(auth, pull, http)));
+  const readings = new Map<number, CiReading>();
+  const notes: string[] = [];
+  for (const [index, pull] of pulls.entries()) {
+    const outcome = outcomes[index]!;
+    if (outcome.reading) readings.set(pull.number, outcome.reading);
+    if (outcome.note) notes.push(outcome.note);
+  }
+  return { readings, notes };
+}
+
+/**
  * 跑一轮同步（只读远程）。`list=true` 走 `pollRemote` 的全量列表（手动 `--list` 才用）；
  * 默认只做「已绑编号精确读 + 每仓库一次评论增量」。
  *
@@ -289,6 +363,11 @@ export async function runSyncRound(opts: {
   run?: Run;
   teaConfig?: string | null;
   now?: () => string;
+  /**
+   * 通知 hook 的落点（CI 结束 / 远端新评论）。**不给 = 不读 CI、不发任何通知**——
+   * 通知是同步的副产品，不是同步的一部分（CLI 之外的调用方按需接）。
+   */
+  notify?: (candidates: readonly NotifyCandidate[]) => void;
 }): Promise<SyncRoundResult> {
   const { store, projectId } = opts;
   const project = store.getProject(projectId);
@@ -313,6 +392,15 @@ export async function runSyncRound(opts: {
   const remote = project.remote ?? "";
   const teaConfig = opts.teaConfig !== undefined ? opts.teaConfig : readTeaConfig();
   const http = opts.http ?? defaultHttpGet;
+  /** 通知只为真的能投出去才做：没接 hook 或 dry-run 时连 CI 都不读（省一次远程请求）。 */
+  const wantsNotify = opts.notify !== undefined && opts.dryRun !== true;
+  /** PR 编号 → 卡片：CI 通知只认"这张卡绑了那个 PR"（与 issue 共用号池的歧义无关）。 */
+  const pullCard = new Map<number, string>();
+  for (const card of cards) {
+    if (card.pr && !pullCard.has(card.pr.number)) pullCard.set(card.pr.number, card.id);
+  }
+  /** 这一轮攒下的通知候选（CI 结束 / 新评论），落完事实之后一次性交给 hook。 */
+  const candidates: NotifyCandidate[] = [];
 
   const degraded: Degradation[] = [];
   const notes: string[] = [];
@@ -328,6 +416,8 @@ export async function runSyncRound(opts: {
   let reason: SyncRoundReport["reason"] = null;
   let source: SyncRoundReport["source"] = null;
   let snapshot: SyncSnapshotData = { issues: [], pulls: [], comments: [] };
+  /** 本轮读到的 CI（按 PR 编号）；没接通知就是空的（那就不读）。 */
+  let ciReadings = new Map<number, CiReading>();
   /** 评论增量读完了没有：没读完（满页/中途失败）游标就不能推到 now —— 更新的评论会永久丢。 */
   let commentsComplete = true;
   let commentsLatestAt: string | null = null;
@@ -347,6 +437,33 @@ export async function runSyncRound(opts: {
     notes.push(...pulled.notes, ...comments.notes);
     commentsComplete = comments.complete;
     commentsLatestAt = comments.latestAt;
+    if (wantsNotify) {
+      const ci = await readCi(target, pulled.pulls, http);
+      ciReadings = ci.readings;
+      // CI 读不到**不算降级**（降级是"三个主端点的语义"，还牵着游标推进）：只留一句 notes。
+      notes.push(...ci.notes);
+      // 「CI 结束」= 上一轮记的是 `pending`，这一轮读到的**同一个 commit** 是 pass / fail。
+      // 每次拉到 pass 就投是错的 —— 状态没变化（或换了 commit）不投。
+      for (const [number, reading] of ciReadings) {
+        const before = (previous?.prev?.pulls ?? []).find((pull) => pull.number === number);
+        if (before?.ci !== "pending" || before.sha !== reading.sha) continue;
+        if (reading.conclusion !== "pass" && reading.conclusion !== "fail") continue;
+        const cardId = pullCard.get(number);
+        if (cardId === undefined) continue;
+        const pull = snapshot.pulls.find((item) => item.number === number);
+        candidates.push({
+          kind: "ci",
+          cardId,
+          pr: {
+            number,
+            sha: reading.sha,
+            conclusion: reading.conclusion,
+            url: pull?.url ?? "",
+          },
+          jobs: reading.jobs.filter((job) => job.conclusion === "fail"),
+        });
+      }
+    }
   } else if (numbers.length === 0 && opts.list !== true) {
     // 一张卡都没绑编号：不值得为一个仓库拉全量（事件也无处可挂）。
     notes.push("这个项目还没有卡片绑定 issue/PR 编号：本轮不读远程（先绑编号再来同步）");
@@ -395,7 +512,31 @@ export async function runSyncRound(opts: {
     const outcome = store.execute({ cmd: "applySync", actor: { kind: "system" }, card: cardId, facts: cardFacts }, fetchedAt);
     applied += outcome.inserted.length;
     duplicates += outcome.duplicates;
-    for (const event of outcome.inserted) types.push(event.type);
+    for (const event of outcome.inserted) {
+      types.push(event.type);
+      // 评论通知取**真的落库了的**事件：事件库的幂等键（`sync:comment:{id}`）已经去过了重，
+      // 所以重复轮询到同一条评论不会变成候选。字段缺一个就不投（**不猜**）。
+      if (!wantsNotify || event.type !== "remote.comment.added") continue;
+      const id = event.payload["id"];
+      const number = event.payload["issueNumber"];
+      const author = event.payload["author"];
+      const body = event.payload["body"];
+      const at = event.payload["at"];
+      const url = event.payload["url"];
+      if (typeof id !== "number" || typeof number !== "number") continue;
+      candidates.push({
+        kind: "comment",
+        cardId,
+        comment: {
+          id,
+          number,
+          author: typeof author === "string" ? author : "",
+          body: typeof body === "string" ? body : "",
+          at: typeof at === "string" ? at : "",
+          url: typeof url === "string" ? url : "",
+        },
+      });
+    }
     if (outcome.inserted.length > 0) cardIds.push(cardId);
   }
 
@@ -416,6 +557,16 @@ export async function runSyncRound(opts: {
     notes.push(`评论还没读完：since 游标推进到 ${cursorAt}（本批最新一条），下一轮从那里接着读`);
   }
 
+  /**
+   * CI 的「上一轮记录」：这一轮读到的按编号放进去；**读不到的原样带过上一轮的值**
+   * （抹成未知的话，"pending → 结束"这个变化就永远看不见了）。
+   */
+  const knownCi = new Map<number, CiReading>(ciReadings);
+  for (const before of previous?.prev?.pulls ?? []) {
+    if (knownCi.has(before.number) || before.sha === undefined || before.ci === undefined) continue;
+    knownCi.set(before.number, { sha: before.sha, conclusion: before.ci, jobs: [] });
+  }
+
   if (opts.dryRun !== true) {
     if (reason === null) {
       const state: ProjectSyncState = {
@@ -427,7 +578,7 @@ export async function runSyncRound(opts: {
           pulls: snapshot.pulls.length,
           comments: snapshot.comments.length,
         },
-        prev: prevFrom(snapshot),
+        prev: prevFrom(snapshot, knownCi),
       };
       store.setSyncState(project.id, state);
     } else if (previous) {
@@ -444,6 +595,18 @@ export async function runSyncRound(opts: {
         counts: { issues: 0, pulls: 0, comments: 0 },
         lastError: reason,
       });
+    }
+  }
+
+  /**
+   * 通知候选交给 hook：**同步不因为通知而改变成败**（hook 自己异步排队、失败只留痕）。
+   * 同步没跑成（没凭据）时不投 —— 那会儿连 CI 都没读到。
+   */
+  if (wantsNotify && reason === null && candidates.length > 0) {
+    try {
+      opts.notify?.(candidates);
+    } catch (error) {
+      console.error(`[sync] 通知 hook 抛错：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -495,6 +658,8 @@ export function startSyncScheduler(opts: {
   run?: Run;
   teaConfig?: string | null;
   now?: () => string;
+  /** 通知 hook 的落点（CI 结束 / 远端新评论）；不给就不读 CI、不发通知。 */
+  notify?: (candidates: readonly NotifyCandidate[]) => void;
   onReport?: (report: SyncRoundReport) => void;
   onError?: (error: unknown) => void;
 }): SyncScheduler | null {
@@ -521,6 +686,7 @@ export function startSyncScheduler(opts: {
           ...(opts.run ? { run: opts.run } : {}),
           ...(opts.teaConfig !== undefined ? { teaConfig: opts.teaConfig } : {}),
           ...(opts.now ? { now: opts.now } : {}),
+          ...(opts.notify ? { notify: opts.notify } : {}),
         });
         if (result.ok) {
           reports.push(result.report);

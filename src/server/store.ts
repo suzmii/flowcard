@@ -137,12 +137,12 @@ export type ProjectSyncState = {
 
 /**
  * 一条待补投的审批通知（会话不在线时攒着，等它下次启动 / 发言时投出去）。
- * `key` 就是那次决定的幂等键（见 `server/approval-hooks.ts`）。
+ * `key` 就是那条通知的幂等键（审批 / CI 结束 / 新评论，见 `server/notify-hooks.ts`）。
  */
 export type ApprovalNotice = { key: string; text: string; at: string };
 
 /**
- * 审批 hook 的投递台账（按卡片存在 `meta` 表里，**不进事件流**）：
+ * 通知 hook（审批 / CI 结束 / 远端新评论）的投递台账（按卡片存在 `meta` 表里，**不进事件流**）：
  * `delivered` 是已经打扰过 agent 的幂等键（含补投的），`pending` 是会话不在线时攒下的通知。
  *
  * 它不是业务事实 —— 重建投影不需要它（和 `ProjectSyncState` 同一类）；丢了最坏是重复提醒一次。
@@ -201,8 +201,8 @@ export type Store = {
   /** 记住这一轮同步（`lastSyncAt` / 上轮摘要 / 降级）。 */
   setSyncState(projectId: string, state: ProjectSyncState): void;
   /**
-   * 审批 hook 的投递台账（按卡片；没记过返回空的一份）。
-   * 放 `meta` 表里、不进事件流：它是「哪些审批通知已经打扰过 agent」，不是流程事实。
+   * 通知 hook（审批 / CI 结束 / 新评论）的投递台账（按卡片；没记过返回空的一份）。
+   * 放 `meta` 表里、不进事件流：它是「哪些通知已经打扰过 agent」，不是流程事实。
    */
   getApprovalLedger(cardId: string): ApprovalLedger;
   setApprovalLedger(cardId: string, ledger: ApprovalLedger): void;
@@ -533,14 +533,15 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     metaSet(`sync:${projectId}`, JSON.stringify(state));
   };
 
-  // ---------------------------------------------------------------- 审批 hook 的投递台账（按卡片，不进事件流）
+  // ---------------------------------------------------------------- 通知 hook 的投递台账（按卡片，不进事件流）
+  // meta 的 key 仍是 `approval:<card>`：它从审批 hook 那时就在用了，换名只会把老台账丢掉。
 
   const getApprovalLedger = (cardId: string): ApprovalLedger => {
     const raw = metaGet(`approval:${cardId}`);
     if (raw === undefined) return { delivered: [], pending: [] };
     try {
       const parsed = JSON.parse(raw) as Partial<ApprovalLedger>;
-      // 手工改坏 / 旧版本写坏的值不该把审批通知整个搞停：形状不对就当没记过（最坏重复提醒一次）。
+      // 手工改坏 / 旧版本写坏的值不该把通知整个搞停：形状不对就当没记过（最坏重复提醒一次）。
       const delivered = Array.isArray(parsed?.delivered)
         ? parsed.delivered.filter((k): k is string => typeof k === "string")
         : [];

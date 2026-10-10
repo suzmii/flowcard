@@ -187,6 +187,9 @@ facts 首轮      : {issue:12, pr:250, comment:8}      # 未给 opts.numbers
 - 有凭据时一轮的调用面（`test/sync-wire.test.ts` 用注入假 http 钉死）：
   每个已绑编号一次 `GET /issues/{n}`、`GET /pulls/{n}`（实测 ~5.8 KB / ~17 KB）+ **每仓库一次** `GET /issues/comments?since=…` 后按已绑编号过滤；
   **断言过：一轮里没有 `/issues?` / `/pulls?` 列表请求**。
+  **接了通知 hook 时**再给每个已绑 PR 加一次只读的 CI 读（Gitea `GET /commits/{head分支}/status`；
+  GitHub 先 `GET /commits/{ref}/check-runs`，没有 check run 再退回 `/status`）—— 只为「CI 结束」通知判状态变化，
+  没接 hook（或 `dry-run`）时**连这一次都不发**；读不到就只留一句 `notes`，**不进 `degraded[]`**（它不牵着游标）。
 - `--list`（手动）才走 `pollRemote` 的全量列表：实测 250 条 PR ≈ 15 s（对照：3 个精确读一轮 ≈ 5–10 s）。默认路径**不翻列表**。
 
 ### 9.6 HTTP / CLI

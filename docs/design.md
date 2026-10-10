@@ -309,14 +309,19 @@ agent: consumeConfirm{id}               → confirm.consumed（这条授权就�
        下一步：现在可以执行清理：`flowcard cleanup c3` 记账，然后把现场清掉（worktree / 分支 / 临时文件）—— 完成后卡片自动进「完成」。
 ```
 
-- **三件事必须都在**：决定（通过 / 驳回）、理由（有就带；驳回本来就必须给）、**下一步该做什么**。下一步按**卡片当前状态**给，不硬写死：`merged` → "先提清理清单 / 现在可以执行清理"，`review` → "等 PR 合并"，`done` → "没有待办了"。文案是纯函数（`approvalNotice(spec, card)`，见 `src/server/approval-hooks.ts`），所以能单测。
+- **三件事必须都在**：决定（通过 / 驳回）、理由（有就带；驳回本来就必须给）、**下一步该做什么**。下一步按**卡片当前状态**给，不硬写死：`merged` → "先提清理清单 / 现在可以执行清理"，`review` → "等 PR 合并"，`done` → "没有待办了"。文案是纯函数（`approvalNotice(spec, card)`，见 `src/server/notify-hooks.ts`），所以能单测。
 - **谁能触发**：`decideGate` / `decideConfirm` / `accept` 三条命令，且 `actor.kind === "human"`。agent 自己在看板外调这三条（自动化跑流程）不算"人的审批"，**不通知自己**。
 - **只投一次**：幂等键就是那次决定本身 —— `approval:<card>:gate:<gate>:<decision>` / `approval:<card>:confirm:<cf-id>:<decision>` / `approval:<card>:accept`。重复决策（门禁已经不是 `open`、确认已经结算、卡片已经验收过）在引擎那层就被拒/跳过，**一条事件都不写**，hook 也就不动；同一条命令重发（事件被幂等键吞掉）同理。
 - **会话不在线不静默丢**（降级）：写一条卡片评论（`【审批通知·待转达】…`，actor 是 `system`）把这个决定留在时间线上，并把通知记成 **pending**；这张卡**下次 `session.start` 成功之后、或下一次 `prompt` 发出去之前**自动补投一次（进程没了但会话文件还在的，会顺带 `-r` 续接同一条会话），同样按幂等键去重。pending 与已投递的键都记在 `meta` 表里（key `approval:<card>`），**不进事件流** —— 它不是流程事实（重建投影不需要它，丢了最坏是重复提醒一次）。
 - **不阻塞、不抛错、失败只留痕**：hook 在 `/api/commands` **成功之后异步跑**，绝不让审批请求等它，也绝不改变审批本身的成败；投递失败只在服务日志里 `console.error` 一行（哪张卡、什么原因），通知留在 pending 里等下次机会。
 - **开关**：`FLOWCARD_APPROVAL_HOOKS=0` 关掉（**默认开**，与 `FLOWCARD_AUTOSTART` 同一个写法），启动日志里明说当前状态（`审批通知 开（人批了会通知托管会话）` / `关（FLOWCARD_APPROVAL_HOOKS=0）`）。
 
-实现：判定与文案全在 `src/server/approval-hooks.ts`（纯函数 + 一个带 IO 的编排壳）；接线在 `src/server/app.ts`（命令成功后投递；`session/start`、`session/prompt` 前补投）；单测与假 omp 端到端在 `test/approval-hooks.test.ts`。
+同一条通道上还有**两类通知**（同样幂等、同样离线降级、同样失败只留痕）：
+
+- **CI 结束**：绑定的 PR 的 CI 从 `pending` 变成 `pass` / `fail` 时投一条（失败带失败的 job 名与链接）。判"结束"用的是**状态变化**（上一轮读到的 CI → 这一轮，且必须是同一个 commit），不是"每次拉到 pass 就投"；幂等键 `ci:<pr>:<sha>:<结论>`。CI 是同步轮询时**按 PR 源分支只读 GET** 读来的（Gitea `/commits/{ref}/status`；GitHub 先 `/commits/{ref}/check-runs`，没有 check run 再退回 `/status`），读不到就不投，也**不动上一轮的记录**（否则"pending → 结束"会永远看不见）。
+- **远端新评论**：绑定的 issue / PR 上落了新的远端评论（`remote.comment.added`）时投一条，带作者、链接、正文摘要（截断）。**自己发的评论不投**（作者 == 这张卡的会话 harness / agentKind / id，或卡片上 agent 留过的名字，或 `FLOWCARD_NOTIFY_SELF_AUTHORS` 里列的）；幂等键 `comment:<issue|pr>:<远端评论 id>`。
+
+实现：判定与文案全在 `src/server/notify-hooks.ts`（纯函数 + 一个带 IO 的编排壳，三个来源共用一套队列 / 台账 / 降级）；接线在 `src/server/app.ts`（命令成功后投递；`session/start`、`session/prompt` 前补投；同步轮询把候选递进来）与 `src/server/syncer.ts`（只读轮询 + 状态变化判定）；单测与假 omp 端到端在 `test/approval-hooks.test.ts`、`test/notify-hooks.test.ts`。**开关**：`FLOWCARD_NOTIFY_HOOKS=0` 关掉（默认开），旧的 `FLOWCARD_APPROVAL_HOOKS=0` 仍然有效（当年只管审批，现在等于同一个总开关）；启动日志里明说当前状态。
 
 ## 6. 事件日志是真相
 

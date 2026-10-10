@@ -4,9 +4,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { personalFlow } from "../flow/personal.ts";
 import { createApp } from "./app.ts";
-import { approvalHooksEnabled } from "./approval-hooks.ts";
+import { notifyHooksEnabled } from "./notify-hooks.ts";
 import { createHostedSessions } from "./hosted-session.ts";
 import { defaultAdapterPath } from "./launch.ts";
+import { validatePrompts } from "./prompts.ts";
 import { createRuntimeSupervisor } from "./runtime.ts";
 import { createStore } from "./store.ts";
 import { DEFAULT_SYNC_INTERVAL_MS } from "./syncer.ts";
@@ -26,6 +27,15 @@ if (!LOOPBACK.has(host) && process.env.FLOWCARD_ALLOW_REMOTE !== "1") {
 }
 const port = Number(process.env.FLOWCARD_PORT ?? "47825");
 
+// 提示词模板（`prompts/*.md`）启动即校验：语法坏 / 缺占位符 / 缺必模板当场拒绝启动 ——
+// 别等到第一次起会话才发现提示发不出去（渲染器每次读文件，改完即生效，不用重启）。
+try {
+  validatePrompts();
+} catch (err) {
+  console.error(`拒绝启动：${err instanceof Error ? err.message : String(err)}`);
+  process.exit(3);
+}
+
 const store = createStore({ dataDir, flow: personalFlow });
 const runtime = createRuntimeSupervisor({ store, dataDir });
 
@@ -40,10 +50,11 @@ const sessions = createHostedSessions({
 });
 
 /**
- * 审批 hook：人批了 / 驳了 → 自动给这张卡的托管会话发一条人话通知。
- * 默认开，`FLOWCARD_APPROVAL_HOOKS=0` 关（关掉后审批照常，只是不通知 agent）。
+ * 通知 hook：审批（人批了 / 驳了）、CI 结束、远端新评论 → 自动给这张卡的托管会话发一条人话通知。
+ * 默认开，`FLOWCARD_NOTIFY_HOOKS=0` 关（关掉后流程照常，只是不通知 agent）；旧的
+ * `FLOWCARD_APPROVAL_HOOKS=0` 仍然有效（它当年只管审批，现在等于同一个开关）。
  */
-const approvalHooksOn = approvalHooksEnabled(process.env);
+const notifyHooksOn = notifyHooksEnabled(process.env);
 
 /** 后台同步节奏：默认 5 分钟一轮（`FLOWCARD_SYNC_INTERVAL_MS=0` 关掉）。 */
 const syncRaw = Number(process.env.FLOWCARD_SYNC_INTERVAL_MS ?? "");
@@ -52,7 +63,7 @@ const app = createApp(store, {
   runtime,
   sync: { intervalMs: syncIntervalMs },
   sessions,
-  approvalHooks: { enabled: approvalHooksOn },
+  notifyHooks: { enabled: notifyHooksOn },
   // 卡片 git 事实（看板阶段派生用）：只对有 worktree 的卡跑只读 git，结果缓存 30s。
   gitFacts: {},
   autostart: {
@@ -70,9 +81,11 @@ serve({ fetch: app.fetch, hostname: host, port }, (info) => {
   const cards = store.listCards().length;
   const tail = reaped.length > 0 ? `；清理残留运行时 ${reaped.join(", ")}` : "";
   const sync = syncIntervalMs > 0 ? `每 ${Math.round(syncIntervalMs / 1000)}s` : "已关闭";
-  const hooks = approvalHooksOn ? "开（人批了会通知托管会话）" : "关（FLOWCARD_APPROVAL_HOOKS=0）";
+  const hooks = notifyHooksOn
+    ? "开（审批 / CI 结束 / 新评论都会通知托管会话）"
+    : "关（FLOWCARD_NOTIFY_HOOKS=0）";
   console.log(
-    `flowcard 已启动 http://${host}:${info.port}  （数据 ${dataDir}，卡片 ${cards} 张，同步 ${sync}，审批通知 ${hooks}${tail}）`,
+    `flowcard 已启动 http://${host}:${info.port}  （数据 ${dataDir}，卡片 ${cards} 张，同步 ${sync}，通知 hook ${hooks}${tail}）`,
   );
 });
 
