@@ -5,10 +5,13 @@ import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { streamSSE } from "hono/streaming";
-import { commandSchema, issueBaseInSchema, projectInSchema, runtimeActionSchema } from "../shared/types.ts";
+import { commandSchema, issueBaseInSchema, projectInSchema, runtimeActionSchema, syncRequestSchema } from "../shared/types.ts";
 import type { Project } from "../shared/types.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
+import { runSyncRound, startSyncScheduler, trackedNumbers } from "./syncer.ts";
+import type { HttpGet } from "./sync.ts";
+import type { Run } from "./probe.ts";
 import { readProject } from "./projects.ts";
 import { clampGraphLimit, readGraph } from "./graph.ts";
 import { readCardDiff } from "./diff.ts";
@@ -21,7 +24,20 @@ import { scanGitRepos } from "./projects.ts";
 /** 看板构建产物目录（`npm run web:build` 的 outDir）。 */
 const WEB_DIST = fileURLToPath(new URL("../../web/dist", import.meta.url));
 
-export type AppOptions = { runtime?: RuntimeSupervisor };
+export type AppOptions = {
+  runtime?: RuntimeSupervisor;
+  /**
+   * 同步（只读轮询）：`intervalMs <= 0` = 关（默认：测试与 CLI 起 app 时都不带，所以不建定时器）。
+   * 每轮只对「有卡片绑了编号」的项目跑，且只按编号精确读 + 每仓库一次评论增量。
+   */
+  sync?: {
+    intervalMs: number;
+    env?: Record<string, string | undefined>;
+    http?: HttpGet;
+    run?: Run;
+    teaConfig?: string | null;
+  };
+};
 
 export function createApp(store: Store, opts: AppOptions = {}) {
   const app = new Hono();
@@ -30,6 +46,26 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   const broadcast = (event: string, data: unknown): void => {
     for (const send of subscribers) send(event, data);
   };
+
+  // 后台同步也是卡片事实的来源 → 和命令一样广播 "changed"，看板据此重拉。
+  if (opts.sync) {
+    startSyncScheduler({
+      store,
+      intervalMs: opts.sync.intervalMs,
+      ...(opts.sync.env ? { env: opts.sync.env } : {}),
+      ...(opts.sync.http ? { http: opts.sync.http } : {}),
+      ...(opts.sync.run ? { run: opts.sync.run } : {}),
+      ...(opts.sync.teaConfig !== undefined ? { teaConfig: opts.sync.teaConfig } : {}),
+      onReport: (report) => {
+        if (report.cardIds.length > 0) {
+          broadcast("changed", { cardIds: report.cardIds, types: report.types });
+        }
+      },
+      onError: (error) => {
+        console.error(`[sync] 一轮同步失败：${String(error)}`);
+      },
+    });
+  }
 
   // 运行时状态变化也是事件（runtime.*）→ 看板既收到细粒度的 "runtime"，也收到 "changed" 触发重取。
   opts.runtime?.subscribe((change) => {
@@ -105,6 +141,93 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   app.get("/api/projects", (c) => c.json({ projects: store.listProjects() }));
 
   /**
+   * `/api/projects/:id/sync` 的 body：`since` 显式给窗口起点，`list` 走全量列表（手动排查用），
+   * `dryRun` 只算事实不落库。三个都不给 = 一轮常规同步（精确读已绑编号 + 每仓库一次评论增量）。
+   */
+  app.post("/api/projects/:id/sync", async (c) => {
+    const id = c.req.param("id");
+    if (!store.getProject(id)) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "NOT_FOUND",
+            message: `项目 ${id} 不存在`,
+            hint: "flowcard project list 看现有项目",
+          },
+        },
+        404,
+      );
+    }
+    const body = await c.req.json().catch(() => null);
+    const parsed = syncRequestSchema.safeParse(body ?? {});
+    if (!parsed.success) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "USAGE_ERROR",
+            message: parsed.error.issues
+              .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+              .join("; "),
+            hint: 'body 形如 {"since":"2026-10-09T00:00:00.000Z","list":false,"dryRun":false}',
+          },
+        },
+        400,
+      );
+    }
+
+    const result = await runSyncRound({
+      store,
+      projectId: id,
+      // 传输依赖与后台调度共用一套（测试/替换用），默认全是生产实现。
+      ...(opts.sync?.env ? { env: opts.sync.env } : {}),
+      ...(opts.sync?.http ? { http: opts.sync.http } : {}),
+      ...(opts.sync?.run ? { run: opts.sync.run } : {}),
+      ...(opts.sync?.teaConfig !== undefined ? { teaConfig: opts.sync.teaConfig } : {}),
+      ...(parsed.data.since ? { since: parsed.data.since } : {}),
+      ...(parsed.data.list !== undefined ? { list: parsed.data.list } : {}),
+      ...(parsed.data.dryRun !== undefined ? { dryRun: parsed.data.dryRun } : {}),
+    });
+    if (!result.ok) return c.json({ ok: false, error: result.error }, 404);
+    // 报告里没有凭据字段（`SyncAuth.token` 从不进返回值）。
+    if (result.report.cardIds.length > 0) {
+      broadcast("changed", { cardIds: result.report.cardIds, types: result.report.types });
+    }
+    return c.json(result.report);
+  });
+
+  /** 同步状态（纯读，不触发网络）：上次同步时刻 / 降级 / 已绑编号数。 */
+  app.get("/api/projects/:id/sync", (c) => {
+    const id = c.req.param("id");
+    const project = store.getProject(id);
+    if (!project) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: "NOT_FOUND",
+            message: `项目 ${id} 不存在`,
+            hint: "flowcard project list 看现有项目",
+          },
+        },
+        404,
+      );
+    }
+    const state = store.getSyncState(id);
+    const tracked = trackedNumbers(store.listCards().filter((card) => card.projectId === id));
+    return c.json({
+      projectId: id,
+      lastSyncAt: state?.at ?? null,
+      degraded: state?.degraded ?? [],
+      notes: state?.notes ?? [],
+      counts: state?.counts ?? null,
+      lastError: state?.lastError ?? null,
+      tracked: { issues: tracked.issues.length, pulls: tracked.pulls.length },
+    });
+  });
+
+  /**
    * 提交图（只读）：`git log --graph` 的原始输出 + 提交/分支/worktree 实况 + 卡片↔分支映射。
    * 只跑只读 git 子命令；`limit` 默认 200、上限 1000（图与响应都要有上限）。
    */
@@ -148,7 +271,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
           error: {
             code: "NO_WORKTREE",
             message: `卡片 ${card.id} 还没绑 worktree，没有可比的 head`,
-            hint: `先建并绑 worktree：flowcard worktree ${card.id} --path .worktrees/x --branch feat/x`,
+            hint: `先建并绑 worktree：flowcard worktree ${card.id} --path .worktrees/x --branch <前缀>/x`,
           },
         },
         409,

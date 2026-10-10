@@ -73,7 +73,7 @@ export function SessionPanel({ card }: { card: CardView }) {
         ) : (
           <p className="text-muted-foreground">
             这张卡还没有 worktree：先在「必要项目」里绑一个（
-            <code className="font-mono">flowcard worktree {card.id} --path .worktrees/{card.id} --branch feat/{card.id}</code>
+            <code className="font-mono">flowcard worktree {card.id} --path .worktrees/{card.id} --branch &lt;前缀&gt;/{card.id}</code>
             ），再回到这里启动会话。
           </p>
         )}

@@ -8,6 +8,7 @@ import { parseArgs } from "node:util";
 import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
 import { summarizeDiff } from "../server/diff.ts";
 import { defaultRun, firstLine } from "../server/probe.ts";
+import { runSync } from "./sync.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import {
   CONFIRM_ACTIONS,
@@ -675,7 +676,7 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`);
     process.exit(0);
   }
 
@@ -683,6 +684,11 @@ async function main(): Promise<void> {
     // 探测是只读 + 回写，与"用户命令"性质不同，实现在 detect.ts，这里只做转发。
     const { runDetect } = await import("./detect.ts");
     await runDetect(process.argv.slice(3));
+  }
+
+  if (name === "sync") {
+    // 同步同样是只读 + 回写（issue/PR 状态 + 新评论），实现在 sync.ts，这里只做转发。
+    await runSync(process.argv.slice(3));
   }
 
   if (name === "list") {

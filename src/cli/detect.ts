@@ -137,7 +137,7 @@ export async function runDetect(argv: string[]): Promise<never> {
     hints.push(`cwd ${cwd} 不在 git 仓库内：请把会话移进项目仓库的 worktree`);
   } else if (result.verdict?.detached) {
     hints.push(
-      `会话所在的 worktree ${result.verdict.path} 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c feat/<名字> 再绑卡`,
+      `会话所在的 worktree ${result.verdict.path} 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c <前缀>/<名字>（前缀看改动性质）再绑卡`,
     );
   } else if (!result.worktree) {
     hints.push(

@@ -16,7 +16,7 @@ export const personalFlow = defineFlow({
   requirements: [
     {
       id: "worktree",
-      describe: "必须建好 worktree 与分支（.worktrees/<名字>，feat/* 或 fix/*）",
+      describe: "必须建好 worktree 与分支（目录 .worktrees/<名字>；分支名按改动性质起，前缀跟仓库惯例走）",
       check: (c) => c.worktree !== null,
     },
     {

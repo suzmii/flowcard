@@ -50,6 +50,7 @@ export function emptyCard(id: string, at: string): Card {
     confirmations: [],
     pushes: [],
     comments: [],
+    remoteComments: [],
     review: { comments: [] },
     spawned: [],
     createdAt: at,
@@ -160,6 +161,51 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
     case "issue.bound":
       next.issue = p.issue as IssueRef;
       break;
+
+    /**
+     * 同步来的 issue 状态：只动 `state`/`title`，其余字段（repo/url）**原样保留**。
+     * 编号对不上就不动（事实本该由同步器按编号路由，这里只是投影层的兜底）。
+     */
+    case "issue.state.changed": {
+      const number = Number(p.number ?? 0);
+      if (!card.issue || card.issue.number !== number) break;
+      next.issue = {
+        ...card.issue,
+        state: p.state === "closed" ? "closed" : "open",
+        ...(typeof p.title === "string" && p.title !== "" ? { title: p.title } : {}),
+      };
+      break;
+    }
+
+    /** 远端评论：恒落成「未读」，重复 id 只投影一次（翻页边界/重放都不该长出第二条）。 */
+    case "remote.comment.added": {
+      const id = Number(p.id ?? 0);
+      if (!Number.isInteger(id) || id <= 0) break;
+      if (card.remoteComments.some((c) => c.id === id)) break;
+      next.remoteComments = [
+        ...card.remoteComments,
+        {
+          id,
+          issueNumber: Number(p.issueNumber ?? 0),
+          author: String(p.author ?? ""),
+          body: String(p.body ?? ""),
+          at: typeof p.at === "string" && p.at !== "" ? p.at : at,
+          url: String(p.url ?? ""),
+          read: false,
+        },
+      ];
+      break;
+    }
+
+    /** 标记已读：只置位，不删记录（顺序与正文都要留着）。 */
+    case "remote.comments.read": {
+      const ids = new Set((Array.isArray(p.ids) ? p.ids : []).map((v) => Number(v)));
+      if (ids.size === 0) break;
+      next.remoteComments = card.remoteComments.map((comment) =>
+        ids.has(comment.id) ? { ...comment, read: true } : comment,
+      );
+      break;
+    }
 
     case "worktree.bound":
       next.worktree = p.worktree as WorktreeRef;

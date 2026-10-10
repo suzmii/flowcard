@@ -32,10 +32,10 @@ function steps(card: Card, cli: string, worktree: { path: string; branch: string
       : line(
           false,
           [
-            "**先建 worktree，名字由你起**（按这次要干的事取名，短一点好认）：",
+            "**先建 worktree，名字由你起**：目录名与分支名都按这次要干的事取（分支前缀看改动性质——feat / fix / chore / docs / refactor…，跟本仓库惯例走）：",
             "  ```bash",
-            "  git worktree add .worktrees/<你起的名字> -b feat/<你起的名字>",
-            `  ${cli} worktree ${card.id} --path .worktrees/<你起的名字> --branch feat/<你起的名字>   # 登记到卡片（不登记我认不出这张卡）`,
+            "  git worktree add .worktrees/<你起的名字> -b <前缀>/<你起的名字>",
+            `  ${cli} worktree ${card.id} --path .worktrees/<你起的名字> --branch <前缀>/<你起的名字>   # 登记到卡片（不登记我认不出这张卡）`,
             "  ```",
             "  然后**把当前会话移进去**（omp：`/wt <分支>` 或 `/move <路径>`），再开始改文件——",
             "  **在主仓库里改文件不算开工**（卡片进不了「实施中」）；建完登记后心跳会自动把会话认到这张卡上。",

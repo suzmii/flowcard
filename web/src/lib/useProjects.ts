@@ -7,9 +7,13 @@ import {
   LOCAL_PROJECT_ID,
   addProject,
   fetchProjects,
+  fetchSyncStatus,
+  runProjectSync,
   setProjectIssueBase,
   type IssueBase,
   type ProjectView,
+  type SyncReportView,
+  type SyncStatusView,
 } from "@/lib/projects";
 
 const STORAGE_KEY = "flowcard.projectId";
@@ -51,6 +55,12 @@ export type ProjectsData = {
     id: string,
     input: { repo?: string; urlTemplate?: string; clear?: boolean },
   ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  /** 当前项目的同步状态（`GET /api/projects/:id/sync`；没同步过 / 接口没有时为 null） */
+  syncStatus: SyncStatusView | null;
+  /** true = 正在跑一轮同步（按钮转圈） */
+  syncing: boolean;
+  /** 「立即同步」：跑一轮并刷新卡片与状态（服务端要重启后才有这个接口时给可读文案） */
+  syncNow: () => Promise<{ ok: true; report: SyncReportView } | { ok: false; message: string }>;
   refresh: () => Promise<void>;
 };
 
@@ -131,5 +141,65 @@ export function useProjects(): ProjectsData {
 
   const selected = projects.find((project) => project.id === selectedId) ?? null;
 
-  return { projects, selected, loading, error, unavailable, select, add, setIssueBase, refresh };
+  /**
+   * 同步状态：跟着**选中的项目**走（每个项目各自记 `lastSyncAt`）。
+   * 拿不到就保持 null（徽标区域只显示「还没同步」），不因为同步接口缺失把项目面板搞崩。
+   */
+  const [syncStatus, setSyncStatus] = useState<SyncStatusView | null>(null);
+  const [syncing, setSyncing] = useState(false);
+
+  const loadSyncStatus = useCallback(async (projectId: string) => {
+    const result = await fetchSyncStatus(projectId);
+    setSyncStatus(result.ok ? result.status : null);
+  }, []);
+
+  useEffect(() => {
+    if (!selected) {
+      setSyncStatus(null);
+      return;
+    }
+    let alive = true;
+    void fetchSyncStatus(selected.id).then((result) => {
+      if (alive) setSyncStatus(result.ok ? result.status : null);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [selected?.id]);
+
+  const syncNow = useCallback<ProjectsData["syncNow"]>(async () => {
+    if (!selected) return { ok: false, message: "先选一个项目" };
+    setSyncing(true);
+    try {
+      const result = await runProjectSync(selected.id);
+      await loadSyncStatus(selected.id);
+      if (!result.ok) return { ok: false, message: result.message };
+      if (result.report.reason !== null && result.report.reason !== undefined) {
+        const why: Record<string, string> = {
+          "no-remote": "这个项目的 remote 认不出目标仓库",
+          "no-credentials": "本机没有可用凭据（tea 登录 / FLOWCARD_GITEA_TOKEN / FLOWCARD_GITHUB_TOKEN 都没有）",
+          "no-transport": "凭据与 tea CLI 都拿不到数据",
+        };
+        return { ok: false, message: `同步没跑成：${why[result.report.reason] ?? result.report.reason}` };
+      }
+      return { ok: true, report: result.report };
+    } finally {
+      setSyncing(false);
+    }
+  }, [selected, loadSyncStatus]);
+
+  return {
+    projects,
+    selected,
+    loading,
+    error,
+    unavailable,
+    select,
+    add,
+    setIssueBase,
+    syncStatus,
+    syncing,
+    syncNow,
+    refresh,
+  };
 }

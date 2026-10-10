@@ -202,6 +202,116 @@ export async function addProject(
   return { ok: true, project: parsed.data.project, created: parsed.data.created ?? true };
 }
 
+// ---------------------------------------------------------------- 同步（只读轮询）
+
+const degradationSchema = z.looseObject({
+  endpoint: z.string(),
+  reason: z.string(),
+  status: z.number().nullable().optional(),
+  detail: z.string().optional(),
+});
+
+/** `GET /api/projects/:id/sync`：上次同步时刻 / 降级 / 已绑编号数（纯读，不触发网络）。 */
+export const syncStatusSchema = z.looseObject({
+  projectId: z.string(),
+  lastSyncAt: z.string().nullable(),
+  degraded: z.array(degradationSchema),
+  notes: z.array(z.string()),
+  counts: z
+    .looseObject({ issues: z.number(), pulls: z.number(), comments: z.number() })
+    .nullable()
+    .optional(),
+  lastError: z.string().nullable().optional(),
+  tracked: z.looseObject({ issues: z.number(), pulls: z.number() }),
+});
+
+export type SyncStatusView = z.infer<typeof syncStatusSchema>;
+
+/** `POST /api/projects/:id/sync` 的报告（**服务端永不返回 token**，这里也没有对应字段）。 */
+const syncReportSchema = z.looseObject({
+  ok: z.boolean(),
+  projectId: z.string(),
+  fetchedAt: z.string(),
+  since: z.string().nullable().optional(),
+  reason: z.string().nullable().optional(),
+  source: z.string().nullable().optional(),
+  counts: z.looseObject({ issues: z.number(), pulls: z.number(), comments: z.number() }),
+  facts: z.number(),
+  applied: z.number(),
+  duplicates: z.number(),
+  degraded: z.array(degradationSchema),
+  notes: z.array(z.string()),
+  numbers: z.looseObject({ issues: z.number(), pulls: z.number() }),
+  dryRun: z.boolean().optional(),
+  cardIds: z.array(z.string()).optional(),
+  types: z.array(z.string()).optional(),
+});
+
+export type SyncReportView = z.infer<typeof syncReportSchema>;
+
+export type SyncStatusResult =
+  | { ok: true; status: SyncStatusView }
+  | { ok: false; message: string; unavailable: boolean };
+
+export type RunSyncResult =
+  | { ok: true; report: SyncReportView }
+  | { ok: false; message: string; unavailable: boolean };
+
+export async function fetchSyncStatus(projectId: string, signal?: AbortSignal): Promise<SyncStatusResult> {
+  let res: Response;
+  try {
+    res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}/sync`), {
+      signal,
+      headers: { accept: "application/json" },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    return { ok: false, message: unreachableMessage(error), unavailable: true };
+  }
+  if (res.status === 404) {
+    return { ok: false, message: "服务端还没有 GET /api/projects/:id/sync（同步接口未实现）", unavailable: true };
+  }
+  if (!res.ok) return { ok: false, message: await readErrorBody(res), unavailable: false };
+  const parsed = syncStatusSchema.safeParse(await res.json().catch(() => null));
+  if (!parsed.success) {
+    return {
+      ok: false,
+      message: `同步状态不符合契约（HTTP ${res.status}）：${describeIssues(parsed.error)}`,
+      unavailable: true,
+    };
+  }
+  return { ok: true, status: parsed.data };
+}
+
+/** 触发一轮同步（只读远程）。降级不抛：`reason !== null` 时报告里说明为什么没跑成。 */
+export async function runProjectSync(projectId: string, signal?: AbortSignal): Promise<RunSyncResult> {
+  let res: Response;
+  try {
+    res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}/sync`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    return { ok: false, message: unreachableMessage(error), unavailable: true };
+  }
+  if (res.status === 404) {
+    return { ok: false, message: "服务端还没有 POST /api/projects/:id/sync（同步接口未实现）", unavailable: true };
+  }
+  if (!res.ok) return { ok: false, message: await readErrorBody(res), unavailable: false };
+  const parsed = syncReportSchema.safeParse(await res.json().catch(() => null));
+  if (!parsed.success) {
+    return {
+      ok: false,
+      message: `同步报告不符合契约（HTTP ${res.status}）：${describeIssues(parsed.error)}`,
+      unavailable: false,
+    };
+  }
+  return { ok: true, report: parsed.data };
+}
+
 /** remote 短形：`git@github.com:owner/repo.git` / `https://host/owner/repo.git` → `owner/repo`。 */
 export function shortRemote(remote: string | undefined): string | null {
   if (!remote) return null;

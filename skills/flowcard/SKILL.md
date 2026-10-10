@@ -17,12 +17,12 @@ description: 用 flowcard 工作台干活（一张卡 = 一次会话）。当你
 
 ```bash
 flowcard open --body "需求正文（标题可省，服务端派生）"     # ① 开卡：直接落「待开工」
-flowcard worktree <card> --path .worktrees/x --branch feat/x   # ② 绑 worktree
+flowcard worktree <card> --path .worktrees/x --branch <前缀>/x   # ② 绑 worktree（前缀看改动性质）
 cd .worktrees/x && omp -e ~/workspace/flowcard/src/adapters/omp/flowcard-omp-adapter.ts
                                                           # ③ 在 worktree 里启动会话：
                                                           #    按 cwd 自动认卡 → 自动进「实施中」
 flowcard issue <card> --number 742    # Issue 只填数字，repo/url 由项目基址拼出来
-flowcard pr <card> --number 7 --url <链接> --branch feat/x     # WIP PR（交付要件）
+flowcard pr <card> --number 7 --url <链接> --branch <前缀>/x     # WIP PR（交付要件）
 flowcard push <card> --sha <sha>      # 推送记录（进度要看得见）
 flowcard end <card> --summary "做完什么"                       # ④ 交回 → 自动进「待验收」
 ```
@@ -51,7 +51,7 @@ flowcard end <card> --summary "做完什么"                       # ④ 交回 
 # 远程写（一事一议）
 
 ```bash
-flowcard confirm <card> --request --for push --detail "git push -u origin feat/x"
+flowcard confirm <card> --request --for push --detail "git push -u origin <分支>"
 flowcard confirm <card> --list      # 只有 approved 且没用过的授权才能执行
 flowcard confirm <card> --consume cf1   # 执行完回报：作废
 ```

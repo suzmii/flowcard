@@ -9,9 +9,10 @@
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
 import { shortHash } from "../shared/hash.ts";
-import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type IssueRef, type Project, type Rejection } from "../shared/types.ts";
+import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type IssueRef, type PrRef, type Project, type Rejection, type SyncFactIn } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 import { reviewAnchor } from "./review.ts";
+import { factKey } from "./sync.ts";
 
 export type CommandOutcome = {
   events: NewEvent[];
@@ -113,6 +114,20 @@ export function resolveIssueRef(
   };
 }
 
+/**
+ * 同步事实 → 卡片上的 PR 状态。三条规矩（都是为了「不拿更弱的信息覆盖更强的已知事实」）：
+ *
+ * 1. 事实确认合并（`merged:true` 或 `state:"merged"`）→ `merged`；
+ * 2. 事实说 `open` 而卡片已经是 `draft` → **保留 `draft`**（draft 比 open 精确，不能降级）；
+ * 3. 事实是 `closed` 但 `merged` 未知（tea CLI 兜底拿不到这个位）而卡片已知 `merged` → 保留 `merged`。
+ */
+export function nextPrState(pr: PrRef, fact: Extract<SyncFactIn, { kind: "pr.state" }>): PrRef["state"] {
+  if (fact.merged === true || fact.state === "merged") return "merged";
+  if (fact.state === "open") return pr.state === "draft" ? "draft" : "open";
+  if (fact.merged === null && pr.state === "merged") return "merged";
+  return "closed";
+}
+
 export function runCommand(input: {
   flow: Flow;
   getCard: (id: string) => Card | undefined;
@@ -149,13 +164,15 @@ export function runCommand(input: {
   };
 
   const emit = (cardId: string, type: EventType, payload: Record<string, unknown>, key: string): void => {
+    // `applySync` 的事实自带幂等键（`factKey`），没有命令级的 `dedupeKey` 可拼。
+    const prefix = "dedupeKey" in cmd ? cmd.dedupeKey : undefined;
     events.push({
       at: now,
       actor: cmd.actor,
       cardId,
       type,
       payload,
-      dedupeKey: cmd.dedupeKey ? `${cmd.dedupeKey}#${key}` : key,
+      dedupeKey: prefix ? `${prefix}#${key}` : key,
     });
   };
 
@@ -669,6 +686,77 @@ export function runCommand(input: {
         `review-verdict:${cmd.card}:${cmd.verdict}:${shortHash(cmd.body ?? "")}:from:${from}`,
       );
       notes.push(`评审判定已记录：${cmd.verdict}（不改流程状态：验收仍由人在看板上点 G3）`);
+      break;
+    }
+
+    /**
+     * 同步事实 → 事件。**每张卡一条命令**（同步器按编号解析好 card），事实只有一条路进来：
+     * 幂等键一律 `factKey(fact)`，所以同一事实重复同步只会落一次。
+     * 编号与卡片对不上就跳过（同步器已经按已绑编号过滤过，这里是兜底）。
+     */
+    case "applySync": {
+      if (!get(cmd.card)) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      for (const fact of cmd.facts) {
+        const card = get(cmd.card)!;
+        if (fact.kind === "issue.state") {
+          if (card.issue?.number !== fact.number) continue;
+          emit(
+            cmd.card,
+            "issue.state.changed",
+            { number: fact.number, state: fact.state, title: fact.title, updatedAt: fact.updatedAt },
+            factKey(fact),
+          );
+        } else if (fact.kind === "pr.state") {
+          if (card.pr?.number !== fact.number) continue;
+          const state = nextPrState(card.pr, fact);
+          const merged = state === "merged";
+          emit(
+            cmd.card,
+            merged ? "pr.merged" : "pr.updated",
+            { pr: { ...card.pr, state, branch: fact.head !== "" ? fact.head : card.pr.branch } },
+            factKey(fact),
+          );
+        } else {
+          emit(
+            cmd.card,
+            "remote.comment.added",
+            {
+              id: fact.id,
+              issueNumber: fact.issueNumber,
+              author: fact.author,
+              body: fact.body,
+              at: fact.at,
+              url: fact.url,
+            },
+            factKey(fact),
+          );
+        }
+        applyPending();
+      }
+      break;
+    }
+
+    /**
+     * 远端评论标记已读（人打开详情时前端调）。`ids` 不给 = 当前全部未读；
+     * 一条未读都没有就**不发事件** —— 所以连着调两次的第二次是空操作（幂等）。
+     */
+    case "markRemoteCommentsRead": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      const wanted = cmd.ids ? new Set(cmd.ids) : null;
+      const ids = card.remoteComments
+        .filter((comment) => !comment.read && (wanted === null || wanted.has(comment.id)))
+        .map((comment) => comment.id);
+      if (ids.length === 0) {
+        notes.push("没有未读的远端评论，跳过");
+        break;
+      }
+      emit(
+        cmd.card,
+        "remote.comments.read",
+        { ids },
+        `remote-read:${cmd.card}:${shortHash(ids.join(","))}`,
+      );
       break;
     }
 

@@ -87,6 +87,17 @@ const commentSchema = z.looseObject({
   body: z.string(),
 });
 
+/** 远端评论（`Card.remoteComments`，同步进来的只读投影）；老投影缺这个字段时按空数组处理。 */
+const remoteCommentSchema = z.looseObject({
+  id: z.number(),
+  issueNumber: z.number(),
+  author: z.string(),
+  body: z.string(),
+  at: z.string(),
+  url: z.string(),
+  read: z.boolean().default(false),
+});
+
 /**
  * 代码评审（`Card.review`，恒存在）：行级注释 + 最后一次判定。
  * 与共享契约 `src/shared/types.ts` 的 `Review` 用文件末尾的编译期断言锁在一起。
@@ -142,6 +153,8 @@ export const cardViewSchema = z.looseObject({
   confirmations: z.array(confirmationSchema),
   pushes: z.array(pushSchema),
   comments: z.array(commentSchema),
+  /** 同步进来的远端评论（只读）；老投影缺这个字段时按空数组处理 */
+  remoteComments: z.array(remoteCommentSchema).default([]),
   /** 代码评审（本地事实）；老投影缺这个字段时按"空评审"处理，别让整个看板解析失败 */
   review: reviewSchema.default(() => ({ comments: [] })),
   partOf: z.string().optional(),

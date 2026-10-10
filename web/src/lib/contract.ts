@@ -11,6 +11,7 @@ export type {
   ConfirmStatus,
   Confirmation,
   Gate,
+  RemoteComment,
   Review,
   ReviewComment,
   ReviewSide,

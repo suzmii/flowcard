@@ -14,6 +14,7 @@ import {
   Loader2,
   Pencil,
   Plus,
+  RefreshCw,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,19 +28,28 @@ import {
   type CandidateView,
   type IssueBase,
   type ProjectView,
+  type SyncReportView,
+  type SyncStatusView,
 } from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
 
 /** 模板输入的占位例子：说清 `{number}` 才是被替换的那一段。 */
 const ISSUE_TEMPLATE_PLACEHOLDER = "https://git.example.com/git/Team/Repo/issues/{number}";
 
-/** 项目元数据一行：remote / 分支 / 最后提交 / 脏文件数 / Issue 基址。 */
+/** 项目元数据一行：remote / 分支 / 最后提交 / 脏文件数 / Issue 基址 / 同步状态。 */
 function ProjectMeta({
   project,
+  syncStatus,
+  syncing,
   onEditIssueBase,
+  onSync,
 }: {
   project: ProjectView;
+  /** 同步状态（`GET /api/projects/:id/sync`）；拿不到/接口没实现时为 null */
+  syncStatus: SyncStatusView | null;
+  syncing: boolean;
   onEditIssueBase?: () => void;
+  onSync: () => void;
 }) {
   const remote = shortRemote(project.remote);
   const base = projectIssueBase(project);
@@ -47,6 +57,13 @@ function ProjectMeta({
   const baseLabel = base.urlTemplate
     ? `Issue ${base.repo ? `${base.repo} · ` : ""}${base.urlTemplate.replace(/^https?:\/\//, "")}`
     : "Issue 基址未设置";
+  const degraded = syncStatus?.degraded ?? [];
+  const syncLabel =
+    syncStatus?.lastError != null
+      ? `同步失败：${syncStatus.lastError}`
+      : syncStatus?.lastSyncAt
+        ? `最后同步 ${timeAgo(syncStatus.lastSyncAt)}`
+        : "还没同步过";
 
   return (
     <div className="flex flex-wrap items-center gap-1.5" data-testid="project-meta">
@@ -104,7 +121,47 @@ function ProjectMeta({
           改 Issue 基址
         </Button>
       ) : null}
-      {project.virtual ? <Badge variant="muted">合成项目（未归属的卡）</Badge> : null}
+      {project.virtual ? (
+        <Badge variant="muted">合成项目（未归属的卡）</Badge>
+      ) : (
+        <>
+          <Badge
+            variant={syncStatus?.lastError != null ? "danger" : degraded.length > 0 ? "warning" : "outline"}
+            data-testid="project-sync-status"
+            title={syncStatus?.lastSyncAt ? `上次同步：${syncStatus.lastSyncAt}` : "这个项目还没同步过"}
+          >
+            <RefreshCw className={syncing ? "animate-spin" : undefined} />
+            {syncLabel}
+          </Badge>
+          {degraded.length > 0 ? (
+            <Badge
+              variant="warning"
+              data-testid="project-sync-degraded"
+              title={degraded
+                .map((item) => `${item.endpoint}：${item.reason}${item.detail ? ` —— ${item.detail}` : ""}`)
+                .join("\n")}
+            >
+              <AlertTriangle />
+              本轮数据可能不全（{degraded.length}）
+            </Badge>
+          ) : null}
+          {syncStatus ? (
+            <Badge variant="muted" title="卡片已绑定的编号数（同步只精确读这些）">
+              已绑 {syncStatus.tracked.issues} issue / {syncStatus.tracked.pulls} PR
+            </Badge>
+          ) : null}
+          <Button
+            size="xs"
+            variant="outline"
+            data-testid="project-sync-now"
+            disabled={syncing}
+            onClick={onSync}
+          >
+            <RefreshCw className={syncing ? "animate-spin" : undefined} />
+            {syncing ? "同步中…" : "立即同步"}
+          </Button>
+        </>
+      )}
     </div>
   );
 }
@@ -115,15 +172,21 @@ export function ProjectSwitcher({
   loading,
   error,
   unavailable,
+  syncStatus,
+  syncing,
   onSelect,
   onAdd,
   onSetIssueBase,
+  onSync,
 }: {
   projects: ProjectView[];
   selected: ProjectView | null;
   loading: boolean;
   error: string | null;
   unavailable: boolean;
+  /** 当前项目的同步状态（`GET /api/projects/:id/sync`） */
+  syncStatus: SyncStatusView | null;
+  syncing: boolean;
   onSelect: (id: string) => void;
   onAdd: (
     path: string,
@@ -133,6 +196,8 @@ export function ProjectSwitcher({
     id: string,
     input: { repo?: string; urlTemplate?: string; clear?: boolean },
   ) => Promise<{ ok: true; project: ProjectView } | { ok: false; message: string }>;
+  /** 「立即同步」：跑一轮只读同步；返回结果由这里出面提示 */
+  onSync: () => Promise<{ ok: true; report: SyncReportView } | { ok: false; message: string }>;
 }) {
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
@@ -286,6 +351,23 @@ export function ProjectSwitcher({
     }
   };
 
+  /** 「立即同步」：结果在这里提示（成功把这一轮读了什么报出来，人知道游标的窗口有多宽）。 */
+  const runSyncNow = async () => {
+    setNotice(null);
+    const result = await onSync();
+    if (!result.ok) {
+      setNotice({ tone: "error", text: result.message });
+      return;
+    }
+    const { counts, applied, duplicates, facts } = result.report;
+    setNotice({
+      tone: "ok",
+      text:
+        `同步完成：读到 issue ${counts.issues} / PR ${counts.pulls} / 评论 ${counts.comments}，` +
+        `算出事实 ${facts} 条（落库 ${applied}，重复 ${duplicates}）`,
+    });
+  };
+
   return (
     <div className="space-y-1.5" data-testid="project-switcher">
       <div className="flex flex-wrap items-center gap-2">
@@ -322,7 +404,13 @@ export function ProjectSwitcher({
           添加项目
         </Button>
         {selected ? (
-          <ProjectMeta project={selected} onEditIssueBase={() => openBaseEditor(selected)} />
+          <ProjectMeta
+            project={selected}
+            syncStatus={syncStatus}
+            syncing={syncing}
+            onEditIssueBase={() => openBaseEditor(selected)}
+            onSync={() => void runSyncNow()}
+          />
         ) : null}
       </div>
 

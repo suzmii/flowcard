@@ -32,17 +32,17 @@ node src/cli/main.ts project add ~/workspace/myrepo     # 先登记项目（看�
 node src/cli/main.ts open --body "## 修好登录页…"        # 建卡：标题可选（服务端按正文派生），项目按 cwd 解析
 node src/cli/main.ts attach ~/shot.png                  # 传图，打印 ![](/api/attachments/<id>) 直接贴进正文
 node src/cli/main.ts open --title "做点事" --issue myrepo#12 --url https://…/issues/12
-node src/cli/main.ts worktree c1 --path .worktrees/x --branch feat/x
+node src/cli/main.ts worktree c1 --path .worktrees/x --branch <前缀>/x   # 前缀看改动性质：feat/fix/chore/…
 node src/cli/main.ts claim c1 --harness omp --session <id> --cwd .worktrees/x
-node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch feat/x
+node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch <前缀>/x
 node src/cli/main.ts push c1 --sha <sha>
-node src/cli/main.ts confirm c1 --request --for push --detail "git push -u origin feat/x"
+node src/cli/main.ts confirm c1 --request --for push --detail "git push -u origin <分支>"
 node src/cli/main.ts confirm c1 --list                  # 人看完 detail 再批：只覆盖这一次动作
 node src/cli/main.ts confirm c1 --approve cf1 --reason "看过了"
 node src/cli/main.ts confirm c1 --consume cf1           # agent 执行完回报：这条授权作废
 node src/cli/main.ts end c1 --summary "做完了"
 node src/cli/main.ts accept c1                          # 人验收
-node src/cli/main.ts cleanup c1 --item "删 .worktrees/x" --item "删分支 feat/x"
+node src/cli/main.ts cleanup c1 --item "删 .worktrees/x" --item "删分支 <前缀>/x"
 node src/cli/main.ts gate c1 --gate G4 --approve && node src/cli/main.ts cleanup c1
 node src/cli/main.ts diff c1                            # 看这一片的 diff（JSON 摘要；--patch 打原始 unified diff）
 node src/cli/main.ts review c1 --comment --path src/x.ts --line 12 --body "这里要判空"

@@ -46,8 +46,8 @@
 - 会话在别处的 linked worktree → 仍接受，`source` 推断为 `"harness"`（见 §9 限制）；
 - **detached HEAD**（`--abbrev-ref HEAD` 返回空或字面量 `HEAD`）→ `branch=null`、`detached=true`、`bindable=null`，
   **一律不回写 worktree**（首次绑定也不回写，见 §7）。理由：`branch` 是绑卡后开 PR / 清理要用的字段，
-  探测是自动跑的，**自动写绝不能让卡片信息变差**——用 `detached` 覆盖掉原本正确的 `feat/x` 是净损失。
-  此时只给 note/hint：`要绑卡请先在里面 \`git switch -c feat/<名字>\``。
+  探测是自动跑的，**自动写绝不能让卡片信息变差**——用 `detached` 覆盖掉原本正确的分支（如 `fix/x` 这类真分支名） 是净损失。
+  此时只给 note/hint：`要绑卡请先在里面 \`git switch -c <前缀>/<名字>\``。
 
 ## 4. PR / CI 探测（可降级）
 
@@ -78,7 +78,7 @@
 | 分支无 upstream | `unpushedCommits=null`（**不 fetch**，只读本地 ref）；退到 `origin/HEAD` 算 `commitsSinceBase` |
 | `cwd` 不在 git 仓库里 | `probe.ok=false` + note；若卡片有 `repoPath` 则退回它探测 |
 | git 输出里没有 worktree（主仓库） | worktree 槽位不回写，给提示 |
-| worktree 处于 **detached HEAD** | worktree 槽位**不回写**（首次绑定也不写），note/hint「先 `git switch -c feat/<名字>`」 |
+| worktree 处于 **detached HEAD** | worktree 槽位**不回写**（首次绑定也不写），note/hint「先 `git switch -c <前缀>/<名字>`」 |
 | 单个工具命令超时（10 s） | kill 后按失败处理并降级 |
 
 ## 6. 本机 gh / tea 实测状态（2026-10-10）
@@ -121,7 +121,7 @@ stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / detache
 
 ```
 会话 cwd 是主仓库 /path/to/repo，不是 worktree：请 /wt <branch> 或 /move <worktree 路径>
-会话所在的 worktree /path/to/repo/.worktrees/demo 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c feat/<名字> 再绑卡
+会话所在的 worktree /path/to/repo/.worktrees/demo 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c <前缀>/<名字> 再绑卡
 ```
 
 ## 9. 已知限制
@@ -134,7 +134,7 @@ stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / detache
 - 自建 Gitea 的 PR URL 可能是 `http://`（本机实测就是），我们是原样记录 URL，不做规范化。
 - `git < 2.31` 不支持 `--path-format=absolute`，已带相对路径兜底，但未在本机（git 2.56）实测。
 - **detached HEAD 的 worktree 不会绑到卡片上**：卡片上的 `worktree.branch` 必须是真分支名（要用来开 PR / 清理）。
-  会话停在 detached HEAD 时只提示、不写卡；想绑就先 `git switch -c feat/<名字>`。
+  会话停在 detached HEAD 时只提示、不写卡；想绑就先 `git switch -c <前缀>/<名字>`。
 - 探测只读、不修改卡片：拿不到的信号不会伪造，也不会把卡片搞坏。
 
 ## 10. 复现

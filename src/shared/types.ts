@@ -178,6 +178,25 @@ export type PushRecord = { sha: string; at: string; actor: Actor };
 
 export type Comment = { id: string; at: string; actor: Actor; body: string };
 
+/**
+ * 从 forge 同步回来的评论（issue / PR 上的）：**只读投影**，不代表本地评论。
+ * 与 `Comment` 分开存（`Card.remoteComments`），免得远端评论混进本地评论的时间线；
+ * `read` 由人打开详情时调的 `markRemoteCommentsRead` 置位，卡片磁贴上的「N 条新评论」数它。
+ */
+export type RemoteComment = {
+  /** forge 上的评论 id（幂等键 `sync:comment:{id}` 用的就是它）。 */
+  id: number;
+  /** 评论挂在哪个编号上：issue 或 PR 的编号（两者共用一个号池）。 */
+  issueNumber: number;
+  author: string;
+  body: string;
+  /** 发表时间（UTC ISO，由同步层归一化）。 */
+  at: string;
+  /** 远端链接；抠不出时为 `""`（不伪造）。 */
+  url: string;
+  read: boolean;
+};
+
 /** 卡片自己的项目运行时（启动按钮管的就是它）。进程的 spawn/kill 在适配层，这里只是事件投影。 */
 export type RuntimeStatus = "stopped" | "starting" | "running" | "failed";
 
@@ -246,6 +265,8 @@ export type Card = {
   confirmations: Confirmation[];
   pushes: PushRecord[];
   comments: Comment[];
+  /** 远端评论（同步进来的，只读）；恒存在，空数组也要能渲染。 */
+  remoteComments: RemoteComment[];
   /** 代码评审（本地事实：行级注释 + 判定）。恒存在，空也要能渲染。 */
   review: Review;
   partOf?: string;
@@ -267,6 +288,9 @@ export type EventType =
   | "card.accepted"
   | "card.blocked"
   | "issue.bound"
+  | "issue.state.changed"
+  | "remote.comment.added"
+  | "remote.comments.read"
   | "worktree.bound"
   | "worktree.removed"
   | "pr.bound"
@@ -360,6 +384,42 @@ export const prInSchema = z.object({
   state: z.enum(["draft", "open", "merged", "closed"]).default("open"),
   ci: z.enum(["pending", "pass", "fail"]).optional(),
 });
+
+/**
+ * 同步事实的结构（`server/sync.ts` 的 `SyncFact` 的镜像）：只描述形状，不含任何凭据/传输细节。
+ * 放在共享层是因为它是**跨边界契约**（HTTP body → 引擎），`server/syncer.ts` 用编译期断言锁住两边一致。
+ */
+export const syncFactSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("issue.state"),
+    number: z.number().int().positive(),
+    state: z.enum(["open", "closed"]),
+    title: z.string(),
+    updatedAt: z.string(),
+  }),
+  z.object({
+    kind: z.literal("pr.state"),
+    number: z.number().int().positive(),
+    state: z.enum(["open", "closed", "merged"]),
+    /** `null` = 传输拿不到 merged 位（tea CLI 兜底），不瞎填。 */
+    merged: z.boolean().nullable(),
+    head: z.string(),
+    base: z.string(),
+    url: z.string(),
+    updatedAt: z.string(),
+  }),
+  z.object({
+    kind: z.literal("remote.comment"),
+    id: z.number().int().positive(),
+    issueNumber: z.number().int().positive(),
+    author: z.string(),
+    body: z.string(),
+    at: z.string(),
+    url: z.string(),
+  }),
+]);
+
+export type SyncFactIn = z.infer<typeof syncFactSchema>;
 
 /** CLI / HTTP 的命令体：一条命令 = 一次写入意图。 */
 export const commandSchema = z.discriminatedUnion("cmd", [
@@ -591,6 +651,27 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     body: z.string().optional(),
     dedupeKey: z.string().optional(),
   }),
+  /**
+   * 同步事实：**服务端同步器唯一的写入口**（引擎把它翻成事件，幂等键就是 `factKey(fact)`）。
+   * 形状与 `server/sync.ts` 的 `SyncFact` 一致（那里有编译期断言锁住）；`card` 由同步器按编号解析好。
+   */
+  z.object({
+    cmd: z.literal("applySync"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    facts: z.array(syncFactSchema).min(1),
+  }),
+  /**
+   * 远端评论标记已读：人打开卡片详情时前端调它。`ids` 不给 = 当前所有未读。
+   * 已经全读过时**不产生事件**（幂等：连着调两次只有第一次有效）。
+   */
+  z.object({
+    cmd: z.literal("markRemoteCommentsRead"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    ids: z.array(z.number().int().positive()).optional(),
+    dedupeKey: z.string().optional(),
+  }),
 ]);
 
 export type Command = z.infer<typeof commandSchema>;
@@ -628,6 +709,23 @@ export const issueBaseInSchema = z.object({
   issueRepo: z.string().trim().min(1).optional(),
   issueUrlTemplate: z.string().trim().min(1).optional(),
   clear: z.boolean().optional(),
+});
+
+/**
+ * POST /api/projects/:id/sync 的 body：三个都可选，全不给 = 一轮常规同步
+ * （精确读已绑编号 + 每仓库一次评论增量）。`since` 必须是能解析的时间。
+ */
+export const syncRequestSchema = z.object({
+  since: z
+    .string()
+    .trim()
+    .min(1)
+    .refine((value) => Number.isFinite(Date.parse(value)), "since 要是能解析的时间（ISO 8601）")
+    .optional(),
+  /** `true` = 手动全量列表模式（`sync.ts` 的 `pollRemote`）。 */
+  list: z.boolean().optional(),
+  /** `true` = 只算事实不落库。 */
+  dryRun: z.boolean().optional(),
 });
 
 // ---------------------------------------------------------------- 只读视图：提交图 / diff

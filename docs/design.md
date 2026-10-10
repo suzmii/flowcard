@@ -120,7 +120,7 @@ type Project = {
 | # | 必要项目 | 完成判据 | 动作性质 |
 |---|---|---|---|
 | 1 | **Issue**（建或查） | `issue != null` | 远程写（建 Issue）→ 需确认 |
-| 2 | **worktree + 分支** | `worktree != null` **且 `session.cwd` 落在 `worktree.path` 内**（会话真的在里面干活）；分支名 `feat/*` `fix/*` | 本地（或委托 harness 的 `/wt`） |
+| 2 | **worktree + 分支** | `worktree != null` **且 `session.cwd` 落在 `worktree.path` 内**（会话真的在里面干活）；分支名按改动性质起（前缀跟仓库惯例：feat / fix / chore / docs / refactor…） | 本地（或委托 harness 的 `/wt`） |
 | 3 | **WIP PR** | `pr != null`（任务一开始就建） | 远程写 → 需确认 |
 | 4 | **推送记录** | 至少一条 push 事件（每天可见进度） | 远程写 → 需确认 |
 | 5 | **验收** | `acceptedAt != null`（人明确验收） | 人工门禁 |
@@ -155,8 +155,8 @@ type Project = {
 
 | 方式 | 步骤 | 何时用 |
 |---|---|---|
-| **A 委托 harness（默认）** | 会话内执行 `/wt feat/xxx` → 绑定 harness 报回的 cwd | 会话已经开着、手上还有未提交改动 |
-| **B flowcard 建** | `flowcard worktree add <card> --branch feat/xxx` 建 `.worktrees/<名字>` → 要求会话 `/move <worktree>`（或直接在 worktree 里重开会话） | 想严格控制 worktree 路径与分支名 |
+| **A 委托 harness（默认）** | 会话内执行 `/wt <前缀>/xxx` → 绑定 harness 报回的 cwd | 会话已经开着、手上还有未提交改动 |
+| **B flowcard 建** | `flowcard worktree add <card> --branch <前缀>/xxx` 建 `.worktrees/<名字>` → 要求会话 `/move <worktree>`（或直接在 worktree 里重开会话） | 想严格控制 worktree 路径与分支名 |
 
 配套的校验与兜底（都是自动的，不靠人自觉）：
 
@@ -338,11 +338,11 @@ flowcard project issue-base <项目 id 或路径> [--repo <owner/repo>] [--templ
 flowcard open   [--title "…"] [--body …] [--project <id>] [--issue 742 | --issue <owner/repo>#742] [--url <链接>]  # 开卡（落 ready）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local；带 Issue 就顺手绑
 flowcard attach <图片> [--name <文件名>]                    # 传图（png/jpg/jpeg/gif/webp ≤10MB），打印 markdown 直接贴进正文/评论
 flowcard issue  <card> --number 742 [--repo …] [--url …]   # 绑 Issue 槽位（只填编号，repo/url 由项目基址补）；这是必要项目，不是阶段
-flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
+flowcard worktree <card> --add --branch <前缀>/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
 flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 会话进入卡片（不给 card 时服务端按 cwd 反查）→ 自动进 working
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
-flowcard confirm <card> --request --for push --detail "git push -u origin feat/x"  # 申请一次远程写确认（G2）
+flowcard confirm <card> --request --for push --detail "git push -u origin <分支>"  # 申请一次远程写确认（G2）
 flowcard confirm <card> [--list]                          # 看这张卡的确认与历史（含已批准未用；不给动作标志就是列）
 flowcard confirm <card> --approve <cf-id> [--reason "…"]   # 人批准：只覆盖这一次动作
 flowcard confirm <card> --reject <cf-id> --reason "…"      # 人驳回：理由必填

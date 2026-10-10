@@ -26,6 +26,7 @@ import {
 import { runCommand, type CommandOutcome } from "./engine.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 import { localProject, projectIdFor } from "./projects.ts";
+import type { Degradation, SyncPrev } from "./sync.ts";
 
 export type ExecuteResult = {
   outcome: CommandOutcome;
@@ -105,8 +106,26 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  * v4：卡片新增 `review` 槽位（行级评审注释 + 判定），老投影里没有 → 重放补上。
  * v5：状态从 9 个缩到 7 个（删 `inbox` / `issue` 两层中转）→ 老事件里的这两个状态投影成 `ready`，
  *     建卡直接落 `ready`，所以形态变了、必须重放。
+ * v6：卡片新增 `remoteComments`（同步进来的远端评论），老投影里没有 → 重放补上空数组。
  */
-export const PROJECTION_VERSION = "5";
+export const PROJECTION_VERSION = "6";
+
+/**
+ * 一个项目上一轮同步的结果（按项目存在 `meta` 表里，**不进事件流**）：
+ * 它是「我们什么时候看过远程」的记录，不是业务事实，重建投影不需要它。
+ * `prev` 只用来省掉无谓的引擎调用；丢了也能跑（`dedupeKey` 兜底幂等）。
+ */
+export type ProjectSyncState = {
+  /** 上一次同步完成时刻（UTC ISO）；`since` 游标 = 它 - 60 s。 */
+  at: string;
+  /** 上一轮的端点降级（空 = 三个端点都完整）。 */
+  degraded: Degradation[];
+  notes: string[];
+  counts: { issues: number; pulls: number; comments: number };
+  prev?: SyncPrev;
+  /** 上一轮整体没跑成的原因（没凭据等）；成功一轮后清掉。 */
+  lastError?: string;
+};
 
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */
@@ -123,6 +142,10 @@ export type Store = {
   upsertProject(project: Project, now?: string): UpsertProjectResult;
   /** 按绝对路径解析所属项目（最具体命中）；不在任何项目内（或只有合成项目）返回 undefined。 */
   projectForPath(path: string): Project | undefined;
+  /** 上一轮同步的结果（没同步过返回 undefined）。 */
+  getSyncState(projectId: string): ProjectSyncState | undefined;
+  /** 记住这一轮同步（`lastSyncAt` / 上轮摘要 / 降级）。 */
+  setSyncState(projectId: string, state: ProjectSyncState): void;
   /** 存一张图片附件（内容寻址，幂等）；校验不过返回 error。 */
   appendAttachment(input: { name: string; mime: string | undefined; bytes: Uint8Array }, now?: string): AppendAttachmentResult;
   getAttachment(id: string): { attachment: Attachment; bytes: Uint8Array } | undefined;
@@ -370,6 +393,24 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     return hits[0];
   };
 
+  // ---------------------------------------------------------------- 同步状态（按项目，不进事件流）
+
+  const getSyncState = (projectId: string): ProjectSyncState | undefined => {
+    const raw = metaGet(`sync:${projectId}`);
+    if (raw === undefined) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as ProjectSyncState;
+      // 手工改坏/旧版本写坏的值不该把同步整个搞停：形状不对就当没同步过。
+      return typeof parsed?.at === "string" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const setSyncState = (projectId: string, state: ProjectSyncState): void => {
+    metaSet(`sync:${projectId}`, JSON.stringify(state));
+  };
+
   // ---------------------------------------------------------------- 附件（图片）
 
   const attachmentsRoot = attachmentsDir(opts.dataDir);
@@ -505,6 +546,8 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     getProject,
     upsertProject,
     projectForPath,
+    getSyncState,
+    setSyncState,
     appendAttachment,
     getAttachment,
     close() {

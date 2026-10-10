@@ -196,7 +196,7 @@ export function CodeChanges({ card, onRefresh }: { card: CardView; onRefresh: ()
                     ) : (
                       <>
                         这张卡还没有 worktree：先在「必要项目 → worktree + 分支」里绑定
-                        （会话里 <code className="font-mono">/wt feat/xxx</code>，或让 CLI 建），再回来看。
+                        （会话里 <code className="font-mono">/wt &lt;前缀&gt;/xxx</code>，或让 CLI 建），再回来看。
                       </>
                     )}
                   </div>

@@ -74,6 +74,13 @@ export function App() {
     setRefreshing(false);
   }, [board, projects]);
 
+  /** 「立即同步」= 服务端跑一轮只读同步，然后重拉卡片（新徽标立刻可见）。 */
+  const syncNow = useCallback(async () => {
+    const result = await projects.syncNow();
+    await board.refresh();
+    return result;
+  }, [projects, board]);
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-muted/30">
       <header className="space-y-2 border-b bg-background px-4 py-2.5">
@@ -157,9 +164,12 @@ export function App() {
           loading={projects.loading}
           error={projects.error}
           unavailable={projects.unavailable}
+          syncStatus={projects.syncStatus}
+          syncing={projects.syncing}
           onSelect={projects.select}
           onAdd={projects.add}
           onSetIssueBase={projects.setIssueBase}
+          onSync={syncNow}
         />
       </header>
 

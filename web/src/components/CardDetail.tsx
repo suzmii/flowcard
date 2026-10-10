@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { CircleSlash, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { CircleSlash, ExternalLink, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
 import { StateActions } from "@/components/detail/StateActions";
@@ -15,7 +15,7 @@ import { postCommand } from "@/lib/api";
 import { STATE_LABELS, STATE_TONE } from "@/lib/contract";
 import type { IssueBase } from "@/lib/projects";
 import type { CardView } from "@/lib/schema";
-import { timeAgo } from "@/lib/utils";
+import { cn, timeAgo } from "@/lib/utils";
 
 type Notice = { tone: "ok" | "error"; text: string; details: string[] } | null;
 
@@ -48,6 +48,27 @@ export function CardDetail({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
+
+  /**
+   * 打开详情 = 人看到这些评论了 → 自动标已读（`markRemoteCommentsRead`），卡片磁贴上的未读数随之清零。
+   * 用 ref 记住「已经为这批 id 发过命令」，免得刷新回来之前重复发。
+   */
+  const unreadIds = card.remoteComments.filter((comment) => !comment.read).map((comment) => comment.id);
+  const unreadKey = `${card.id}:${unreadIds.join(",")}`;
+  const markedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (unreadIds.length === 0 || markedRef.current === unreadKey) return;
+    markedRef.current = unreadKey;
+    void (async () => {
+      await postCommand({
+        cmd: "markRemoteCommentsRead",
+        actor: { kind: "human", name: "看板" },
+        card: card.id,
+        ids: unreadIds,
+      });
+      await onRefresh();
+    })();
+  }, [unreadKey, unreadIds.length, card.id, onRefresh]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -204,6 +225,46 @@ export function CardDetail({
                       <span className="ml-auto">{timeAgo(comment.at)}</span>
                     </div>
                     <Markdown text={comment.body} />
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          ) : null}
+
+          {card.remoteComments.length > 0 ? (
+            <Section
+              title="远端动态"
+              hint={`${card.remoteComments.length} 条远端评论 · 只读（同步进来的，点标题回远端看）`}
+            >
+              <ul className="space-y-2" data-testid="card-remote-comments">
+                {card.remoteComments.map((comment) => (
+                  <li
+                    key={comment.id}
+                    data-testid={`remote-comment-${comment.id}`}
+                    className={cn(
+                      "rounded-lg border bg-background p-2.5",
+                      !comment.read && "border-sky-600/40 bg-sky-50/40",
+                    )}
+                  >
+                    <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <Badge variant="info">#{comment.issueNumber}</Badge>
+                      <span className="font-mono">{comment.author || "—"}</span>
+                      {comment.read ? <Badge variant="muted">已读</Badge> : <Badge variant="warning">未读</Badge>}
+                      <span className="ml-auto">{timeAgo(comment.at)}</span>
+                    </div>
+                    <Markdown text={comment.body} />
+                    {comment.url ? (
+                      <a
+                        className="mt-1 inline-flex items-center gap-1 text-[11px] text-sky-700 underline"
+                        href={comment.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        data-testid={`remote-comment-link-${comment.id}`}
+                      >
+                        <ExternalLink className="size-3" />
+                        在远端打开
+                      </a>
+                    ) : null}
                   </li>
                 ))}
               </ul>

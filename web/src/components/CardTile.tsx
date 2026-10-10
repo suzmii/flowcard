@@ -1,4 +1,4 @@
-import { CircleDot, GitPullRequest, Lock, Play } from "lucide-react";
+import { CircleDot, GitPullRequest, Lock, MessageSquare, Play } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { RUNTIME_TONE, SESSION_STATE_LABELS } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
@@ -22,6 +22,7 @@ export function CardTile({
 }) {
   const openGates = Object.values(card.gates).filter((gate) => gate.status === "open");
   const runtime = card.runtime ?? null;
+  const unreadComments = card.remoteComments.filter((comment) => !comment.read).length;
 
   return (
     <button
@@ -81,6 +82,17 @@ export function CardTile({
           <Badge variant="warning" title={openGates.map((gate) => `${gate.id} ${gate.title}`).join(" / ")}>
             <Lock />
             门禁 {openGates.map((g) => g.id).join("+")}
+          </Badge>
+        ) : null}
+
+        {unreadComments > 0 ? (
+          <Badge
+            variant="info"
+            data-testid="tile-remote-unread"
+            title={`${unreadComments} 条未读远端评论（打开卡片就标已读）`}
+          >
+            <MessageSquare />
+            {unreadComments} 条新评论
           </Badge>
         ) : null}
 

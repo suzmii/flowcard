@@ -422,7 +422,7 @@ export type GitSignals = {
   commitsSinceBase: number | null;
   /** 上一步实际用的基线 ref。 */
   base: string | null;
-  /** upstream ref（`origin/feat/x` 形式）；没有 → null。 */
+  /** upstream ref（`origin/<分支>` 形式）；没有 → null。 */
   upstream: string | null;
   remoteUrl: string | null;
   remote: Remote | null;
@@ -658,7 +658,7 @@ export async function probe(cwd: string, opts: ProbeOptions = {}): Promise<Probe
   } else if (verdict?.detached) {
     notes.push(
       `worktree ${verdict.path} 处于 detached HEAD（没有分支）：**不回写 worktree**（避免把卡片上已有的分支覆盖成无效值）；` +
-        `要绑卡请先在里面 \`git switch -c feat/<名字>\``,
+        `要绑卡请先在里面 \`git switch -c <前缀>/<名字>\`（前缀看改动性质）`,
     );
   } else if (verdict && !verdict.underWorktreesDir) {
     notes.push("worktree 不在 .worktrees/ 约定目录下：仍接受（推断 source=harness）");
