@@ -15,6 +15,15 @@ npm start                       # 起服务，默认 http://127.0.0.1:47825
 npm run cli -- list             # 或 node src/cli/main.ts list
 ```
 
+看板由服务自己发（`GET /` → `web/dist`）。所以**第一次要先构建一次前端**：
+
+```bash
+npm run web:install && npm run web:build     # 之后改前端只需再跑 web:build 并重启服务
+```
+
+本机已装成用户级常驻服务：`systemctl --user status|restart flowcard`，开机/登录自启（`Linger=yes`，登出也不停）。
+改完前端要 `npm run web:build && systemctl --user restart flowcard`。
+
 CLI 是 agent 的唯一写入口，stdout 恒为一行 JSON：
 
 ```bash

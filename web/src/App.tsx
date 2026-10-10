@@ -1,7 +1,8 @@
 import { useCallback, useState } from "react";
-import { AlertTriangle, LayoutGrid, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, LayoutGrid, Plus, RefreshCw, Wifi, WifiOff } from "lucide-react";
 import { Board } from "@/components/Board";
 import { CardDetail } from "@/components/CardDetail";
+import { NewCardDialog } from "@/components/NewCardDialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useBoard, type Connection } from "@/lib/useBoard";
@@ -23,6 +24,7 @@ export function App() {
   const board = useBoard();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [newCardOpen, setNewCardOpen] = useState(false);
 
   const cards = board.cards ?? [];
   const selected = cards.find((card) => card.id === selectedId) ?? null;
@@ -54,6 +56,14 @@ export function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            data-testid="new-card-open"
+            onClick={() => setNewCardOpen(true)}
+          >
+            <Plus />
+            新建卡片
+          </Button>
           <span
             className="flex items-center gap-1.5 text-xs text-muted-foreground"
             title="GET /api/stream（SSE）"
@@ -101,6 +111,12 @@ export function App() {
           onRefresh={board.refresh}
         />
       ) : null}
+
+      <NewCardDialog
+        open={newCardOpen}
+        onClose={() => setNewCardOpen(false)}
+        onCreated={board.refresh}
+      />
     </div>
   );
 }
