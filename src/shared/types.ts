@@ -325,6 +325,7 @@ export type EventType =
   | "session.heartbeat"
   | "session.ended"
   | "session.cwd.mismatch"
+  | "session.deleted"
   | "runtime.starting"
   | "runtime.started"
   | "runtime.failed"
@@ -549,6 +550,17 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     card: z.string().min(1),
     sessionId: z.string().optional(),
     summary: z.string().optional(),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
+    /**
+     * 删掉这张卡的会话事实（**不动** omp 磁盘上的会话文件）：`session` 投影成 `null`，
+     * 下次「启动会话」不再 `-r` 续接，是一段全新的对话。转录由服务端另外清（不进事件流）。
+     * 服务端内部命令（`POST /api/cards/:id/session/delete`），见 `server/hosted-session.ts`。
+     */
+    cmd: z.literal("deleteSession"),
+    actor: actorSchema,
+    card: z.string().min(1),
     dedupeKey: z.string().optional(),
   }),
   z.object({

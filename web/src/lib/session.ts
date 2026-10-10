@@ -397,6 +397,23 @@ export async function stopSession(cardId: string): Promise<SessionActionOutcome>
   return outcome.ok ? { ok: true } : outcome;
 }
 
+/**
+ * 删会话的二次确认文案：一句话说清**删的是什么、不删什么**。做成常量给两处按钮共用，
+ * 免得一处说了「下次是全新对话」、另一处忘了说，或者两边口径不一致。
+ */
+export const DELETE_SESSION_CONFIRM =
+  "删除这个会话？\n\n" +
+  "· 会停掉这张卡的 omp 进程；\n" +
+  "· 会清掉网页里的转录（历史对话没了）；\n" +
+  "· 卡片不再记这个会话，下次「启动会话」是一段全新的对话；\n" +
+  "· 磁盘上 omp 的会话文件保留 —— 你在自己的终端里还能 `omp -r` 回到这段对话。";
+
+/** 删掉这张卡的会话（停进程 + 清转录 + 卡片不再记会话）。幂等。 */
+export async function deleteSession(cardId: string): Promise<SessionActionOutcome> {
+  const outcome = await postSession(cardId, "/delete", {}, "删除会话");
+  return outcome.ok ? { ok: true } : outcome;
+}
+
 // ------------------------------------------------------------------ 事件与归并
 export type SessionNoticeLevel = "info" | "warn" | "error";
 export type SessionNotice = { at: string; level: SessionNoticeLevel; message: string };

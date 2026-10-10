@@ -113,8 +113,10 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  * v6：卡片新增 `remoteComments`（同步进来的远端评论），老投影里没有 → 重放补上空数组。
  * v8：卡片新增 `eventCount`（已应用的事件条数）——意图类命令的幂等键用它当卡片版本，
  *     老投影里没有这个字段 → 必须重放一遍才能继续拿它当幂等键。
+ * v9：会话能删 —— 新增 `session.deleted` 事件把卡片 `session` 清成 `null`；老投影不认这条事件，
+ *     重建时必须重放才拿到 `session = null`。
  */
-export const PROJECTION_VERSION = "8";
+export const PROJECTION_VERSION = "9";
 
 /**
  * 一个项目上一轮同步的结果（按项目存在 `meta` 表里，**不进事件流**）：
@@ -132,6 +134,20 @@ export type ProjectSyncState = {
   /** 上一轮整体没跑成的原因（没凭据等）；成功一轮后清掉。 */
   lastError?: string;
 };
+
+/**
+ * 一条待补投的审批通知（会话不在线时攒着，等它下次启动 / 发言时投出去）。
+ * `key` 就是那次决定的幂等键（见 `server/approval-hooks.ts`）。
+ */
+export type ApprovalNotice = { key: string; text: string; at: string };
+
+/**
+ * 审批 hook 的投递台账（按卡片存在 `meta` 表里，**不进事件流**）：
+ * `delivered` 是已经打扰过 agent 的幂等键（含补投的），`pending` 是会话不在线时攒下的通知。
+ *
+ * 它不是业务事实 —— 重建投影不需要它（和 `ProjectSyncState` 同一类）；丢了最坏是重复提醒一次。
+ */
+export type ApprovalLedger = { delivered: string[]; pending: ApprovalNotice[] };
 
 /**
  * 托管会话里的一次工具调用（转录里 `role: "tool"` 的那一行）。
@@ -184,6 +200,12 @@ export type Store = {
   getSyncState(projectId: string): ProjectSyncState | undefined;
   /** 记住这一轮同步（`lastSyncAt` / 上轮摘要 / 降级）。 */
   setSyncState(projectId: string, state: ProjectSyncState): void;
+  /**
+   * 审批 hook 的投递台账（按卡片；没记过返回空的一份）。
+   * 放 `meta` 表里、不进事件流：它是「哪些审批通知已经打扰过 agent」，不是流程事实。
+   */
+  getApprovalLedger(cardId: string): ApprovalLedger;
+  setApprovalLedger(cardId: string, ledger: ApprovalLedger): void;
   /** 存一张图片附件（内容寻址，幂等）；校验不过返回 error。 */
   appendAttachment(input: { name: string; mime: string | undefined; bytes: Uint8Array }, now?: string): AppendAttachmentResult;
   getAttachment(id: string): { attachment: Attachment; bytes: Uint8Array } | undefined;
@@ -197,6 +219,13 @@ export type Store = {
   appendSessionMessage(input: SessionMessageInput): { seq: number };
   /** 某张卡片的转录（按 `seq` 升序；默认最近 500 条，上限 2000）。 */
   listSessionMessages(cardId: string, limit?: number): SessionMessageRow[];
+  /**
+   * 清掉某张卡片的**全部**转录（删会话时用）。返回删掉的行数。
+   *
+   * 转录不进事件流（见 `docs/design.md` §14.4），所以删它也不必落事件 —— `session.deleted`
+   * 只负责卡片上的会话事实；转录是「会话说过的话」，会话没了就该跟着没。
+   */
+  clearSessionMessages(cardId: string): number;
   close(): void;
 };
 
@@ -504,6 +533,33 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     metaSet(`sync:${projectId}`, JSON.stringify(state));
   };
 
+  // ---------------------------------------------------------------- 审批 hook 的投递台账（按卡片，不进事件流）
+
+  const getApprovalLedger = (cardId: string): ApprovalLedger => {
+    const raw = metaGet(`approval:${cardId}`);
+    if (raw === undefined) return { delivered: [], pending: [] };
+    try {
+      const parsed = JSON.parse(raw) as Partial<ApprovalLedger>;
+      // 手工改坏 / 旧版本写坏的值不该把审批通知整个搞停：形状不对就当没记过（最坏重复提醒一次）。
+      const delivered = Array.isArray(parsed?.delivered)
+        ? parsed.delivered.filter((k): k is string => typeof k === "string")
+        : [];
+      const pending = Array.isArray(parsed?.pending)
+        ? parsed.pending.filter(
+            (p): p is ApprovalNotice =>
+              typeof p?.key === "string" && typeof p?.text === "string" && typeof p?.at === "string",
+          )
+        : [];
+      return { delivered, pending };
+    } catch {
+      return { delivered: [], pending: [] };
+    }
+  };
+
+  const setApprovalLedger = (cardId: string, ledger: ApprovalLedger): void => {
+    metaSet(`approval:${cardId}`, JSON.stringify(ledger));
+  };
+
   // ---------------------------------------------------------------- 附件（图片）
 
   const attachmentsRoot = attachmentsDir(opts.dataDir);
@@ -574,6 +630,15 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       .prepare("SELECT * FROM session_messages WHERE card_id = ? ORDER BY seq DESC LIMIT ?")
       .all(cardId, cap) as SessionMessageDbRow[];
     return rows.map(toSessionMessage).reverse();
+  };
+
+  /** 删会话时清转录：整卡一起删（`seq` 是按卡递增的，不必留空洞）。 */
+  const clearSessionMessages = (cardId: string): number => {
+    const before = db
+      .prepare("SELECT COUNT(*) AS n FROM session_messages WHERE card_id = ?")
+      .get(cardId) as { n: number };
+    db.prepare("DELETE FROM session_messages WHERE card_id = ?").run(cardId);
+    return before.n;
   };
 
   const execute = (cmd: Command, now = new Date().toISOString()): ExecuteResult => {
@@ -702,10 +767,13 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     projectForPath,
     getSyncState,
     setSyncState,
+    getApprovalLedger,
+    setApprovalLedger,
     appendAttachment,
     getAttachment,
     appendSessionMessage,
     listSessionMessages,
+    clearSessionMessages,
     close() {
       db.close();
     },

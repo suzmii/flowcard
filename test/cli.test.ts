@@ -205,6 +205,27 @@ describe("CLI 退出码契约", () => {
     await rejected.close();
   });
 
+  it("session delete 的退出码契约：打到 .../session/delete、成功 0、卡片不存在 3、缺卡片 id 2、不可达 5", async () => {
+    const ok = await fakeServer(() => ({ status: 200, body: JSON.stringify({ ok: true }) }));
+    const ran = await runCli(["session", "delete", "c1"], ok.url);
+    expect(ran.status).toBe(0);
+    expect(jsonObject(ran.stdout)).toEqual({ ok: true });
+    expect(ok.requests).toEqual(["POST /api/cards/c1/session/delete"]);
+    // 缺卡片 id 是用法错（2）：不发请求。
+    expect((await runCli(["session", "delete"], ok.url)).status).toBe(2);
+    await ok.close();
+
+    const missing = await fakeServer(() => ({
+      status: 404,
+      body: JSON.stringify({ error: { code: "NOT_FOUND", message: "卡片 c1 不存在" } }),
+    }));
+    expect((await runCli(["session", "delete", "c1"], missing.url)).status).toBe(3);
+    await missing.close();
+
+    const dead = await deadPort();
+    expect((await runCli(["session", "delete", "c1"], `http://127.0.0.1:${dead}`)).status).toBe(5);
+  });
+
   it("sync 的退出码不回归：no-credentials / no-transport → 4、no-remote → 3、成功 → 0", async () => {
     for (const [reason, code] of [
       ["no-credentials", 4],

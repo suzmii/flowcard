@@ -29,6 +29,7 @@ import {
   SendHorizontal,
   Square,
   SquareTerminal,
+  Trash2,
   X,
 } from "lucide-react";
 import { Markdown } from "@/components/Markdown";
@@ -41,8 +42,10 @@ import {
   TOOL_STATUS_LABELS,
   SESSION_STATUS_LABELS,
   SESSION_STATUS_TONE,
+  DELETE_SESSION_CONFIRM,
   abortSession,
   applySessionEvent,
+  deleteSession,
   fetchSession,
   initialSessionView,
   mergeSessionSnapshot,
@@ -270,7 +273,7 @@ export function SessionChat({
   const [streamFailures, setStreamFailures] = useState(0);
   /** 换个 key 就丢掉当前 EventSource 重建一条（假活连接只能靠重建救）。 */
   const [streamKey, setStreamKey] = useState(0);
-  const [action, setAction] = useState<null | "start" | "abort" | "stop" | "prompt">(null);
+  const [action, setAction] = useState<null | "start" | "abort" | "stop" | "prompt" | "delete">(null);
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<PendingImage[]>([]);
@@ -471,8 +474,10 @@ export function SessionChat({
     void ingest(files);
   };
 
-  const act = async (kind: "start" | "abort" | "stop" | "prompt") => {
+  const act = async (kind: "start" | "abort" | "stop" | "prompt" | "delete") => {
     if (action !== null) return;
+    // 删会话是不可逆的（转录清了、卡片不再记这个会话）→ 二次确认，写清删什么、不删什么。
+    if (kind === "delete" && !window.confirm(DELETE_SESSION_CONFIRM)) return;
     setAction(kind);
     setNotice(null);
 
@@ -500,7 +505,9 @@ export function SessionChat({
         ? await startSession(card.id, worktreePath ? { cwd: worktreePath } : {})
         : kind === "abort"
           ? await abortSession(card.id)
-          : await stopSession(card.id);
+          : kind === "delete"
+            ? await deleteSession(card.id)
+            : await stopSession(card.id);
 
     if (result.ok) {
       setNotice({
@@ -512,7 +519,9 @@ export function SessionChat({
               : "已请求启动会话，稍候…"
             : kind === "abort"
               ? "已请求中断当前这一轮"
-              : "已请求停止会话",
+              : kind === "delete"
+                ? "会话已删除：转录已清空，下次「启动会话」是全新的对话（omp 的会话文件仍保留）"
+                : "已请求停止会话",
       });
     } else {
       setNotice({ tone: "error", text: `${result.code}：${result.message}` });
@@ -606,6 +615,20 @@ export function SessionChat({
             >
               <Hand />
               {action === "abort" ? "中断中…" : "中断"}
+            </Button>
+          ) : null}
+          {/* 没会话事实也没转录的卡（会话视图里不会有，卡片详情里有）不显示删除：没东西可删。 */}
+          {status !== "stopped" || messages.length > 0 ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={action !== null}
+              data-testid="session-delete"
+              title="停进程、清转录；下次启动是全新对话（omp 的会话文件保留）"
+              onClick={() => void act("delete")}
+            >
+              <Trash2 />
+              {action === "delete" ? "删除中…" : "删除会话"}
             </Button>
           ) : null}
         </div>

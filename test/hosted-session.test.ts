@@ -54,7 +54,13 @@ if (MODE === "die-before-ready") { process.exit(3); }
 // 乱码行不能影响会话（协议解析失败必须被丢掉）
 process.stdout.write("这不是 JSON" + NL);
 
-const sessionId = "fake-session-1";
+// 真 omp 起一段**新**对话时 sessionId 是新生成的（-r 续接才沿用文件里的那个）。
+// FAKE_OMP_FRESH_ID=1 时照抄这一点：每次新进程给一个不同的 id（删会话后"再 start 是全新对话"
+// 要用它 —— id 相同的话 claim 的幂等键会跟删除前那次撞上，被去重静默吞掉）。
+const sessionId =
+  process.env.FAKE_OMP_FRESH_ID && resumeIdx < 0
+    ? "fresh-" + process.pid + "-" + Math.random().toString(36).slice(2, 6)
+    : "fake-session-1";
 // 挂着的那一轮：{ promptId, msgId }（abort 时照着它收尾）。
 let pending = null;
 let buf = "";
@@ -166,7 +172,7 @@ afterAll(async () => {
 });
 
 /** 真进程 + 真管道，argv 换成 `node -e <假 omp> <omp 的真实参数…>`；registry 的其余依赖照生产走。 */
-function spawnFake(mode: string, sessionFile?: string) {
+function spawnFake(mode: string, sessionFile?: string, extraEnv?: NodeJS.ProcessEnv) {
   return (opts: StartRpcOptions): OmpRpcSession => {
     const session = startRpcSession({
       ...opts,
@@ -178,6 +184,7 @@ function spawnFake(mode: string, sessionFile?: string) {
         ...opts.env,
         FAKE_OMP_MODE: mode,
         ...(sessionFile === undefined ? {} : { FAKE_OMP_SESSION_FILE: sessionFile }),
+        ...(extraEnv ?? {}),
       },
       spawn: defaultSpawn,
     });
@@ -205,12 +212,18 @@ function openCard(store: Store, worktreePath: string): string {
   return id;
 }
 
-function makeSessions(store: Store, mode: string, calls: StartRpcOptions[] = [], sessionFile?: string): HostedSessions {
+function makeSessions(
+  store: Store,
+  mode: string,
+  calls: StartRpcOptions[] = [],
+  sessionFile?: string,
+  extraEnv?: NodeJS.ProcessEnv,
+): HostedSessions {
   return createHostedSessions({
     store,
     startSession: (opts) => {
       calls.push(opts);
-      return spawnFake(mode, sessionFile)(opts);
+      return spawnFake(mode, sessionFile, extraEnv)(opts);
     },
     resolveOmpPath: async () => undefined, // 别真去 `sh -c command -v omp`
   });
@@ -999,3 +1012,76 @@ class SseReader {
     return this.#text;
   }
 }
+
+describe("删会话：停进程 + 清转录 + 清卡片会话事实（omp 的会话文件保留）", () => {
+  it("删掉后转录空、status=stopped、卡片 session=null；再 start 是全新对话（无 -r）；重复删幂等", async () => {
+    const { store, dir } = makeStore();
+    // 卡片上留一份**对得上**的会话文件：没有删除的话，第二次 start 会用它 `-r` 续接。
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), dir);
+    const id = openCard(store, dir);
+    const calls: StartRpcOptions[] = [];
+    // `FAKE_OMP_FRESH_ID=1`：假 omp 起新对话时给一个新 sessionId（真 omp 就是这样）——
+    // 否则删除前后两次 claim 的身份完全一样，claim 的幂等键会撞上、被去重静默吞掉。
+    const sessions = makeSessions(store, "normal", calls, fixture, { FAKE_OMP_FRESH_ID: "1" });
+    const app = createApp(store, { sessions });
+    const json = { "content-type": "application/json" };
+    const url = (suffix: string): string => `/api/cards/${id}/session${suffix}`;
+
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+    const started = await sessions.start(id, { kickoff: "第一句" });
+    expect(started.ok).toBe(true);
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
+    // 前置：会话起来了、卡片绑上了（含会话文件）、转录有内容
+    expect(sessions.isLive(id)).toBe(true);
+    const firstId = store.getCard(id)?.session?.id ?? "";
+    expect(firstId).toMatch(/^fresh-/);
+    expect(store.listSessionMessages(id).length).toBeGreaterThan(0);
+    expect(store.getCard(id)?.session?.file).toBe(fixture);
+    // 攒着等这个会话的审批通知：删会话时该清掉（`delivered` 留着，别在新会话里重复打扰）。
+    store.setApprovalLedger(id, {
+      delivered: ["gate:G1"],
+      pending: [{ key: "gate:G2", text: "通知", at: "2026-10-10T00:00:00.000Z" }],
+    });
+
+    // 删会话（无 body）：200 + { ok: true }
+    const deleted = await app.request(url("/delete"), { method: "POST", headers: json, body: "{}" });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ ok: true });
+
+    // ① GET .../session：转录为空、status=stopped（进程也停了）
+    const after = (await (await app.request(url(""))).json()) as { status: string; messages: unknown[] };
+    expect(after.status).toBe("stopped");
+    expect(after.messages).toEqual([]);
+    expect(store.listSessionMessages(id)).toEqual([]);
+    expect(sessions.isLive(id)).toBe(false);
+
+    // ② 卡片上的会话事实清掉（`session = null`），一条 `session.deleted` 事件
+    expect(store.getCard(id)?.session).toBe(null);
+    expect(store.listEventsOfCard(id, "session.deleted").map((e) => e.type)).toEqual(["session.deleted"]);
+    // pending 清掉、delivered 留着
+    expect(store.getApprovalLedger(id)).toEqual({ delivered: ["gate:G1"], pending: [] });
+
+    // ③ 幂等：没会话可删时重复删不报错，也不会再写第二条 `session.deleted`
+    const again = await app.request(url("/delete"), { method: "POST", headers: json, body: "{}" });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual({ ok: true });
+    expect(store.listEventsOfCard(id, "session.deleted")).toHaveLength(1);
+    expect(store.getCard(id)?.session).toBe(null);
+
+    // ④ 再 start：卡片不再记会话文件 → argv 里没有 `-r`，是一段全新的对话（新的 omp sessionId）
+    const readyBefore = log.byType("ready").length;
+    const restarted = await sessions.start(id, {});
+    expect(restarted.ok).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.args ?? []).not.toContain("-r");
+    expect(calls[1]?.args ?? []).not.toContain("-r");
+    await log.waitForNth((e) => e.type === "ready", readyBefore + 1);
+    const secondId = store.getCard(id)?.session?.id ?? "";
+    expect(secondId).toMatch(/^fresh-/);
+    expect(secondId).not.toBe(firstId); // 全新的一段对话（不是续接回来的同一条）
+
+    // 卡片不存在：404（不是 5xx）
+    expect((await app.request("/api/cards/c404/session/delete", { method: "POST", headers: json, body: "{}" })).status).toBe(404);
+  });
+});

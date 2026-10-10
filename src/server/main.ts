@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { personalFlow } from "../flow/personal.ts";
 import { createApp } from "./app.ts";
+import { approvalHooksEnabled } from "./approval-hooks.ts";
 import { createHostedSessions } from "./hosted-session.ts";
 import { defaultAdapterPath } from "./launch.ts";
 import { createRuntimeSupervisor } from "./runtime.ts";
@@ -36,6 +37,12 @@ const sessions = createHostedSessions({
   logDir: join(dataDir, "logs"),
 });
 
+/**
+ * 审批 hook：人批了 / 驳了 → 自动给这张卡的托管会话发一条人话通知。
+ * 默认开，`FLOWCARD_APPROVAL_HOOKS=0` 关（关掉后审批照常，只是不通知 agent）。
+ */
+const approvalHooksOn = approvalHooksEnabled(process.env);
+
 /** 后台同步节奏：默认 5 分钟一轮（`FLOWCARD_SYNC_INTERVAL_MS=0` 关掉）。 */
 const syncRaw = Number(process.env.FLOWCARD_SYNC_INTERVAL_MS ?? "");
 const syncIntervalMs = Number.isFinite(syncRaw) && syncRaw >= 0 ? syncRaw : DEFAULT_SYNC_INTERVAL_MS;
@@ -43,6 +50,7 @@ const app = createApp(store, {
   runtime,
   sync: { intervalMs: syncIntervalMs },
   sessions,
+  approvalHooks: { enabled: approvalHooksOn },
   autostart: {
     // 默认开；`FLOWCARD_AUTOSTART=0` 关掉（只开卡、不起会话）
     enabled: process.env.FLOWCARD_AUTOSTART !== "0",
@@ -58,8 +66,9 @@ serve({ fetch: app.fetch, hostname: host, port }, (info) => {
   const cards = store.listCards().length;
   const tail = reaped.length > 0 ? `；清理残留运行时 ${reaped.join(", ")}` : "";
   const sync = syncIntervalMs > 0 ? `每 ${Math.round(syncIntervalMs / 1000)}s` : "已关闭";
+  const hooks = approvalHooksOn ? "开（人批了会通知托管会话）" : "关（FLOWCARD_APPROVAL_HOOKS=0）";
   console.log(
-    `flowcard 已启动 http://${host}:${info.port}  （数据 ${dataDir}，卡片 ${cards} 张，同步 ${sync}${tail}）`,
+    `flowcard 已启动 http://${host}:${info.port}  （数据 ${dataDir}，卡片 ${cards} 张，同步 ${sync}，审批通知 ${hooks}${tail}）`,
   );
 });
 

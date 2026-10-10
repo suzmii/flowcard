@@ -373,6 +373,12 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       if (card.session) next.session = { ...card.session, state: "ended", lastSeenAt: at };
       break;
 
+    // 删会话：卡片上的会话事实整个清掉（不是 `ended`）。磁盘上 omp 的会话文件不动，
+    // 但卡片不再记它 —— 所以下次「启动会话」不会再 `-r` 续接，是一段全新的对话。
+    case "session.deleted":
+      next.session = null;
+      break;
+
     case "session.cwd.mismatch":
     case "git.probed":
       break;

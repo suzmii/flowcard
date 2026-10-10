@@ -605,6 +605,20 @@ export function runCommand(input: {
       break;
     }
 
+    case "deleteSession": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      // 重复删是 no-op（幂等，不报错）：卡片上已经没有会话事实可清。
+      // 守卫**不靠**幂等键：删掉之后 `eventCount` 变了，同内容的第二次删会拿到新键，
+      // 若没有这道守卫就会写一条多余的 `session.deleted`。
+      if (!card.session) {
+        notes.push("卡片没有会话，跳过");
+        break;
+      }
+      emit(cmd.card, "session.deleted", {}, intentKey("deleteSession", card));
+      break;
+    }
+
     case "accept": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });

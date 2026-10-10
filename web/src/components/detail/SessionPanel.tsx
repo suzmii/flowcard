@@ -1,7 +1,9 @@
-import type { ReactNode } from "react";
-import { AlertTriangle, CheckCircle2, HelpCircle } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { AlertTriangle, CheckCircle2, HelpCircle, Trash2 } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DELETE_SESSION_CONFIRM, deleteSession } from "@/lib/session";
 import { SESSION_STATE_LABELS, type Session } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 import { timeAgo } from "@/lib/utils";
@@ -32,6 +34,18 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 export function SessionPanel({ card }: { card: CardView }) {
   const session = card.session;
   const worktree = card.worktree;
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const onDeleteSession = async () => {
+    if (deleting || !window.confirm(DELETE_SESSION_CONFIRM)) return;
+    setDeleting(true);
+    setDeleteError(null);
+    const result = await deleteSession(card.id);
+    setDeleting(false);
+    // 删成功：卡片事实（`session=null`）随后由看板的 `changed` 刷新带回，这一块自然收起。
+    if (!result.ok) setDeleteError(`${result.code}：${result.message}`);
+  };
 
   if (!session) {
     // 卡片天生就有"它自己的会话"——只是那次会话还没启动。启动入口在「会话」视图里
@@ -111,6 +125,28 @@ export function SessionPanel({ card }: { card: CardView }) {
         <span className="min-w-0 flex-1 break-all font-mono text-xs">{resumeCommand(session)}</span>
         <CopyButton value={resumeCommand(session)} label="复制恢复命令" />
       </div>
+
+      <div className="flex flex-wrap items-center gap-2 border-t pt-2">
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={deleting}
+          data-testid="session-delete"
+          title="停进程、清转录；下次启动是全新对话（omp 的会话文件保留）"
+          onClick={() => void onDeleteSession()}
+        >
+          <Trash2 />
+          {deleting ? "删除中…" : "删除会话"}
+        </Button>
+        <span className="text-[11px] text-muted-foreground">
+          停进程 + 清转录，卡片不再记这个会话；下次启动是全新对话，omp 的会话文件保留
+        </span>
+      </div>
+      {deleteError ? (
+        <p className="rounded border border-red-600/30 bg-red-50 p-2 text-xs text-red-800" data-testid="session-delete-error">
+          {deleteError}
+        </p>
+      ) : null}
     </div>
   );
 }

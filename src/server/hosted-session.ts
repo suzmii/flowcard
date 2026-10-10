@@ -199,6 +199,14 @@ export type HostedSessions = {
    * 停掉当前进程 → 原会话（`-r`，cwd 头改到新目录）续接 → 起来后自己重新 claim（卡片进「实施中」）。
    */
   changeCwd(cardId: string, opts: { cwd: string; brief?: string }): Promise<ChangeCwdResult>;
+  /**
+   * 删掉这张卡的会话：① 在跑就先停掉它的 omp 进程；② 清转录（`session_messages` 这张卡的行）；
+   * ③ 落一条 `session.deleted` 把卡片上的会话事实清成 `null`；④ 丢掉进程内的 live 记录。
+   *
+   * **不动**磁盘上 omp 的会话文件（用户在自己的终端里还能 `omp -r` 回去）；因为卡片不再记它，
+   * 下次 `start()` 不会再 `-r` 续接 —— 是一段全新的对话。幂等，失败也不抛。
+   */
+  remove(cardId: string): Promise<SimpleResult>;
   /** 服务退出时用：逐个优雅停（关 stdin → omp 自己收尾），并行等。 */
   stopAll(): Promise<void>;
   snapshot(cardId: string): SessionSnapshot;
@@ -213,7 +221,10 @@ export type HostedSessions = {
 };
 
 export type HostedSessionDeps = {
-  store: Pick<Store, "getCard" | "getProject" | "execute" | "appendSessionMessage" | "listSessionMessages">;
+  store: Pick<
+    Store,
+    "getCard" | "getProject" | "execute" | "appendSessionMessage" | "listSessionMessages" | "clearSessionMessages"
+  >;
   /** 起会话的实现；默认 `startRpcSession`。测试注入假 omp（换 argv/env）。 */
   startSession?: (opts: StartRpcOptions) => OmpRpcSession;
   /** omp 可执行文件的绝对路径；不给就找一次（`resolveOmpPath`），找不到交给 PATH 的 `omp`。 */
@@ -1169,6 +1180,51 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
   };
 
   /**
+   * 删掉这张卡的会话（语义见 `HostedSessions.remove` 的注释）。**绝不抛**。
+   *
+   * 顺序有讲究：**先**把 live 记录从 `records` 里摘掉、清转录、落 `session.deleted`（都同步），
+   * **最后**才等 omp 进程收尾。理由有二：
+   *  · `handle()` 的头一行就是 `records.get(cardId) !== live` 的守卫，记录一摘，在途帧全被丢掉
+   *    —— 不会在转录清掉之后又写回来一行，也不会发出一条与删除矛盾的 `session.ended`；
+   *  · 卡片会话事实在**任何 await 之前**就清掉了，并发来的 `prompt` 只会看到"没有会话"（409），
+   *    不可能把这条会话又续接回来。
+   */
+  const remove = async (cardId: string): Promise<SimpleResult> => {
+    const live = records.get(cardId);
+    if (live) {
+      // 摘掉记录就是"注销"：之后 `handle()` 的在途帧、`prompt()` 的自动续接（`revive`）都找不到它。
+      live.off();
+      records.delete(cardId);
+    }
+    let failure: SessionError | undefined;
+    try {
+      store.clearSessionMessages(cardId);
+    } catch (error) {
+      failure = {
+        code: "DELETE_FAILED",
+        message: `转录没清掉：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (failure === undefined) {
+      // 卡片上的会话事实：一条 `session.deleted`（投影里 `session = null`）。下次 `start()` 因此不再 `-r`。
+      const result = store.execute({
+        cmd: "deleteSession",
+        actor: { kind: "system", name: "flowcard" },
+        card: cardId,
+      });
+      if (result.outcome.rejection) {
+        failure = { code: result.outcome.rejection.code, message: result.outcome.rejection.message };
+      } else {
+        const types = result.outcome.events.map((event) => event.type);
+        if (types.length > 0) notifyCard(cardId, types);
+      }
+    }
+    // 最后收进程（不管前面成没成）：它已经没人监听了，在途帧也进不来（记录早摘了）。
+    if (live) await live.session.stop().catch(() => undefined);
+    return failure === undefined ? { ok: true } : { ok: false, error: failure };
+  };
+
+  /**
    * 把会话搬到新 cwd —— 卡片进 worktree 的正规路径（`flowcard worktree use` 的第二步）：
    * 停掉旧进程 → 用改过 `cwd` 头的会话文件 `-r` 续接（同 sessionId、历史不断）→ 起来后 bringUp
    * 自己重新 claim（cwd 已在新目录）→ 卡片自动进「实施中」。
@@ -1298,6 +1354,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     prompt,
     abort,
     stop,
+    remove,
     changeCwd,
     async stopAll() {
       await Promise.all([...records.values()].map((live) => live.session.stop().catch(() => undefined)));

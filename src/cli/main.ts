@@ -519,7 +519,7 @@ async function build(): Promise<Command> {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue gate confirm worktree session claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect list show`);
   }
 }
 
@@ -657,6 +657,41 @@ async function waitForState(card: string, want: string, timeoutMs: number): Prom
     if (state === want || Date.now() > deadline) return state;
     await new Promise<void>((resolve) => setTimeout(resolve, 400));
   }
+}
+
+/**
+ * `flowcard session delete <card>`：删掉这张卡的会话（`POST /api/cards/:id/session/delete`）——
+ * 停掉该卡的托管进程、清掉转录、把卡片上的会话事实清成 `null`。
+ *
+ * **不动**磁盘上 omp 的会话文件：你在自己的终端里还能 `omp -r` 回去；但 flowcard 不再记它，
+ * 下次「启动会话」不会续接 —— 是一段全新的对话。幂等（重复删也 `ok:true`）。
+ */
+async function runSessionDelete(): Promise<never> {
+  const card = positionals[2];
+  if (!card) die(2, "session delete 需要卡片 id：flowcard session delete <card>");
+  let res: Response;
+  try {
+    res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}/session/delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+  } catch (error) {
+    return unreachable(error);
+  }
+  const payload = (await res.json().catch(() => null)) as {
+    ok?: boolean;
+    error?: { code?: string; message?: string };
+  } | null;
+  if (payload === null) {
+    return finish(
+      `${JSON.stringify({ ok: false, error: { code: "SERVER_ERROR", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` } })}\n`,
+      5,
+    );
+  }
+  // 卡片不存在（404）与"服务端拒了"都是"状态不允许"（3），与别的命令一致。
+  if (!res.ok || payload.ok === false) return finish(`${JSON.stringify(payload)}\n`, 3);
+  return finish(`${JSON.stringify(payload)}\n`, 0);
 }
 
 /**
@@ -840,7 +875,7 @@ async function main(): Promise<void> {
 
   if (!name || name === "help" || name === "--help") {
     return finish(
-      `${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`,
+      `${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree session claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`,
       0,
     );
   }
@@ -934,6 +969,14 @@ async function main(): Promise<void> {
 
   // `worktree use`：绑 worktree + 把会话搬进去（多步，不是单条命令）。
   if (name === "worktree" && positionals[1] === "use") await runWorktreeUse();
+
+  // `session delete`：删掉一张卡的会话（停进程 + 清转录 + 清卡片上的会话事实）。
+  if (name === "session") {
+    if (positionals[1] !== "delete") {
+      die(2, `未知的 session 子命令 "${positionals[1] ?? ""}"。可用：flowcard session delete <card>`);
+    }
+    await runSessionDelete();
+  }
 
   // 项目（看板 Metadata）与附件不是命令：直接打各自的端点。
   if (name === "project") await runProject(positionals.slice(1));

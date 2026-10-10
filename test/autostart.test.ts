@@ -54,6 +54,9 @@ function fakeSessions(outcome: Partial<StartSessionResult> = {}): {
     async changeCwd() {
       return { ok: false, status: "stopped", resumed: false, error: { code: "NO_SESSION", message: "假注册表没有会话" } };
     },
+    async remove() {
+      return { ok: true };
+    },
     async stopAll() {
       return undefined;
     },

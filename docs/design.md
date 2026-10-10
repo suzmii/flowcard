@@ -254,6 +254,28 @@ agent: consumeConfirm{id}               → confirm.consumed（这条授权就�
 - 看板**只申请 / 批准 / 记录**（设计 §10）：`git push`、`tea pr create` 由 agent 或人自己敲。
 - 幂等：同一条申请重复发送不会产生第二条；但一件已经结算（用掉/被拒）的事再申请，算**新的一次申请**。
 
+### 5.2 审批 hook：人做完决定，自动通知在干活的 agent
+
+人在看板上点「批准 / 驳回」之后，**不该再要人跑到终端里喊一声** —— 服务自己会把一条人话通知投给这张卡的托管会话（§14）：
+
+```
+人的决定：decideGate / decideConfirm / accept，且 actor.kind === "human"
+  → 命令成功（决定事件真的落库；被拒或被幂等吞掉的不算）
+  → 投一条通知进这张卡的托管会话：
+       【flowcard 审批通知】人已批准清理（G4 清理确认）。
+       理由：现场没用了
+       下一步：现在可以执行清理：`flowcard cleanup c3` 记账，然后把现场清掉（worktree / 分支 / 临时文件）—— 完成后卡片自动进「完成」。
+```
+
+- **三件事必须都在**：决定（通过 / 驳回）、理由（有就带；驳回本来就必须给）、**下一步该做什么**。下一步按**卡片当前状态**给，不硬写死：`merged` → "先提清理清单 / 现在可以执行清理"，`review` → "等 PR 合并"，`done` → "没有待办了"。文案是纯函数（`approvalNotice(spec, card)`，见 `src/server/approval-hooks.ts`），所以能单测。
+- **谁能触发**：`decideGate` / `decideConfirm` / `accept` 三条命令，且 `actor.kind === "human"`。agent 自己在看板外调这三条（自动化跑流程）不算"人的审批"，**不通知自己**。
+- **只投一次**：幂等键就是那次决定本身 —— `approval:<card>:gate:<gate>:<decision>` / `approval:<card>:confirm:<cf-id>:<decision>` / `approval:<card>:accept`。重复决策（门禁已经不是 `open`、确认已经结算、卡片已经验收过）在引擎那层就被拒/跳过，**一条事件都不写**，hook 也就不动；同一条命令重发（事件被幂等键吞掉）同理。
+- **会话不在线不静默丢**（降级）：写一条卡片评论（`【审批通知·待转达】…`，actor 是 `system`）把这个决定留在时间线上，并把通知记成 **pending**；这张卡**下次 `session.start` 成功之后、或下一次 `prompt` 发出去之前**自动补投一次（进程没了但会话文件还在的，会顺带 `-r` 续接同一条会话），同样按幂等键去重。pending 与已投递的键都记在 `meta` 表里（key `approval:<card>`），**不进事件流** —— 它不是流程事实（重建投影不需要它，丢了最坏是重复提醒一次）。
+- **不阻塞、不抛错、失败只留痕**：hook 在 `/api/commands` **成功之后异步跑**，绝不让审批请求等它，也绝不改变审批本身的成败；投递失败只在服务日志里 `console.error` 一行（哪张卡、什么原因），通知留在 pending 里等下次机会。
+- **开关**：`FLOWCARD_APPROVAL_HOOKS=0` 关掉（**默认开**，与 `FLOWCARD_AUTOSTART` 同一个写法），启动日志里明说当前状态（`审批通知 开（人批了会通知托管会话）` / `关（FLOWCARD_APPROVAL_HOOKS=0）`）。
+
+实现：判定与文案全在 `src/server/approval-hooks.ts`（纯函数 + 一个带 IO 的编排壳）；接线在 `src/server/app.ts`（命令成功后投递；`session/start`、`session/prompt` 前补投）；单测与假 omp 端到端在 `test/approval-hooks.test.ts`。
+
 ## 6. 事件日志是真相
 
 - 所有写入都是 **append-only 事件**；`cards` 是可重建投影（`flowcard rebuild` 可重放）。
@@ -450,7 +472,7 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M7 项目与附件** | 项目 = 看板 Metadata（先选项目再建卡，`repoPath` 由项目解析）；建卡只填正文（标题服务端派生）；图片附件（内容寻址 + 白名单） | `project add` 读真 git 元数据；`open` 不填标题/项目也能落到正确项目与标题；传图后 `GET` 回的字节与 `Content-Type` 与上传一致；老卡片投影成 `local` |
 | **M8 提交图与评审** | 文本提交图（`--graph` 原样 + 多 worktree/卡片叠加）、只读 diff（三点）、行级评论、评审判定（**本地事实，不改状态**）（§12） | 真仓库里 `GET /api/projects/:id/graph` 出提交/分支/worktree 实况；带 worktree 的卡片 diff 出 added/modified/deleted/renamed/binary 与行号；approve 不改 `state`；rebuild 与投影一致 |
 | **M9 同步** | 只读轮询 forge，把 issue/PR 状态与新评论搬进事件流（§13；规格与实测在 `docs/sync.md`） | 真项目跑一轮 → 卡片上出现 `issue.state.changed` / `pr.merged` / 新评论；再跑一轮零差异；磁贴显示「N 条新评论」、详情有「远端动态」 |
-| **M10 托管会话** ✅ | 每卡一个 `omp --mode rpc --no-ui` 子进程：网页直接对话 + 看工具输出，不再弹终端（§14；协议在 `docs/omp-rpc.md`） | 假 omp 端到端 + 真机一次（见 §14.5） |
+| **M10 托管会话** ✅ | 每卡一个 `omp --mode rpc --no-ui` 子进程：网页直接对话 + 看工具输出，不再弹终端（§14；协议在 `docs/omp-rpc.md`） | 假 omp 端到端 + 真机一次（见 §14.6） |
 
 顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10（M0、M1–M9 已完成；M10 已完成，P2 的步骤协议未做）。
 
@@ -593,6 +615,7 @@ POST /api/cards/:id/session/start   { cwd? }                    → { ok, status
 POST /api/cards/:id/session/prompt  { text, images?: [{name,dataBase64}] } → { ok, messageId? }
 POST /api/cards/:id/session/abort   {}                          → { ok }
 POST /api/cards/:id/session/stop    {}                          → { ok }
+POST /api/cards/:id/session/delete  {}                          → { ok }（停进程 + 清转录 + 卡片不再记会话；不动 omp 会话文件）
 GET  /api/cards/:id/session/stream  （每卡一条 SSE）
  → event "ready"       { ompSessionId?, cwd }          // 就绪（连上会先补一条现况）
    event "message"     { id, role, textDelta?, contentIndex? }   // 流式增量，前端按 id 累加
@@ -620,6 +643,10 @@ GET  /api/cards/:id/session/stream  （每卡一条 SSE）
 
 11. **重启后再「启动会话」默认也是续接，不是从零开始**：`start()` 没被显式指定 `resume` 时，看卡片上留的会话文件 —— 文件还在、且**头里的 `sessionId` 就是卡片绑的那个、`cwd` 就是这次要跑的目录**，就自动 `-r` 续接（同 ompSessionId、同转录，重新 claim 后卡片回到「实施中」）；对不上（文件没了/头不符）就退化成新会话，并推一条 `notice` 把原因说清（不静默），`fresh: true` 才强制开一段新的（`changeCwd` 的 handoff 副本走显式 `resume`，优先级最高）。
 
+12. **审批通知会自动投进会话**：人在看板上批了 / 驳了（`decideGate` / `decideConfirm` / `accept`，且是人的 actor）之后，服务把一条人话通知投给这张卡的托管会话 —— 这条通道就是 `sessions.prompt`（见 §5.2）。`session/start` 成功之后、`session/prompt` 发出去**之前**各补投一次攒下的通知（会话不在线时先降级成卡片评论 + pending），所以 agent 看到的是「人批了什么 → 人又说了什么」。
+
+13. **会话能删**（`POST .../session/delete`，见 §14.5）：停掉该卡的 omp 进程、清掉转录、落一条 `session.deleted` 把卡片 `session` 清成 `null`。**磁盘上 omp 的会话文件不动**（用户终端里还能 `omp -r` 回去），但卡片不再记它 —— 所以下次「启动会话」不会再 `-r` 续接，是**一段全新的对话**。幂等，失败也不 5xx。
+
 > **注意既有语义**：`end` 事件在流程里挂的是「`working → review`」，所以**停会话当前一轮等于交回**（和以前关掉终端时适配器上报 `end` 一样）。这是流程定死的规则，不是托管会话引入的。
 
 ### 14.4 转录为什么不进事件流（取舍）
@@ -631,10 +658,26 @@ GET  /api/cards/:id/session/stream  （每卡一条 SSE）
 - **代价**：转录**不在** `/api/events`、不进 `rebuild`、也不能被流程规则引用。要在别处重建它就等于丢了——这是有意的（要做流程判断就该走命令，而不是读对话）。
 - 表在 `createStore` 里 `CREATE TABLE IF NOT EXISTS`，老库自动补上；**不动 `PROJECTION_VERSION`**（投影形态没变）。重启服务后 `GET .../session` 照样给得出历史（`status` 记不住：没起会话的卡就是 `stopped`，有转录的是 `ended`）。
 
-### 14.5 里程碑
+### 14.5 删会话（删的是什么、不删什么）
+
+`POST /api/cards/:id/session/delete`（CLI：`flowcard session delete <card>`；前端在「会话」视图的头部与卡片详情的「会话」区各一个按钮，二次确认）。一次删除做四件事，**都不抛**（失败也只回 `{ok:false,error}`，不是 5xx）：
+
+1. **停掉该卡的托管进程**（若在跑）：就是「停止」那条路径（关 stdin → omp 自己收尾退出）；
+2. **清掉转录**：`session_messages` 里这张卡的行整卡删掉（`store.clearSessionMessages`）；
+3. **清掉卡片上的会话事实**：落一条新事件 **`session.deleted`**，投影里 `session = null`。这条事件让 `PROJECTION_VERSION` 从 8 升到 **9**（老投影不认这条事件，必须重放才拿到 `null`）；
+4. **清掉攒着等它的东西**：pending 的审批通知（`delivered` 留着 —— 那些决定已经打扰过 agent，不该因为删了会话就在新会话里重复打扰）、进程内的 live 记录。
+
+**不删什么，为什么**：
+
+- **不动磁盘上 omp 的会话文件**。会话文件是 omp 的资产，不是 flowcard 的：删掉它等于替用户毁掉他在自己终端里 `omp -r` 回去的路。flowcard 只**不再记**它（卡片 `session = null`），所以「下次启动是全新对话」这件事由卡片事实保证，不靠删文件。
+- **不删卡片**，也不动状态机：删会话不是流程事实，卡片的 issue/PR/worktree/门禁都原样。
+
+顺序上有讲究（见 `hosted-session.ts` 的 `remove`）：**先**摘 live 记录、清转录、落 `session.deleted`（全同步），**最后**才等进程收尾。`handle()` 头一行的 `records` 成员守卫因此会把在途帧全丢掉 —— 转录清掉之后不会再被写回一行，也不会冒出一条与删除矛盾的 `session.ended`；而卡片事实在任何 `await` 之前就清了，并发来的 `prompt` 只会看到「没有会话」（409），不可能把这条会话续接回来。删完再 `start()`：卡片上没有会话文件可认（`resolveResumeFile` 拿 null）→ **argv 里没有 `-r`**，是一段全新的对话。
+
+### 14.6 里程碑
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M10** ✅ | 每卡一个托管 omp RPC 会话（stdio 管道）：5 个 HTTP 端点 + 每卡 SSE、转录落库、自动开工改走托管会话、旧终端路径删除 | 假 omp 端到端（起→ready→prompt→文本/工具/输出→result→转录落库；abort；stop；子进程早退→卡片会话 `ended`；重启后转录仍在）；真机一次：`/tmp/fc-hosted` 里发一句极短 prompt，SSE 出 `ready/message/tool/state`，`GET .../session` 给出转录与 tokens |
+| **M10** ✅ | 每卡一个托管 omp RPC 会话（stdio 管道）：6 个 HTTP 端点 + 每卡 SSE、转录落库、自动开工改走托管会话、旧终端路径删除、会话可删（§14.5） | 假 omp 端到端（起→ready→prompt→文本/工具/输出→result→转录落库；abort；stop；删会话→转录空 + 卡片 `session=null` + 再起是全新对话；子进程早退→卡片会话 `ended`；重启后转录仍在）；真机一次：`/tmp/fc-hosted` 里发一句极短 prompt，SSE 出 `ready/message/tool/state`，`GET .../session` 给出转录与 tokens |
 
 **P2（未做）**：步骤协议 —— **不让 AI 同步状态，而是告诉 AI 当前要做什么，做完让它输出"是否通过 / 是否需要人工介入"的结构化回执**；回执要用的是**最后一条助手回复的完整文本**，所以本次先把转录持久化了。
