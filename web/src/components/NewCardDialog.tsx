@@ -12,7 +12,12 @@ type Draft = { title: string; body: string };
 const EMPTY_DRAFT: Draft = { title: "", body: "" };
 
 /** 服务端回的开卡结果（只取要展示的两项）。 */
-type Created = { id: string; title: string | null };
+type Created = {
+  id: string;
+  title: string | null;
+  /** 开卡即开工的结果：起会话成不成、起在哪儿。 */
+  autostart: { status: string; cwd?: string; summary: string; terminal?: { terminal?: string } } | null;
+};
 
 /**
  * 人在看板上自己开卡：正文必填（主输入，支持粘贴/拖放图片），标题可选。
@@ -78,7 +83,11 @@ export function NewCardDialog({
       setError(rejection ? `${rejection.code}：${rejection.message}` : "开卡失败：服务端没有给出原因。");
       return;
     }
-    setCreated({ id: result.card?.id ?? "（服务端未回 id）", title: result.card?.title ?? null });
+    setCreated({
+      id: result.card?.id ?? "（服务端未回 id）",
+      title: result.card?.title ?? null,
+      autostart: result.autostart ?? null,
+    });
     setDraft(EMPTY_DRAFT);
     await onCreated();
   }, [draft, onCreated, projectId]);
@@ -130,6 +139,20 @@ export function NewCardDialog({
                 {created.title ?? "（服务端没有回标题，以看板上的卡为准）"}
               </div>
               <div className="font-mono text-[11px] text-emerald-800/80">{created.id}</div>
+              {created.autostart ? (
+                <div
+                  data-testid="new-card-autostart"
+                  className={
+                    created.autostart.status === "started"
+                      ? "text-[11px] text-emerald-800"
+                      : "text-[11px] text-amber-800"
+                  }
+                >
+                  {created.autostart.status === "started"
+                    ? `已在你桌面上起会话（${created.autostart.terminal?.terminal ?? "终端"}，工作目录 ${created.autostart.cwd ?? "?"}）——worktree 由会话自己按提示创建并登记`
+                    : `会话没起来：${created.autostart.summary}（卡片上留了一条评论，附手动命令）`}
+                </div>
+              ) : null}
             </div>
           ) : null}
 

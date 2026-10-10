@@ -13,6 +13,9 @@ import { runSyncRound, startSyncScheduler, trackedNumbers } from "./syncer.ts";
 import type { HttpGet } from "./sync.ts";
 import type { Run } from "./probe.ts";
 import { readProject } from "./projects.ts";
+import { autostartCard } from "./autostart.ts";
+import { writeBriefFile } from "./brief.ts";
+import { defaultAdapterPath, launchSession, resolveOmpPath } from "./launch.ts";
 import { clampGraphLimit, readGraph } from "./graph.ts";
 import { readCardDiff } from "./diff.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
@@ -36,6 +39,20 @@ export type AppOptions = {
     http?: HttpGet;
     run?: Run;
     teaConfig?: string | null;
+  };
+  /**
+   * 开卡即开工：`open` 成功后自动**在桌面上起一次会话**并把开工提示注入进去
+   * （worktree 由会话自己按提示创建、自己登记）。`enabled: false` 或未传则只开卡不起会话。
+   */
+  autostart?: {
+    enabled: boolean;
+    dataDir: string;
+    adapterPath?: string;
+    cli?: string;
+    /** 测试注入：替换真正的"起会话"实现。 */
+    launch?: typeof launchSession;
+    resolveOmpPath?: typeof resolveOmpPath;
+    writeBrief?: typeof writeBriefFile;
   };
 };
 
@@ -115,6 +132,37 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       types: result.outcome.events.map((e) => e.type),
     });
 
+    // 开卡即开工：卡片建好就在桌面上把会话立起来（带开工提示）；失败会自己写到卡片评论上
+    let autostart: Awaited<ReturnType<typeof autostartCard>> | undefined;
+    if (
+      !result.outcome.rejection &&
+      parsed.data.cmd === "open" &&
+      opts.autostart?.enabled === true &&
+      result.card
+    ) {
+      autostart = await autostartCard(result.card.id, {
+        getCard: (id) => store.getCard(id),
+        getProject: (id) => store.getProject(id),
+        comment: async (cardId, body) => {
+          store.execute({
+            cmd: "comment",
+            actor: { kind: "system" },
+            card: cardId,
+            body,
+            dedupeKey: `autostart:${cardId}:${body.length}`,
+          });
+        },
+        dataDir: opts.autostart.dataDir,
+        ...(opts.autostart.adapterPath ? { adapterPath: opts.autostart.adapterPath } : {}),
+        ...(opts.autostart.cli ? { cli: opts.autostart.cli } : {}),
+        io: {
+          launchSession: opts.autostart.launch ?? launchSession,
+          resolveOmpPath: opts.autostart.resolveOmpPath ?? resolveOmpPath,
+          writeBrief: opts.autostart.writeBrief ?? writeBriefFile,
+        },
+      });
+    }
+
     const rejection = result.outcome.rejection;
     const status = rejection
       ? rejection.code === "NOT_FOUND"
@@ -131,6 +179,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
         inserted: result.inserted.length,
         duplicates: result.duplicates,
         notes: result.outcome.notes,
+        ...(autostart ? { autostart } : {}),
         ...(rejection ? { rejection } : {}),
         ...(result.outcome.blocked ? { blocked: result.outcome.blocked } : {}),
       },

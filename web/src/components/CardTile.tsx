@@ -82,11 +82,17 @@ export function CardTile({
 
         {activity.length > 0 ? (
           <span className="flex flex-wrap items-center gap-1" data-testid="tile-activity">
-            {activity.slice(0, 2).map((signal) => (
-              <Badge key={signal.key} variant={signal.tone} title={signal.detail ?? signal.label} data-testid={`tile-activity-${signal.key}`}>
+            {activity.slice(0, 6).map((signal) => (
+              <Badge
+                key={signal.key}
+                variant={signal.tone}
+                title={signal.detail ?? signal.label}
+                data-testid={`tile-activity-${signal.key}`}
+              >
                 {signal.label}
               </Badge>
             ))}
+            {activity.length > 6 ? <Badge variant="muted">{`+${activity.length - 6}`}</Badge> : null}
           </span>
         ) : null}
 

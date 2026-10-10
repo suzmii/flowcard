@@ -5,6 +5,7 @@ import { personalFlow } from "../flow/personal.ts";
 import { createApp } from "./app.ts";
 import { createRuntimeSupervisor } from "./runtime.ts";
 import { createStore } from "./store.ts";
+import { defaultAdapterPath } from "./launch.ts";
 import { DEFAULT_SYNC_INTERVAL_MS } from "./syncer.ts";
 
 const dataDir =
@@ -18,7 +19,17 @@ const runtime = createRuntimeSupervisor({ store, dataDir });
 /** 后台同步节奏：默认 5 分钟一轮（`FLOWCARD_SYNC_INTERVAL_MS=0` 关掉）。 */
 const syncRaw = Number(process.env.FLOWCARD_SYNC_INTERVAL_MS ?? "");
 const syncIntervalMs = Number.isFinite(syncRaw) && syncRaw >= 0 ? syncRaw : DEFAULT_SYNC_INTERVAL_MS;
-const app = createApp(store, { runtime, sync: { intervalMs: syncIntervalMs } });
+const app = createApp(store, {
+  runtime,
+  sync: { intervalMs: syncIntervalMs },
+  autostart: {
+    // 默认开；`FLOWCARD_AUTOSTART=0` 关掉（只开卡、不起会话）
+    enabled: process.env.FLOWCARD_AUTOSTART !== "0",
+    dataDir,
+    adapterPath: defaultAdapterPath(),
+    cli: "flowcard",
+  },
+});
 
 // 上一次跑挂/被 SIGKILL 时留下的运行时进程组，这里收尾（只收自己起的那些）。
 const reaped = await runtime.reapStale();

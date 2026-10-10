@@ -120,9 +120,15 @@ export function CardDetail({
             <h2 className="text-sm font-semibold leading-snug">{card.title}</h2>
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               <Badge variant="outline">{STATE_LABELS[card.state]}</Badge>
-              <span className="text-xs text-muted-foreground" data-testid="detail-activity">
-                当前：{cardActivity(card).filter((a) => a.key !== "session-cwd").slice(0, 3).map((a) => a.label).join(" · ") || "—"}
-                {" · "}下一步：{cardNextStep(card)}
+              <span className="flex flex-wrap items-center gap-1" data-testid="detail-activity">
+                {cardActivity(card).map((signal) => (
+                  <Badge key={signal.key} variant={signal.tone} title={signal.detail ?? signal.label}>
+                    {signal.label}
+                  </Badge>
+                ))}
+              </span>
+              <span className="text-xs text-muted-foreground" data-testid="detail-next-step">
+                下一步：{cardNextStep(card)}
               </span>
               <Badge variant="muted" className="font-mono">
                 {card.id}

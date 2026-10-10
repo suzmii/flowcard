@@ -184,6 +184,15 @@ export const commandsResponseSchema = z.looseObject({
   notes: z.array(z.string()).optional(),
   rejection: rejectionSchema.optional(),
   blocked: z.looseObject({ missing: z.array(z.string()) }).optional(),
+  /** 开卡即开工的结果（只有 `open` 会带；服务端 `FLOWCARD_AUTOSTART=0` 时没有）。 */
+  autostart: z
+    .looseObject({
+      status: z.string(),
+      cwd: z.string().optional(),
+      summary: z.string(),
+      terminal: z.looseObject({ terminal: z.string().optional(), command: z.string().optional() }).optional(),
+    })
+    .optional(),
 });
 
 /**
