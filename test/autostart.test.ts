@@ -1,8 +1,8 @@
 /** 开工这条链路的单测：提示词内容、argv 拼装与引号、编排的降级路径。全部不碰真终端/git。 */
 import { describe, expect, it } from "vitest";
 import { cardBrief, writeBriefFile } from "../src/server/brief.ts";
-import { autostartCard, hasLiveSession, worktreePlanFor } from "../src/server/autostart.ts";
-import { defaultAdapterPath, sessionCommand, shq, worktreeArgv } from "../src/server/launch.ts";
+import { autostartCard, hasLiveSession } from "../src/server/autostart.ts";
+import { defaultAdapterPath, sessionCommand, shq } from "../src/server/launch.ts";
 import { emptyCard } from "../src/server/project.ts";
 import type { Card, Project } from "../src/shared/types.ts";
 
@@ -82,15 +82,6 @@ describe("启动命令拼装", () => {
     expect(shq("it's")).toBe("'it'\\''s'");
   });
 
-  it("worktree 参数：新分支带 -b，已存在时退化成绑现有分支", () => {
-    const plan = { repoPath: "/repo", path: "/repo/.worktrees/c7", branch: "feat/c7", base: "master" };
-    expect(worktreeArgv(plan, { useExistingBranch: false })).toEqual([
-      "-C", "/repo", "worktree", "add", "/repo/.worktrees/c7", "-b", "feat/c7", "master",
-    ]);
-    expect(worktreeArgv(plan, { useExistingBranch: true })).toContain("feat/c7");
-    expect(worktreeArgv(plan, { useExistingBranch: true })).not.toContain("-b");
-  });
-
   it("会话命令：带扩展与提示文件，且提示用 $(cat) 传，退出后留住终端", () => {
     const cmd = sessionCommand({
       ompPath: "/home/u/.bun/bin/omp",
@@ -111,15 +102,10 @@ describe("自动开工编排", () => {
     const base = {
       getCard: (id: string) => cards.get(id),
       getProject: () => project,
-      bindWorktree: async (id: string, ref: { path: string; branch: string }) => {
-        calls.push(`bind:${id}:${ref.path}`);
-        cards.set(id, { ...cards.get(id)!, worktree: { ...ref, source: "flowcard" } });
-      },
       comment: async (id: string, body: string) => void calls.push(`comment:${id}:${body}`),
       dataDir: "/data",
       adapterPath: "/repo/src/adapters/omp/adapter.ts",
       io: {
-        createWorktree: async () => ({ ok: true, path: "/repo/.worktrees/c7", branch: "feat/c7", reusedBranch: false }),
         launchSession: async () => ({ ok: true, terminal: "konsole", command: "omp …" }),
         resolveOmpPath: async () => "/home/u/.bun/bin/omp",
         writeBrief: async () => ({ written: true }),
@@ -130,13 +116,12 @@ describe("自动开工编排", () => {
     return base;
   };
 
-  it("正常路径：建 worktree → 绑定 → 写提示 → 起会话，并把结论写进评论", async () => {
+  it("正常路径：写提示 → 在项目根起会话（worktree 交给 AI），结论写进评论", async () => {
     const d = deps();
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("started");
-    expect(outcome.worktree?.path).toBe("/repo/.worktrees/c7");
+    expect(outcome.cwd).toBe("/repo");
     expect(outcome.terminal).toEqual({ ok: true, terminal: "konsole", command: "omp …" });
-    expect(d.calls.some((c) => c.startsWith("bind:c7:"))).toBe(true);
     expect(d.calls.some((c) => c.startsWith("comment:c7:已在桌面上启动会话"))).toBe(true);
   });
 
@@ -147,27 +132,21 @@ describe("自动开工编排", () => {
     expect(outcome.status).toBe("skipped");
   });
 
-  it("建 worktree 失败 → 不静默：写清失败原因与手动命令，不起会话", async () => {
-    const d = deps({
-      io: {
-        createWorktree: async () => ({ ok: false, reason: "not-a-repo", message: "/repo 不是 git 仓库" }),
-        launchSession: async () => {
-          throw new Error("不该走到起会话这一步");
-        },
-        resolveOmpPath: async () => undefined,
-        writeBrief: async () => ({ written: true }),
-      },
-    });
+  it("提示里把「建 worktree」交回给会话：名字自定 + 要登记 + 要切进去", async () => {
+    const d = deps();
     const outcome = await autostartCard("c7", d as never);
-    expect(outcome.status).toBe("failed");
-    expect(d.calls.some((c) => c.includes("自动开工失败"))).toBe(true);
-    expect(d.calls.some((c) => c.includes("worktree add"))).toBe(true);
+    const text = cardBrief({ card: card(), project });
+    expect(outcome.status).toBe("started");
+    expect(text).toMatch(/名字由你起/);
+    expect(text).toMatch(/git worktree add \.worktrees\/<你起的名字>/);
+    expect(text).toMatch(/flowcard worktree c7 --path/);
+    expect(text).toMatch(/\/wt <分支>|\/move <路径>/);
+    expect(text).toMatch(/在主仓库里改文件不算开工/);
   });
 
-  it("没终端 → worktree 照样建好绑定，评论里给手动启动命令", async () => {
+  it("没终端 → 评论里给手动启动命令，卡片状态不动", async () => {
     const d = deps({
       io: {
-        createWorktree: async () => ({ ok: true, path: "/repo/.worktrees/c7", branch: "feat/c7", reusedBranch: false }),
         launchSession: async () => ({ ok: false, reason: "no-terminal", message: "没找到可用的终端" }),
         resolveOmpPath: async () => undefined,
         writeBrief: async () => ({ written: true }),
@@ -175,7 +154,7 @@ describe("自动开工编排", () => {
     });
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("failed");
-    expect(outcome.worktree?.branch).toBe("feat/c7");
+    expect(outcome.cwd).toBe("/repo");
     expect(d.calls.some((c) => c.includes("没起来会话"))).toBe(true);
   });
 
@@ -188,10 +167,5 @@ describe("自动开工编排", () => {
   it("扩展路径由服务端自己算出来（不靠环境变量）", () => {
     const path = defaultAdapterPath();
     expect(path.endsWith("src/adapters/omp/flowcard-omp-adapter.ts")).toBe(true);
-  });
-
-  it("worktree 计划：路径落在项目下的 .worktrees/<卡片 id>，分支 feat/<卡片 id>", () => {
-    const plan = worktreePlanFor(card(), project);
-    expect(plan).toMatchObject({ repoPath: "/repo", path: "/repo/.worktrees/c7", branch: "feat/c7", base: "master" });
   });
 });

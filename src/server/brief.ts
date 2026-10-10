@@ -29,7 +29,18 @@ function steps(card: Card, cli: string, worktree: { path: string; branch: string
   out.push(
     wt
       ? line(true, `worktree 已就绪：\`${wt.path}\`（分支 \`${wt.branch}\`）——**你就在里面干活，别切到主仓库**`)
-      : line(false, `先建 worktree：\`${cli} worktree ${card.id} --path .worktrees/${card.id} --branch feat/${card.id}\`（建完再回到那个目录继续）`),
+      : line(
+          false,
+          [
+            "**先建 worktree，名字由你起**（按这次要干的事取名，短一点好认）：",
+            "  ```bash",
+            "  git worktree add .worktrees/<你起的名字> -b feat/<你起的名字>",
+            `  ${cli} worktree ${card.id} --path .worktrees/<你起的名字> --branch feat/<你起的名字>   # 登记到卡片（不登记我认不出这张卡）`,
+            "  ```",
+            "  然后**把当前会话移进去**（omp：`/wt <分支>` 或 `/move <路径>`），再开始改文件——",
+            "  **在主仓库里改文件不算开工**（卡片进不了「实施中」）；建完登记后心跳会自动把会话认到这张卡上。",
+          ].join("\n"),
+        ),
   );
 
   out.push(
