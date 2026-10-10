@@ -87,6 +87,35 @@ const commentSchema = z.looseObject({
   body: z.string(),
 });
 
+/**
+ * 代码评审（`Card.review`，恒存在）：行级注释 + 最后一次判定。
+ * 与共享契约 `src/shared/types.ts` 的 `Review` 用文件末尾的编译期断言锁在一起。
+ */
+const reviewCommentSchema = z.looseObject({
+  id: z.string(),
+  sha: z.string(),
+  path: z.string(),
+  line: z.number(),
+  side: z.enum(["new", "old"]).catch("new"),
+  body: z.string(),
+  at: z.string(),
+  actor: actorSchema,
+  /** true = 这条评论基于的提交已不是当前 head（行可能已漂） */
+  outdated: z.boolean().default(false),
+});
+
+const reviewVerdictSchema = z.looseObject({
+  decision: z.enum(["approve", "request_changes", "comment"]).catch("comment"),
+  at: z.string(),
+  by: z.string(),
+  body: z.string().optional(),
+});
+
+const reviewSchema = z.looseObject({
+  comments: z.array(reviewCommentSchema).default([]),
+  verdict: reviewVerdictSchema.optional(),
+});
+
 /** 运行时字段（`Card.runtime: Runtime | null`）。 */
 const runtimeSchema = z.looseObject({
   status: z.enum(["stopped", "starting", "running", "failed"]),
@@ -113,6 +142,8 @@ export const cardViewSchema = z.looseObject({
   confirmations: z.array(confirmationSchema),
   pushes: z.array(pushSchema),
   comments: z.array(commentSchema),
+  /** 代码评审（本地事实）；老投影缺这个字段时按"空评审"处理，别让整个看板解析失败 */
+  review: reviewSchema.default(() => ({ comments: [] })),
   partOf: z.string().optional(),
   spawned: z.array(z.string()),
   acceptedAt: z.string().optional(),

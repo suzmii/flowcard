@@ -1,7 +1,8 @@
 import { useCallback, useState } from "react";
-import { AlertTriangle, LayoutGrid, Plus, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, GitFork, LayoutGrid, Plus, RefreshCw, Wifi, WifiOff } from "lucide-react";
 import { Board } from "@/components/Board";
 import { CardDetail } from "@/components/CardDetail";
+import { GraphView } from "@/components/GraphView";
 import { NewCardDialog } from "@/components/NewCardDialog";
 import { ProjectSwitcher } from "@/components/ProjectSwitcher";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,28 @@ import { useBoard, type Connection } from "@/lib/useBoard";
 import { useProjects } from "@/lib/useProjects";
 import { shortRemote } from "@/lib/projects";
 import { clockTime } from "@/lib/utils";
+
+/** 主视图：看板 / 提交图（提交图不重排看板，只切换主区）。 */
+type View = "board" | "graph";
+
+const VIEW_KEY = "flowcard.view";
+
+function readView(): View {
+  try {
+    return window.localStorage.getItem(VIEW_KEY) === "graph" ? "graph" : "board";
+  } catch {
+    // 隐私模式等拿不到 localStorage：只是不持久化
+    return "board";
+  }
+}
+
+function writeView(view: View) {
+  try {
+    window.localStorage.setItem(VIEW_KEY, view);
+  } catch {
+    /* 同上 */
+  }
+}
 
 const CONNECTION_TEXT: Record<Connection, string> = {
   connecting: "连接中…",
@@ -27,8 +50,14 @@ export function App() {
   const board = useBoard();
   const projects = useProjects();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [view, setView] = useState<View>(() => readView());
   const [refreshing, setRefreshing] = useState(false);
   const [newCardOpen, setNewCardOpen] = useState(false);
+
+  const switchView = useCallback((next: View) => {
+    setView(next);
+    writeView(next);
+  }, []);
 
   const cards = board.cards ?? [];
   // 看板按当前项目过滤（服务端把没归属的卡投影成 projectId="local"）；没有可选项目时不过滤。
@@ -67,6 +96,31 @@ export function App() {
                 运行时事件 {board.runtimeEvents}
               </Badge>
             ) : null}
+          </div>
+
+          <div className="flex items-center gap-0.5 rounded-md border p-0.5" role="tablist" aria-label="主视图">
+            <Button
+              size="xs"
+              variant={view === "board" ? "secondary" : "ghost"}
+              data-testid="view-board"
+              role="tab"
+              aria-selected={view === "board"}
+              onClick={() => switchView("board")}
+            >
+              <LayoutGrid />
+              看板
+            </Button>
+            <Button
+              size="xs"
+              variant={view === "graph" ? "secondary" : "ghost"}
+              data-testid="view-graph"
+              role="tab"
+              aria-selected={view === "graph"}
+              onClick={() => switchView("graph")}
+            >
+              <GitFork />
+              提交图
+            </Button>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
@@ -125,12 +179,20 @@ export function App() {
       ) : null}
 
       <main className="min-h-0 flex-1">
-        <Board
-          cards={visibleCards}
-          loading={board.loading}
-          selectedId={selectedId}
-          onSelect={setSelectedId}
-        />
+        {view === "graph" ? (
+          <GraphView
+            project={currentProject}
+            version={board.lastChangedAt ?? ""}
+            onOpenCard={setSelectedId}
+          />
+        ) : (
+          <Board
+            cards={visibleCards}
+            loading={board.loading}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+          />
+        )}
       </main>
 
       {selected ? (

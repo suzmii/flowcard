@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { CircleSlash, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
+import { CodeChanges } from "@/components/detail/CodeChanges";
 import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
@@ -160,6 +161,8 @@ export function CardDetail({
           <Section title="会话" hint="cwd 必须落在 worktree 内">
             <SessionPanel card={card} />
           </Section>
+
+          <CodeChanges card={card} onRefresh={onRefresh} />
 
           <Section title="门禁" hint="未决门禁可在这里批准/驳回">
             <GatePanel card={card} busy={busy} onRun={run} />
