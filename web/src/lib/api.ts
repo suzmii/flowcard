@@ -70,10 +70,11 @@ export async function readErrorBody(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
-export async function fetchCards(signal?: AbortSignal): Promise<CardView[]> {
+export async function fetchCards(signal?: AbortSignal, opts: { includeDeleted?: boolean } = {}): Promise<CardView[]> {
+  const query = opts.includeDeleted ? "?includeDeleted=1" : "";
   let res: Response;
   try {
-    res = await fetch(`${BASE}/api/cards`, { signal, headers: { accept: "application/json" } });
+    res = await fetch(`${BASE}/api/cards${query}`, { signal, headers: { accept: "application/json" } });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw unreachable(error);

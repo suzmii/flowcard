@@ -137,6 +137,8 @@ const runtimeSchema = z.looseObject({
 });
 
 export const cardViewSchema = z.looseObject({
+  deletedAt: z.string().optional(),
+  deletedReason: z.string().optional(),
   id: z.string(),
   title: z.string(),
   body: z.string(),

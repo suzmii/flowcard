@@ -108,7 +108,7 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  *     建卡直接落 `ready`，所以形态变了、必须重放。
  * v6：卡片新增 `remoteComments`（同步进来的远端评论），老投影里没有 → 重放补上空数组。
  */
-export const PROJECTION_VERSION = "6";
+export const PROJECTION_VERSION = "7";
 
 /**
  * 一个项目上一轮同步的结果（按项目存在 `meta` 表里，**不进事件流**）：

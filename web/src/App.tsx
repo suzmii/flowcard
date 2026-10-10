@@ -47,7 +47,8 @@ const CONNECTION_TONE: Record<Connection, string> = {
 };
 
 export function App() {
-  const board = useBoard();
+  const [showDeleted, setShowDeleted] = useState(false);
+  const board = useBoard({ includeDeleted: showDeleted });
   const projects = useProjects();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>(() => readView());
@@ -131,7 +132,19 @@ export function App() {
           </div>
 
           <div className="ml-auto flex items-center gap-2">
-            <Button
+                        <label
+              className="flex items-center gap-1 text-xs text-muted-foreground"
+              data-testid="show-deleted"
+              title="软删除的卡默认不显示；勾上可以看到并恢复"
+            >
+              <input
+                type="checkbox"
+                checked={showDeleted}
+                onChange={(event) => setShowDeleted(event.target.checked)}
+              />
+              显示已删除
+            </label>
+<Button
               size="sm"
               data-testid="new-card-open"
               onClick={() => setNewCardOpen(true)}

@@ -94,7 +94,12 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     c.json({ ok: true, cards: store.listCards().length, events: store.listEvents(1).length }),
   );
 
-  app.get("/api/cards", (c) => c.json({ cards: store.listCards() }));
+  app.get("/api/cards", (c) => {
+    // 软删除的卡默认不进看板；`?includeDeleted=1` 才带出来（配合 CLI 的 restore 用）
+    const includeDeleted = c.req.query("includeDeleted") === "1";
+    const cards = store.listCards().filter((card) => includeDeleted || !card.deletedAt);
+    return c.json({ cards });
+  });
 
   app.get("/api/cards/:id", (c) => {
     const card = store.getCard(c.req.param("id"));

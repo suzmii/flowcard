@@ -99,6 +99,16 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       next.blockedReason = String(p.reason ?? "");
       break;
 
+    case "card.deleted":
+      next.deletedAt = at;
+      if (typeof p.reason === "string" && p.reason !== "") next.deletedReason = p.reason;
+      break;
+
+    case "card.restored":
+      delete next.deletedAt;
+      delete next.deletedReason;
+      break;
+
     case "card.accepted":
       next.acceptedAt = at;
       break;

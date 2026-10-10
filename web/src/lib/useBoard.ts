@@ -21,7 +21,7 @@ export type BoardData = {
 
 const PING_TIMEOUT_MS = 30_000;
 
-export function useBoard(): BoardData {
+export function useBoard(opts: { includeDeleted?: boolean } = {}): BoardData {
   const [cards, setCards] = useState<CardView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -35,7 +35,7 @@ export function useBoard(): BoardData {
     if (inFlight.current) return;
     inFlight.current = true;
     try {
-      const next = await fetchCards();
+      const next = await fetchCards(undefined, { includeDeleted: opts.includeDeleted === true });
       setCards(next);
       setError(null);
     } catch (cause) {
@@ -46,7 +46,7 @@ export function useBoard(): BoardData {
       inFlight.current = false;
       setLoading(false);
     }
-  }, []);
+  }, [opts.includeDeleted]);
 
   useEffect(() => {
     void refresh();

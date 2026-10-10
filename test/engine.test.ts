@@ -264,6 +264,44 @@ describe("声明式 setter 的幂等语义", () => {
   });
 });
 
+describe("删除与恢复（软删除：看板消失、事件留痕、可恢复）", () => {
+  it("删除后带 deletedAt 与原因，重复删除只记 no-op", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "要删的卡", body: "" }).primaryCardId;
+
+    h.run({ cmd: "delete", actor: h.human, card: id, reason: "建错了" });
+    expect(h.card(id).deletedAt).toBeDefined();
+    expect(h.card(id).deletedReason).toBe("建错了");
+
+    const again = h.run({ cmd: "delete", actor: h.human, card: id, reason: "再删一次" });
+    expect(again.events).toHaveLength(0);
+    expect(again.notes.join(" ")).toContain("已经是删除状态");
+  });
+
+  it("恢复清掉删除标记；没删过就恢复是 no-op", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "恢复", body: "" }).primaryCardId;
+    const clean = h.run({ cmd: "restore", actor: h.human, card: id });
+    expect(clean.notes.join(" ")).toContain("本来就没被删除");
+
+    h.run({ cmd: "delete", actor: h.human, card: id });
+    h.run({ cmd: "restore", actor: h.human, card: id });
+    expect(h.card(id).deletedAt).toBeUndefined();
+    expect(h.rebuild(id)).toEqual(h.card(id));
+  });
+
+  it("删除不影响其它字段（六项要件与评论都留着）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "删了也别丢", body: "", issue: issueRef }).primaryCardId;
+    h.run({ cmd: "comment", actor: h.agent, card: id, body: "一条评论" });
+    h.run({ cmd: "delete", actor: h.human, card: id });
+
+    const card = h.card(id);
+    expect(card.issue?.number).toBe(issueRef.number);
+    expect(card.comments.map((c) => c.body)).toContain("一条评论");
+  });
+});
+
 describe("worktree 路径统一成绝对（相对路径会让 cwd 校验永远失败）", () => {
   const project = {
     id: "proj-1",

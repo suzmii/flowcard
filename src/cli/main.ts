@@ -442,6 +442,15 @@ async function build(): Promise<Command> {
         card: requireCard(),
         ...(opt("reason") ? { reason: opt("reason")! } : {}),
       };
+    case "delete":
+      return {
+        cmd: "delete",
+        actor: actor(),
+        card: requireCard(),
+        ...(opt("reason") || opt("body") ? { reason: opt("reason") ?? opt("body")! } : {}),
+      };
+    case "restore":
+      return { cmd: "restore", actor: actor(), card: requireCard() };
     case "drop":
       return {
         cmd: "drop",

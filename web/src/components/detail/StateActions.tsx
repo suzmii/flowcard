@@ -1,9 +1,9 @@
 /**
- * 卡片上的"人工推进"动作：**只剩「放弃这条」**（drop，必须写理由，理由进评论留痕）。
+ * 卡片上的"人工推进"动作：**放弃**（drop，理由进评论）与**删除**（软删除：从看板消失、可恢复）。
  * 其余推进都由事实自动完成（绑 worktree / 起会话自动开工、推送、PR 合并、验收、清理）。
  */
 import { useState } from "react";
-import { CircleSlash } from "lucide-react";
+import { CircleSlash, Trash2, Undo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { CardView } from "@/lib/schema";
@@ -21,11 +21,34 @@ export function StateActions({
 }) {
   const [reason, setReason] = useState("");
   const [confirmDrop, setConfirmDrop] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteReason, setDeleteReason] = useState("");
+
+  const human = { kind: "human", name: "me" } as const;
+
+  // 已删除：只给"恢复"（软删除，事件与六项要件都还在）
+  if (card.deletedAt) {
+    return (
+      <div className="flex flex-wrap items-center gap-2" data-testid="state-actions">
+        <span className="text-xs text-amber-700">
+          已删除{card.deletedReason ? `（${card.deletedReason}）` : ""} · {card.deletedAt.slice(0, 16).replace("T", " ")}
+        </span>
+        <Button
+          size="xs"
+          variant="outline"
+          data-testid="state-restore"
+          disabled={busy !== null}
+          onClick={() => void onRun("恢复卡片", { cmd: "restore", actor: human, card: card.id })}
+        >
+          <Undo2 />
+          恢复这张卡
+        </Button>
+      </div>
+    );
+  }
 
   const finished = card.state === "done" || card.state === "dropped";
   if (finished) return null;
-
-  const human = { kind: "human", name: "me" } as const;
 
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="state-actions">
@@ -70,6 +93,51 @@ export function StateActions({
         >
           <CircleSlash />
           放弃这条
+        </Button>
+      )}
+
+      {confirmDelete ? (
+        <span className="flex flex-wrap items-center gap-2" data-testid="state-delete-form">
+          <Input
+            data-testid="state-delete-reason"
+            autoFocus
+            className="h-7 max-w-[20rem] text-xs"
+            placeholder="为什么删（可选，记进事件）"
+            value={deleteReason}
+            onChange={(event) => setDeleteReason(event.target.value)}
+          />
+          <Button
+            size="xs"
+            variant="outline"
+            data-testid="state-delete-submit"
+            disabled={busy !== null}
+            onClick={() =>
+              void onRun("删除卡片", {
+                cmd: "delete",
+                actor: human,
+                card: card.id,
+                ...(deleteReason.trim() ? { reason: deleteReason.trim() } : {}),
+              })
+            }
+          >
+            <Trash2 />
+            确认删除
+          </Button>
+          <Button size="xs" variant="ghost" onClick={() => setConfirmDelete(false)}>
+            取消
+          </Button>
+        </span>
+      ) : (
+        <Button
+          size="xs"
+          variant="ghost"
+          data-testid="state-delete"
+          disabled={busy !== null}
+          title="软删除：从看板消失，事件与六项要件都留着，可恢复"
+          onClick={() => setConfirmDelete(true)}
+        >
+          <Trash2 />
+          删除卡片
         </Button>
       )}
     </div>

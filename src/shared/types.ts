@@ -274,6 +274,9 @@ export type Card = {
   acceptedAt?: string;
   cleanedAt?: string;
   blockedReason?: string;
+  /** 软删除：删除时间与原因。看板默认不显示已删除的卡（`?includeDeleted=1` 可见并可恢复）。 */
+  deletedAt?: string;
+  deletedReason?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -287,6 +290,8 @@ export type EventType =
   | "card.spawned"
   | "card.accepted"
   | "card.blocked"
+  | "card.deleted"
+  | "card.restored"
   | "issue.bound"
   | "issue.state.changed"
   | "remote.comment.added"
@@ -515,6 +520,19 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     actor: actorSchema,
     card: z.string().min(1),
     reason: z.string().optional(),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
+    cmd: z.literal("delete"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    reason: z.string().optional(),
+    dedupeKey: z.string().optional(),
+  }),
+  z.object({
+    cmd: z.literal("restore"),
+    actor: actorSchema,
+    card: z.string().min(1),
     dedupeKey: z.string().optional(),
   }),
   z.object({

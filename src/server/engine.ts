@@ -598,6 +598,33 @@ export function runCommand(input: {
       break;
     }
 
+    case "delete": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      if (card.deletedAt) {
+        notes.push("卡片已经是删除状态，跳过");
+        break;
+      }
+      emit(
+        cmd.card,
+        "card.deleted",
+        { ...(cmd.reason ? { reason: cmd.reason } : {}) },
+        `delete:${cmd.card}:${shortHash(cmd.reason ?? "")}`,
+      );
+      break;
+    }
+
+    case "restore": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      if (!card.deletedAt) {
+        notes.push("卡片本来就没被删除，跳过");
+        break;
+      }
+      emit(cmd.card, "card.restored", {}, `restore:${cmd.card}:${card.deletedAt}`);
+      break;
+    }
+
     case "block": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });

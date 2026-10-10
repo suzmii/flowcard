@@ -176,6 +176,25 @@ describe("HTTP 接口", () => {
     await reader.cancel();
   });
 
+  it("软删除的卡默认不进列表，?includeDeleted=1 能看到（并可恢复）", async () => {
+    const { app } = harness();
+    const opened = await post(app, { cmd: "open", actor: HUMAN, title: "删我", body: "" });
+    const id = opened.data.card?.id ?? "";
+    await post(app, { cmd: "delete", actor: HUMAN, card: id, reason: "建错了" });
+
+    const hidden = (await (await app.request("/api/cards")).json()) as { cards: { id: string }[] };
+    expect(hidden.cards.map((c) => c.id)).not.toContain(id);
+
+    const shown = (await (await app.request("/api/cards?includeDeleted=1")).json()) as {
+      cards: { id: string; deletedAt?: string }[];
+    };
+    expect(shown.cards.find((c) => c.id === id)?.deletedAt).toBeDefined();
+
+    await post(app, { cmd: "restore", actor: HUMAN, card: id });
+    const back = (await (await app.request("/api/cards")).json()) as { cards: { id: string }[] };
+    expect(back.cards.map((c) => c.id)).toContain(id);
+  });
+
   it("rebuild 不改投影（HTTP 也能触发）", async () => {
     const { app, store } = harness();
     const opened = await post(app, { cmd: "open", actor: HUMAN, title: "重放", body: "" });
