@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { commandSchema, issueBaseInSchema, projectInSchema, runtimeActionSchema, syncRequestSchema } from "../shared/types.ts";
 import type { Project } from "../shared/types.ts";
@@ -60,6 +61,57 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   const app = new Hono();
   const subscribers = new Set<(event: string, data: unknown) => void>();
 
+  /**
+   * 调用方鉴别：**只监听回环不等于可信**——任意网页都能从浏览器打 127.0.0.1，
+   * 而本服务能起进程/起终端/读 Gitea 凭据，所以必须挡住"不是本页发来的"请求。
+   * 三条独立规则，任一命中即拒：
+   *   1. 带 `Sec-Fetch-Site` 且不是 same-origin/same-site/none（现代浏览器都会带）
+   *   2. 带 `Origin`/`Referer` 且主机不在白名单（本机回环）
+   *   3. 写接口（/api/commands 等）必须是 `Content-Type: application/json`——
+   *      这是 CORS 的"非安全列表类型"，跨站发它必须先过预检，而本服务不返回 CORS 头 ⇒ 跨站发不出来
+   */
+  const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+  const hostOf = (value: string): string | null => {
+    try {
+      return new URL(value).hostname;
+    } catch {
+      return null;
+    }
+  };
+  app.use("/api/*", async (c, next) => {
+    const site = c.req.header("sec-fetch-site");
+    if (site && site !== "same-origin" && site !== "same-site" && site !== "none") {
+      return c.json({ ok: false, rejection: { code: "FORBIDDEN", message: "拒绝跨站请求" } }, 403);
+    }
+    for (const header of ["origin", "referer"] as const) {
+      const value = c.req.header(header);
+      if (!value) continue;
+      const host = hostOf(value);
+      if (host !== null && !LOOPBACK_HOSTS.has(host)) {
+        return c.json({ ok: false, rejection: { code: "FORBIDDEN", message: `拒绝来自 ${host} 的请求` } }, 403);
+      }
+    }
+    return next();
+  });
+
+  // 写接口只收 JSON：既挡跨站简单请求，也顺手把"任何 Content-Type 都能写"堵上
+  app.use("/api/commands", async (c, next) => {
+    if (c.req.method === "POST") {
+      const type = c.req.header("content-type") ?? "";
+      if (!type.includes("application/json")) {
+        return c.json(
+          { ok: false, rejection: { code: "UNSUPPORTED_MEDIA", message: "只接受 application/json" } },
+          415,
+        );
+      }
+    }
+    return next();
+  });
+
+  // 请求体上限：JSON 走 1 MiB（正文/评论足够），附件单独给 12 MiB（比自己 10 MiB 的校验松一点，
+  // 真正的大小判定仍在 attachments.checkAttachment 里）
+  const jsonLimit = bodyLimit({ maxSize: 1 << 20, onError: (c) => c.json({ ok: false, rejection: { code: "PAYLOAD_TOO_LARGE", message: "请求体超过 1 MiB" } }, 413) });
+
   const broadcast = (event: string, data: unknown): void => {
     for (const send of subscribers) send(event, data);
   };
@@ -108,11 +160,14 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   });
 
   app.get("/api/events", (c) => {
-    const limit = Number(c.req.query("limit") ?? "200");
-    return c.json({ events: store.listEvents(Number.isFinite(limit) ? limit : 200) });
+    // SQLite 里负 LIMIT = 无上限，必须收敛（-1 会把整部历史一次性倒出来）
+    const raw = Number(c.req.query("limit") ?? "200");
+    // 负数/NaN 一律退回默认值（SQLite 里负 LIMIT = 无上限，绝不能透传）
+    const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 1000) : 200;
+    return c.json({ events: store.listEvents(limit) });
   });
 
-  app.post("/api/commands", async (c) => {
+  app.post("/api/commands", jsonLimit, async (c) => {
     const body = await c.req.json().catch(() => null);
     const parsed = commandSchema.safeParse(body);
     if (!parsed.success) {
@@ -359,7 +414,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
    * 登记项目（看板的 Metadata）：读一次 git 元数据存起来。同 path 幂等（`created:false` 并刷新元数据），
    * 因为"这个仓库现在长这样"是会变的，而重复登记不该产生第二个项目。
    */
-  app.post("/api/projects", async (c) => {
+  app.post("/api/projects", jsonLimit, async (c) => {
     const body = await c.req.json().catch(() => null);
     const parsed = projectInSchema.safeParse(body);
     if (!parsed.success) {
@@ -582,7 +637,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     return c.json({ roots, candidates });
   });
 
-  app.post("/api/projects/pick", async (c) => {
+  app.post("/api/projects/pick", jsonLimit, async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { start?: string; timeoutMs?: number };
     const roots = projectRootsFromEnv();
     const start = body.start ?? roots[0] ?? process.env.HOME ?? "/";

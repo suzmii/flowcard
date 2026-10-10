@@ -2,7 +2,7 @@
  * 存储：事件是真相，cards 表是可重建的投影。
  * 每次写入后按"该卡片的事件全量重放"重建投影，保证投影 == 事件流的折叠结果。
  */
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { Flow } from "../shared/flow.ts";
@@ -133,6 +133,12 @@ export type Store = {
   getCard(id: string): Card | undefined;
   listCards(): Card[];
   listEvents(limit?: number): Event[];
+  /**
+   * 某张卡片最近的 N 条某前缀事件（按 seq 升序返回）。
+   * `runtime.*` 用它：**全局滑窗会随心跳滑走**（最新 1000 条只覆盖约 8 小时），
+   * 一旦卡片的 runtime 事件滑出去，停止按钮就找不到进程身份了。
+   */
+  listEventsOfCard(cardId: string, typePrefix: string, limit?: number): Event[];
   /** 从零重放全部事件重建投影，返回卡片数。 */
   rebuild(): number;
   /** 全部项目（含合成项目 local，恒在；真实项目按登记时间排）。 */
@@ -182,8 +188,17 @@ const toAttachment = (row: AttachmentRow): Attachment => ({
 });
 
 export function createStore(opts: { dataDir: string; flow: Flow }): Store {
-  mkdirSync(opts.dataDir, { recursive: true });
-  const db = new DatabaseSync(`${opts.dataDir}/flowcard.sqlite`);
+  // 数据目录里有卡片正文、远端评论正文、附件：只给自己读写（不依赖 umask）
+  mkdirSync(opts.dataDir, { recursive: true, mode: 0o700 });
+  const dbPath = `${opts.dataDir}/flowcard.sqlite`;
+  const db = new DatabaseSync(dbPath);
+  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      chmodSync(file, 0o600);
+    } catch {
+      // -wal/-shm 可能还没建：下一轮再说，不该因此起不来
+    }
+  }
   db.exec(`
     PRAGMA journal_mode = WAL;
     CREATE TABLE IF NOT EXISTS events (
@@ -535,6 +550,13 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     execute,
     getCard,
     listCards,
+    listEventsOfCard(cardId: string, typePrefix: string, limit = 50) {
+      const rows = db
+        .prepare("SELECT * FROM events WHERE card_id = ? AND type LIKE ? ORDER BY seq DESC LIMIT ?")
+        .all(cardId, `${typePrefix}%`, Math.min(Math.max(limit, 1), 500)) as EventRow[];
+      return rows.map(toEvent).reverse();
+    },
+
     listEvents(limit = 200) {
       const rows = db
         .prepare("SELECT * FROM events ORDER BY seq DESC LIMIT ?")

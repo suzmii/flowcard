@@ -329,11 +329,13 @@ export function createRuntimeSupervisor(opts: RuntimeSupervisorOptions): Runtime
     return { signal: "SIGKILL" };
   };
 
-  /** 从事件流重建某个卡片最后一次运行的进程身份（重启后的唯一线索）。 */
+  /**
+   * 从事件流重建某个卡片最后一次运行的进程身份（重启后的唯一线索）。
+   * **按卡片查库**，不用全局滑窗：全局最新 1000 条只覆盖约 8 小时（心跳 30s 一条），
+   * 卡片的 runtime 事件滑出窗口后就找不到目标 → 停止按钮失效、残留进程没人收。
+   */
   const targetFromEvents = (cardId: string): StopTarget | null => {
-    const events = opts.store
-      .listEvents(1000)
-      .filter((e) => e.cardId === cardId && e.type.startsWith("runtime."));
+    const events = opts.store.listEventsOfCard(cardId, "runtime.", 50);
     for (let i = events.length - 1; i >= 0; i--) {
       const ev = events[i]!;
       if (ev.type === "runtime.stopped") return null;

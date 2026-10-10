@@ -61,7 +61,7 @@ export const TERMINALS: TerminalSpec[] = [
   { binary: "kitty", argv: ({ cwd, command }) => ["--directory", cwd, "bash", "-lc", command] },
   { binary: "alacritty", argv: ({ cwd, command }) => ["--working-directory", cwd, "-e", "bash", "-lc", command] },
   { binary: "wezterm", argv: ({ cwd, command }) => ["start", "--cwd", cwd, "--", "bash", "-lc", command] },
-  { binary: "xterm", argv: ({ cwd, command }) => ["-e", "bash", "-lc", `cd ${cwd} && ${command}`] },
+  { binary: "xterm", argv: ({ cwd, command }) => ["-e", "bash", "-lc", `cd ${shq(cwd)} && ${command}`] },
 ];
 
 export async function resolveTerminal(opts: { run?: RunFn } = {}): Promise<TerminalSpec | undefined> {
@@ -130,6 +130,8 @@ export type LaunchSessionResult =
 /** 在用户桌面上开一个终端跑会话（detached，不阻塞服务）。 */
 export async function launchSession(opts: {
   worktreePath: string;
+  /** 适配器日志目录（给了就按卡片分文件写在那里，不再落到 /tmp） */
+  logDir?: string;
   /** 卡片 id：塞进环境变量，适配器第一秒就能绑上卡片（不必等 worktree 建好、cwd 能对上） */
   cardId?: string;
   harness?: string;
@@ -161,12 +163,15 @@ export async function launchSession(opts: {
     ...(opts.kickoff ? { kickoff: opts.kickoff } : {}),
   });
   const argv = terminal.argv({ cwd: opts.worktreePath, command });
-  const flowcardEnv = opts.cardId
+  const flowcardEnv: Record<string, string> = opts.cardId
     ? {
         FLOWCARD_CARD: opts.cardId,
         FLOWCARD_URL: `http://${process.env.FLOWCARD_HOST ?? "127.0.0.1"}:${process.env.FLOWCARD_PORT ?? "47825"}`,
       }
     : {};
+  // 适配器日志别都往 /tmp/omp-adapter.log 写（多卡互相覆盖，且 /tmp 是公开可读的）
+  const logDir = opts.logDir;
+  if (logDir && opts.cardId) flowcardEnv.FLOWCARD_OMP_LOG = `${logDir}/omp-${opts.cardId}.log`;
   const env = { ...process.env, ...flowcardEnv, ...(opts.env ?? (await sessionGraphicalEnv())) };
   const spawnFn = opts.spawnFn ?? spawn;
 

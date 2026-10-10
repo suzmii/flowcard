@@ -195,6 +195,59 @@ describe("HTTP 接口", () => {
     expect(back.cards.map((c) => c.id)).toContain(id);
   });
 
+  it("跨站请求一律拒（回环 ≠ 可信）：Sec-Fetch-Site / Origin 两道闸", async () => {
+    const { app } = harness();
+    const body = JSON.stringify({ cmd: "open", actor: HUMAN, title: "跨站", body: "x" });
+
+    const crossSite = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" },
+      body,
+    });
+    expect(crossSite.status).toBe(403);
+
+    const foreignOrigin = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body,
+    });
+    expect(foreignOrigin.status).toBe(403);
+
+    // 本页（同源，无 Sec-Fetch、Origin 是回环）照常放行
+    const ok = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1:47825", "sec-fetch-site": "same-origin" },
+      body,
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("写接口只收 application/json（挡跨站简单请求）", async () => {
+    const { app } = harness();
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ cmd: "open", actor: HUMAN, title: "text/plain", body: "x" }),
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("events 的 limit 收敛：负数不会把整部历史倒出来", async () => {
+    const { app } = harness();
+    for (let i = 0; i < 5; i++) {
+      await post(app, { cmd: "open", actor: HUMAN, title: `卡 ${i}`, body: "" });
+    }
+    const all = (await (await app.request("/api/events?limit=1000")).json()) as { events: { type: string }[] };
+    expect(all.events.length).toBe(5);
+
+    // 负 LIMIT 在 SQLite 里是"无上限"：不能原样透传（否则一次性倒出整部历史）
+    const negative = (await (await app.request("/api/events?limit=-1")).json()) as { events: unknown[] };
+    expect(negative.events.length).toBe(5);
+
+    const small = (await (await app.request("/api/events?limit=2")).json()) as { events: unknown[] };
+    expect(small.events.length).toBe(2);
+  });
+
   it("rebuild 不改投影（HTTP 也能触发）", async () => {
     const { app, store } = harness();
     const opened = await post(app, { cmd: "open", actor: HUMAN, title: "重放", body: "" });

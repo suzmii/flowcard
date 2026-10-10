@@ -24,7 +24,9 @@ import { appendFileSync } from "node:fs";
 const BASE = (process.env.FLOWCARD_URL ?? "http://127.0.0.1:47825").replace(/\/+$/, "");
 const CARD = process.env.FLOWCARD_CARD ?? "";
 const HEARTBEAT_MS = Number(process.env.FLOWCARD_OMP_HEARTBEAT_MS ?? 15_000);
-const LOG_PATH = process.env.FLOWCARD_OMP_LOG ?? "/tmp/omp-adapter.log";
+const LOG_PATH =
+  process.env.FLOWCARD_OMP_LOG ??
+  `${process.env.XDG_STATE_HOME ?? `${process.env.HOME ?? "/tmp"}/.local/state`}/flowcard/omp-adapter.log`;
 const POST_TIMEOUT_MS = 1_500;
 
 interface OmpSessionManager {
@@ -53,7 +55,7 @@ interface OmpExtensionApi {
 
 function log(line: string): void {
   try {
-    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${line}\n`);
+    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
   } catch {
     /* 日志失败必须静默 */
   }

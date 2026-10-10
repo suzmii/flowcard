@@ -83,6 +83,22 @@ describe("启动命令拼装", () => {
     expect(shq("it's")).toBe("'it'\\''s'");
   });
 
+  it("终端 argv：cwd 一律作为独立参数或已转义（xterm 兜底路径也不拼未转义字符串）", async () => {
+    const { TERMINALS } = await import("../src/server/launch.ts");
+    const evil = "/tmp/有 空格; rm -rf ~";
+    for (const terminal of TERMINALS) {
+      const argv = terminal.argv({ cwd: evil, command: "echo hi" });
+      const joined = argv.join("\u0000");
+      if (terminal.binary === "xterm") {
+        // xterm 只有一个字符串参数，必须已经 shq 转义：不能出现裸的分号
+        const inner = argv[argv.length - 1] ?? "";
+        expect(inner).toContain("'/tmp/有 空格; rm -rf ~'");
+      } else {
+        expect(joined).toContain(evil);
+      }
+    }
+  });
+
   it("会话命令：带扩展与提示文件，且提示用 $(cat) 传，退出后留住终端", () => {
     const cmd = sessionCommand({
       ompPath: "/home/u/.bun/bin/omp",

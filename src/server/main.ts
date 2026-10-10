@@ -11,6 +11,16 @@ import { DEFAULT_SYNC_INTERVAL_MS } from "./syncer.ts";
 const dataDir =
   process.env.FLOWCARD_DATA_DIR ?? `${homedir()}/.local/share/flowcard`;
 const host = process.env.FLOWCARD_HOST ?? "127.0.0.1";
+// 服务没有鉴权，但能起进程/起终端/读 Gitea 凭据 —— 只允许绑回环。
+// 真要暴露到局域网，必须显式承认风险（FLOWCARD_ALLOW_REMOTE=1）并自行加反代鉴权。
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
+if (!LOOPBACK.has(host) && process.env.FLOWCARD_ALLOW_REMOTE !== "1") {
+  console.error(
+    `拒绝绑定 ${host}：本服务无鉴权且能起进程/读凭据，只允许回环。` +
+      `确实要暴露请设 FLOWCARD_ALLOW_REMOTE=1（并自行在反代上加鉴权）。`,
+  );
+  process.exit(2);
+}
 const port = Number(process.env.FLOWCARD_PORT ?? "47825");
 
 const store = createStore({ dataDir, flow: personalFlow });
