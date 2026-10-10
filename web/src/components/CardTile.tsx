@@ -48,7 +48,7 @@ export function CardTile({
   const runtime = card.runtime ?? null;
   const unreadComments = card.remoteComments.filter((comment) => !comment.read).length;
   const worktree = card.worktree;
-  // 磁贴主点击（打开详情）不变；会话相关的两处小按钮走同一条路，只是让详情直接对着对话区
+  // 磁贴主点击（打开详情）不变；会话相关的入口直接进**会话视图**（不进详情）。
   const openSession = onSelectSession ?? onSelect;
 
   return (
@@ -61,7 +61,7 @@ export function CardTile({
       )}
     >
       {light ? (
-        // 会话灯 = 会话的入口：点一下就打开这张卡的详情并直接落在对话区。
+        // 会话灯 = 会话入口：点一下直接进这张卡的**会话视图**。
         // 用 after 撑大命中区（灯本身只有 10px），不改磁贴的主点击。
         <span
           className={cn(
@@ -70,7 +70,7 @@ export function CardTile({
           )}
           data-testid="tile-session-light"
           data-light-tone={light.tone}
-          title={`${light.label} · 点开详情直接看对话`}
+          title={`${light.label} · 打开会话视图`}
           aria-label={`${light.label}（打开对话）`}
           onClick={(event) => {
             event.stopPropagation();
@@ -87,6 +87,20 @@ export function CardTile({
           —
         </span>
         <span className="line-clamp-2 text-sm font-medium leading-snug">{card.title}</span>
+        {/* 常驻聊天入口：任何卡都有（没会话的卡进去后能看到「启动会话」）。
+            灯只对有会话的卡点，所以这个按钮才是"每张卡都能进对话"的那条路。 */}
+        <span
+          className="ml-auto shrink-0 cursor-pointer rounded border border-border px-1.5 py-0.5 text-[11px] leading-none text-muted-foreground hover:border-foreground/40 hover:text-foreground"
+          data-testid="tile-chat"
+          title="打开会话视图"
+          aria-label="打开会话视图"
+          onClick={(event) => {
+            event.stopPropagation();
+            openSession(card.id);
+          }}
+        >
+          对话
+        </span>
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1">
@@ -95,7 +109,7 @@ export function CardTile({
             variant="outline"
             className="cursor-pointer"
             data-testid="tile-session-badge"
-            title={`会话 ${card.session.id}（${card.session.cwd}）· 点开详情直接看对话`}
+            title={`会话 ${card.session.id}（${card.session.cwd}）· 打开会话视图`}
             onClick={(event) => {
               event.stopPropagation();
               openSession(card.id);

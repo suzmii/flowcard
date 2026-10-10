@@ -107,12 +107,6 @@ export function App() {
     setFocusSession(false);
   }, []);
 
-  /** 磁贴的会话灯/会话徽标：同样打开详情，但直接落在对话区。 */
-  const openCardSession = useCallback((id: string) => {
-    setSelectedId(id);
-    setFocusSession(true);
-  }, []);
-
   const closeCard = useCallback(() => {
     setSelectedId(null);
     setFocusSession(false);
@@ -319,7 +313,7 @@ export function App() {
             loading={board.loading}
             selectedId={selectedId}
             onSelect={openCard}
-            onSelectSession={openCardSession}
+            onSelectSession={openSessionView}
           />
         )}
       </main>
