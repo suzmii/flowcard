@@ -2,20 +2,21 @@
  * 投影：把 append-only 的事件流折成卡片现状。纯函数、不碰 IO。
  * rebuild 就是「从零 reduce 一遍全部事件」，所以投影必须与事件语义严格一致。
  */
-import type {
-  Actor,
-  Card,
-  CardState,
-  Comment,
-  ConfirmAction,
-  ConfirmStatus,
-  Confirmation,
-  Event,
-  IssueRef,
-  PrRef,
-  Runtime,
-  Session,
-  WorktreeRef,
+import {
+  LOCAL_PROJECT_ID,
+  type Actor,
+  type Card,
+  type CardState,
+  type Comment,
+  type ConfirmAction,
+  type ConfirmStatus,
+  type Confirmation,
+  type Event,
+  type IssueRef,
+  type PrRef,
+  type Runtime,
+  type Session,
+  type WorktreeRef,
 } from "../shared/types.ts";
 
 /** 引擎产生的新事件（缺 seq/id，由存储层补）。 */
@@ -35,6 +36,7 @@ export function emptyCard(id: string, at: string): Card {
     title: "",
     body: "",
     state: "inbox",
+    projectId: LOCAL_PROJECT_ID,
     issue: null,
     pr: null,
     worktree: null,
@@ -70,6 +72,8 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
       next.title = String(p.title ?? "");
       next.body = String(p.body ?? "");
       next.state = "inbox";
+      // 老事件的 payload 里没有 projectId（升级前开的卡）→ 一律落到合成项目「未归属」。
+      next.projectId = typeof p.projectId === "string" && p.projectId !== "" ? p.projectId : LOCAL_PROJECT_ID;
       if (typeof p.repoPath === "string") next.repoPath = p.repoPath;
       if (typeof p.partOf === "string") next.partOf = p.partOf;
       if (p.issue) next.issue = p.issue as IssueRef;

@@ -7,9 +7,25 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { Flow } from "../shared/flow.ts";
 import { isInside, normalizePath } from "../shared/paths.ts";
-import type { Actor, Card, Command, CwdClaimResolution, Event } from "../shared/types.ts";
+import {
+  LOCAL_PROJECT_ID,
+  type Actor,
+  type Attachment,
+  type Card,
+  type Command,
+  type CwdClaimResolution,
+  type Event,
+  type Project,
+} from "../shared/types.ts";
+import {
+  attachmentsDir,
+  readAttachmentBytes,
+  saveAttachment,
+  type AttachmentRejection,
+} from "./attachments.ts";
 import { runCommand, type CommandOutcome } from "./engine.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
+import { localProject, projectIdFor } from "./projects.ts";
 
 export type ExecuteResult = {
   outcome: CommandOutcome;
@@ -17,6 +33,14 @@ export type ExecuteResult = {
   duplicates: number;
   card: Card | undefined;
 };
+
+/** 登记项目的结果：同 path 重复登记不算新建（`created:false`），且保留最初的 addedAt。 */
+export type UpsertProjectResult = { project: Project; created: boolean };
+
+/** 存附件的结果：校验失败给 `error`（HTTP 层照着回 415/413），成功时 `created` 说明是不是新内容。 */
+export type AppendAttachmentResult =
+  | { ok: true; attachment: Attachment; created: boolean }
+  | { ok: false; error: AttachmentRejection };
 
 /** 解析失败时给出的 message / hint 各自的上限（要能一眼读完，又要带参照物）。 */
 const CLAIM_HINT_BUDGET = 200;
@@ -76,8 +100,10 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  * 投影格式版本：**改动 `Card` 的形态（增删槽位）时把它 +1**。
  * 启动时版本不一致就自动 rebuild 一次——投影本来就能从事件重放，这样老库不用手工救，
  * 也不会让"投影比代码旧"悄悄毁掉前端解析。
+ *
+ * v3：卡片新增 `projectId`（老事件没有 → 投影成 `local`），所以必须重放一遍。
  */
-export const PROJECTION_VERSION = "2";
+export const PROJECTION_VERSION = "3";
 
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */
@@ -87,6 +113,16 @@ export type Store = {
   listEvents(limit?: number): Event[];
   /** 从零重放全部事件重建投影，返回卡片数。 */
   rebuild(): number;
+  /** 全部项目（含合成项目 local，恒在；真实项目按登记时间排）。 */
+  listProjects(): Project[];
+  getProject(id: string): Project | undefined;
+  /** 登记 / 刷新一个项目（按 path 幂等，保留最初的 addedAt）。 */
+  upsertProject(project: Project, now?: string): UpsertProjectResult;
+  /** 按绝对路径解析所属项目（最具体命中）；不在任何项目内（或只有合成项目）返回 undefined。 */
+  projectForPath(path: string): Project | undefined;
+  /** 存一张图片附件（内容寻址，幂等）；校验不过返回 error。 */
+  appendAttachment(input: { name: string; mime: string | undefined; bytes: Uint8Array }, now?: string): AppendAttachmentResult;
+  getAttachment(id: string): { attachment: Attachment; bytes: Uint8Array } | undefined;
   close(): void;
 };
 
@@ -100,6 +136,24 @@ type EventRow = {
   payload: string;
   dedupe_key: string;
 };
+
+type AttachmentRow = {
+  id: string;
+  mime: string;
+  ext: string;
+  name: string;
+  bytes: number;
+  at: string;
+};
+
+const toAttachment = (row: AttachmentRow): Attachment => ({
+  id: row.id,
+  mime: row.mime as Attachment["mime"],
+  ext: row.ext,
+  name: row.name,
+  bytes: row.bytes,
+  at: row.at,
+});
 
 export function createStore(opts: { dataDir: string; flow: Flow }): Store {
   mkdirSync(opts.dataDir, { recursive: true });
@@ -124,6 +178,25 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- 项目是**环境元数据**（仓库路径/分支/远程），不是业务流程，所以单独一张表、不进事件流：
+    -- 建卡时刷一次 git 元数据代表"现在长这样"，没有谁在什么时候做了什么要重放。
+    -- 卡片归属（Card.projectId）仍然走事件，因为那是业务事实。
+    CREATE TABLE IF NOT EXISTS projects (
+      id      TEXT PRIMARY KEY,
+      path    TEXT NOT NULL,
+      project TEXT NOT NULL,
+      at      TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS projects_path ON projects(path);
+    -- 附件元数据：字节在 <dataDir>/attachments/<id>.<ext>，路径由 id+ext 推出，所以这里不存路径。
+    CREATE TABLE IF NOT EXISTS attachments (
+      id    TEXT PRIMARY KEY,
+      mime  TEXT NOT NULL,
+      ext   TEXT NOT NULL,
+      name  TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      at    TEXT NOT NULL
+    );
   `);
 
   const toEvent = (row: EventRow): Event => ({
@@ -220,10 +293,121 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     return rows.map((r) => JSON.parse(r.card) as Card);
   };
 
+  // ---------------------------------------------------------------- 项目（环境元数据）
+
+  const getProject = (id: string): Project | undefined => {
+    const row = db.prepare("SELECT project FROM projects WHERE id = ?").get(id) as
+      | { project: string }
+      | undefined;
+    return row ? (JSON.parse(row.project) as Project) : undefined;
+  };
+
+  /** 真实项目在前（按登记时间），合成项目 local 放最后——它是"桶"，不是仓库。 */
+  const listProjects = (): Project[] => {
+    const all = (db.prepare("SELECT project FROM projects").all() as { project: string }[]).map(
+      (r) => JSON.parse(r.project) as Project,
+    );
+    const rank = (p: Project): number => (p.virtual === true ? 1 : 0);
+    return all.sort(
+      (a, b) => rank(a) - rank(b) || a.addedAt.localeCompare(b.addedAt) || a.id.localeCompare(b.id),
+    );
+  };
+
+  /**
+   * id 由路径派生，理论上同 basename 的两个仓库会撞（4 位哈希）。撞了就退到 8 位，再撞加序号：
+   * **id 一旦分配就不再变**（卡片归属靠它），所以宁可长一点也不换。
+   */
+  const allocateProjectId = (want: string, path: string): string => {
+    const owner = (id: string): string | undefined =>
+      (db.prepare("SELECT path FROM projects WHERE id = ?").get(id) as { path: string } | undefined)
+        ?.path;
+    if (owner(want) === undefined) return want;
+    const wide = projectIdFor(path, 8);
+    if (owner(wide) === undefined) return wide;
+    for (let n = 2; n <= 50; n++) {
+      const candidate = `${wide}-${n}`;
+      if (owner(candidate) === undefined) return candidate;
+    }
+    throw new Error(`项目 id 分配失败（同名同哈希太多）：${path}`);
+  };
+
+  const upsertProject = (incoming: Project, now = new Date().toISOString()): UpsertProjectResult => {
+    const existing = db.prepare("SELECT project FROM projects WHERE path = ?").get(incoming.path) as
+      | { project: string }
+      | undefined;
+    if (existing) {
+      // 同 path 幂等：元数据刷新（分支/远程/脏文件随时会变），但 id 与加入时间不动。
+      const prev = JSON.parse(existing.project) as Project;
+      const merged: Project = { ...incoming, id: prev.id, addedAt: prev.addedAt, lastSeenAt: now };
+      db.prepare("UPDATE projects SET project = ?, at = ? WHERE path = ?").run(
+        JSON.stringify(merged),
+        merged.lastSeenAt,
+        incoming.path,
+      );
+      return { project: merged, created: false };
+    }
+    const project: Project = { ...incoming, id: allocateProjectId(incoming.id, incoming.path) };
+    db.prepare("INSERT INTO projects (id, path, project, at) VALUES (?, ?, ?, ?)").run(
+      project.id,
+      project.path,
+      JSON.stringify(project),
+      project.lastSeenAt,
+    );
+    return { project, created: true };
+  };
+
+  /**
+   * 路径 → 项目：命中的里面取路径最长的（嵌套仓库时最具体的赢），与 `claim` 按 cwd 认卡同规则。
+   * 合成项目（path 为空）不参与。
+   */
+  const projectForPath = (path: string): Project | undefined => {
+    const normalized = normalizePath(path);
+    const hits = listProjects().filter((p) => !p.virtual && p.path !== "" && isInside(normalized, p.path));
+    hits.sort((a, b) => b.path.length - a.path.length);
+    return hits[0];
+  };
+
+  // ---------------------------------------------------------------- 附件（图片）
+
+  const attachmentsRoot = attachmentsDir(opts.dataDir);
+
+  const appendAttachment = (
+    input: { name: string; mime: string | undefined; bytes: Uint8Array },
+    now = new Date().toISOString(),
+  ): AppendAttachmentResult => {
+    const saved = saveAttachment(attachmentsRoot, input, now);
+    if (!saved.ok) return saved;
+    const existing = db.prepare("SELECT * FROM attachments WHERE id = ?").get(saved.attachment.id) as
+      | AttachmentRow
+      | undefined;
+    // 内容一样就是同一张图：元数据保留第一次的记录（id 内容寻址，天然幂等）。
+    if (existing) return { ok: true, attachment: toAttachment(existing), created: false };
+    db.prepare("INSERT INTO attachments (id, mime, ext, name, bytes, at) VALUES (?, ?, ?, ?, ?, ?)").run(
+      saved.attachment.id,
+      saved.attachment.mime,
+      saved.attachment.ext,
+      saved.attachment.name,
+      saved.attachment.bytes,
+      saved.attachment.at,
+    );
+    return { ok: true, attachment: saved.attachment, created: true };
+  };
+
+  const getAttachment = (id: string): { attachment: Attachment; bytes: Uint8Array } | undefined => {
+    const row = db.prepare("SELECT * FROM attachments WHERE id = ?").get(id) as
+      | AttachmentRow
+      | undefined;
+    if (!row) return undefined;
+    const attachment = toAttachment(row);
+    const bytes = readAttachmentBytes(attachmentsRoot, attachment);
+    return bytes ? { attachment, bytes } : undefined;
+  };
+
   const execute = (cmd: Command, now = new Date().toISOString()): ExecuteResult => {
     const outcome = runCommand({
       flow: opts.flow,
       getCard,
+      getProject,
       cmd,
       now,
       newCardId: nextCardId,
@@ -237,7 +421,9 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     let written: { inserted: Event[]; duplicates: number };
     try {
       written = insertEvents(outcome.events);
-      const touched = new Set(outcome.events.map((e) => e.cardId));
+      // 只重投影**真的写进去了**的卡片：命令被幂等键吞掉时事件一条没写，
+      // 若照样重投影就会给"新分配但没事件"的 id 落一张空壳卡（重复 open 会凭空多一张空卡）。
+      const touched = new Set(written.inserted.map((e) => e.cardId));
       for (const cardId of touched) putCard(project(cardId));
       db.exec("COMMIT");
     } catch (error) {
@@ -245,11 +431,27 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       throw error;
     }
 
+    /**
+     * 主卡：正常就是 `primaryCardId` 的投影。事件全被幂等吞掉时必须按第一条事件的 dedupeKey
+     * 找回第一次写进去的那张卡 —— `open` 每次都先分配新 id，光看 `primaryCardId` 是找不到原卡的，
+     * 而"重发同一条 open 要指向同一张卡"正是幂等该给人的东西。
+     */
+    const primaryCard = (): Card | undefined => {
+      const direct = getCard(outcome.primaryCardId);
+      if (direct) return direct;
+      const key = outcome.events[0]?.dedupeKey;
+      if (!key) return undefined;
+      const row = db.prepare("SELECT card_id FROM events WHERE dedupe_key = ?").get(key) as
+        | { card_id: string }
+        | undefined;
+      return row ? getCard(row.card_id) : undefined;
+    };
+
     return {
       outcome,
       inserted: written.inserted,
       duplicates: written.duplicates,
-      card: getCard(outcome.primaryCardId),
+      card: primaryCard(),
     };
   };
 
@@ -266,6 +468,18 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     }
     return listCards().length;
   };
+
+  // 合成项目「未归属」恒存在（首次启动落一行，之后复用）。它拥有所有非项目卡，看板里也要能看到。
+  if (!getProject(LOCAL_PROJECT_ID)) {
+    const at = new Date().toISOString();
+    const local = localProject(at);
+    db.prepare("INSERT INTO projects (id, path, project, at) VALUES (?, ?, ?, ?)").run(
+      local.id,
+      local.path,
+      JSON.stringify(local),
+      at,
+    );
+  }
 
   // 投影版本不一致 → 从事件重放一次（自愈，不需要人手工 rebuild）
   if (metaGet("projection_version") !== PROJECTION_VERSION) {
@@ -284,6 +498,12 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       return rows.map(toEvent).reverse();
     },
     rebuild,
+    listProjects,
+    getProject,
+    upsertProject,
+    projectForPath,
+    appendAttachment,
+    getAttachment,
     close() {
       db.close();
     },

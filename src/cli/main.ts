@@ -2,7 +2,11 @@
  * flowcard CLI：agent 的唯一写入口。
  * 契约：stdout 永远是一行 JSON；退出码 0 成功 / 2 用法 / 3 状态不允许 / 4 缺必要条件 / 5 服务不可达。
  */
+import { readFileSync } from "node:fs";
+import { basename, extname } from "node:path";
 import { parseArgs } from "node:util";
+import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
+import { resolveUserPath } from "../shared/paths.ts";
 import { CONFIRM_ACTIONS, type Actor, type Command, type ConfirmAction } from "../shared/types.ts";
 
 const DEFAULT_URL = process.env.FLOWCARD_URL ?? `http://127.0.0.1:${process.env.FLOWCARD_PORT ?? "47825"}`;
@@ -19,7 +23,8 @@ const { values, positionals } = parseArgs({
     issue: { type: "string" },
     url: { type: "string" },
     repo: { type: "string" },
-    "repo-path": { type: "string" },
+    project: { type: "string" },
+    name: { type: "string" },
     state: { type: "string" },
     ci: { type: "string" },
     number: { type: "string" },
@@ -73,6 +78,86 @@ function requireCard(): string {
   return card;
 }
 
+/** 读接口的统一收尾：非 2xx 时把服务端的 error 原样当 rejection 打出来，按 404/其它分退出码。 */
+async function report(res: Response): Promise<never> {
+  const payload = (await res.json().catch(() => null)) as {
+    error?: { code?: string; message?: string; hint?: string };
+  } | null;
+  process.stdout.write(`${JSON.stringify(payload ?? { ok: false })}\n`);
+  if (res.ok) process.exit(0);
+  process.exit(res.status === 404 ? 3 : 2);
+}
+
+/** 服务不可达（连不上就是连不上，别装成别的错）。 */
+function unreachable(error: unknown): never {
+  process.stdout.write(
+    `${JSON.stringify({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${DEFAULT_URL}：${String(error)}` } })}\n`,
+  );
+  process.exit(5);
+}
+
+/**
+ * `flowcard project add <路径> | list | current [--path <路径>]`
+ * 项目 = 看板的 Metadata：登记一次，之后开卡只给 `--project <id>`（不给就按 cwd 解析）。
+ */
+async function runProject(args: string[]): Promise<never> {
+  const sub = args[0] ?? "list";
+  // 人手输的路径（可能带 ~ 或相对路径）在 CLI 侧先定成绝对路径：服务端 cwd 与调用方不一定一致。
+  const target = resolveUserPath(args[1] ?? opt("path") ?? process.cwd());
+
+  try {
+    if (sub === "list") return await report(await fetch(`${DEFAULT_URL}/api/projects`));
+    if (sub === "current") {
+      return await report(
+        await fetch(`${DEFAULT_URL}/api/project/current?path=${encodeURIComponent(target)}`),
+      );
+    }
+    if (sub === "add") {
+      return await report(
+        await fetch(`${DEFAULT_URL}/api/projects`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path: target }),
+        }),
+      );
+    }
+  } catch (error) {
+    unreachable(error);
+  }
+  die(2, `未知的 project 子命令 "${sub}"：可用 add <路径> / list / current [--path <路径>]`);
+}
+
+/** `flowcard attach <图片>`：上传后打印 markdown，直接贴进正文或评论。 */
+async function runAttach(file: string | undefined): Promise<never> {
+  if (!file) die(2, "attach 需要 <图片文件路径>（png/jpg/jpeg/gif/webp）");
+  const mime = MIME_BY_EXT[extname(file).slice(1).toLowerCase()];
+  if (!mime) die(2, `只支持 png/jpg/jpeg/gif/webp，收到 "${file}"`);
+
+  let bytes: Uint8Array;
+  try {
+    bytes = readFileSync(file);
+  } catch (error) {
+    die(2, `读不到文件 ${file}：${String(error)}`);
+  }
+  // 本地先量一次：明知超限就别把 10MB 推上去再等 413。
+  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+    die(2, `${file} 有 ${bytes.byteLength} 字节，超过上限 ${MAX_ATTACHMENT_BYTES} 字节（10 MB）`);
+  }
+
+  const name = opt("name") ?? basename(file);
+  try {
+    return await report(
+      await fetch(`${DEFAULT_URL}/api/attachments?name=${encodeURIComponent(name)}`, {
+        method: "POST",
+        headers: { "content-type": mime },
+        body: bytes,
+      }),
+    );
+  } catch (error) {
+    unreachable(error);
+  }
+}
+
 /** 解析 `--issue repo#123`。 */
 function parseIssueSpec(spec: string, url: string | undefined): { repo: string; number: number; url: string } {
   const [repo, numRaw] = spec.split("#");
@@ -83,19 +168,40 @@ function parseIssueSpec(spec: string, url: string | undefined): { repo: string; 
   return { repo, number, url: url ?? `issue://${repo}#${number}` };
 }
 
-function build(): Command {
+/**
+ * 当前目录落在哪个项目里（服务端按 `shared/paths.ts` 的路径段规则解析，CLI 不自己比路径）。
+ * 没登记过 / 服务不可达 → undefined，调用方退回合成项目 local。
+ */
+async function currentProjectId(cwd: string): Promise<string | undefined> {
+  try {
+    const res = await fetch(
+      `${DEFAULT_URL}/api/project/current?path=${encodeURIComponent(resolveUserPath(cwd))}`,
+    );
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as { project?: { id?: string } };
+    return data.project?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+async function build(): Promise<Command> {
   const name = positionals[0];
   switch (name) {
-    case "open":
+    case "open": {
+      // 标题可选：不给（或给空白）由服务端从正文派生。项目不给就按 cwd 解析，解析不到用 local。
+      const title = opt("title");
+      const projectId = opt("project") ?? (await currentProjectId(process.cwd()));
       return {
         cmd: "open",
         actor: actor(),
-        title: opt("title") ?? die(2, "open 需要 --title"),
+        ...(title !== undefined && title.trim() !== "" ? { title } : {}),
         body: opt("body") ?? "",
-        ...(opt("repo-path") ? { repoPath: opt("repo-path")! } : {}),
+        ...(projectId ? { projectId } : {}),
         ...(opt("issue") ? { issue: { ...parseIssueSpec(opt("issue")!, opt("url")), state: "open" as const } } : {}),
         ...(opt("part-of") ? { partOf: opt("part-of")! } : {}),
       };
+    }
     case "issue": {
       const card = requireCard();
       const spec = opt("issue") ?? die(2, "issue 需要 --issue <repo>#<n>");
@@ -296,7 +402,7 @@ function build(): Command {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
   }
 }
 
@@ -304,7 +410,7 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue plan gate confirm worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
     process.exit(0);
   }
 
@@ -378,7 +484,11 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const command = build();
+  // 项目（看板 Metadata）与附件不是命令：直接打各自的端点。
+  if (name === "project") await runProject(positionals.slice(1));
+  if (name === "attach") await runAttach(positionals[1]);
+
+  const command = await build();
   let res: Response;
   try {
     res = await fetch(`${DEFAULT_URL}/api/commands`, {

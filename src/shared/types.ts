@@ -60,6 +60,57 @@ export type WorktreeRef = {
   source: "harness" | "flowcard";
 };
 
+/**
+ * 项目 = 整块看板的 **Metadata**：一个 git 仓库。进入 flowcard 先选项目，之后建卡只填正文，
+ * 归属由 `Card.projectId` 记，repo 路径/分支/远程都从这里解析（不再手填）。
+ *
+ * 存在性：**每个实例一定有 `local` 这个合成项目**（`virtual: true`，不在磁盘上），
+ * 所有没归属的卡片（含升级前的老卡片）都落在这里。
+ */
+export type Project = {
+  /** 由仓库根路径派生（目录名 + 哈希后缀）：短、稳定、可读 */
+  id: string;
+  /** 默认取仓库目录名 */
+  name: string;
+  /** 仓库根绝对路径（`git rev-parse --show-toplevel`；合成项目为 ""） */
+  path: string;
+  /** `git remote get-url origin` */
+  remote?: string;
+  /** `git rev-parse --abbrev-ref HEAD`；detached HEAD 时缺省 */
+  headBranch?: string;
+  /** `origin/HEAD` 指向的分支；拿不到就回退到存在的 main / master */
+  defaultBranch?: string;
+  lastCommit?: { sha: string; subject: string; at: string };
+  /** `git status --porcelain` 行数（脏文件数） */
+  dirtyFiles?: number;
+  /** 仅本地存在的合成项目（只有 `local`） */
+  virtual?: boolean;
+  addedAt: string;
+  lastSeenAt: string;
+};
+
+/** 合成项目 id：没归属的卡片都落在这里。 */
+export const LOCAL_PROJECT_ID = "local";
+export const LOCAL_PROJECT_NAME = "未归属";
+
+/** 图片附件的 MIME 白名单。**不含 svg**：svg 是可执行脚本，等于把 XSS 面挂到看板上。 */
+export const IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+export type ImageMime = (typeof IMAGE_MIMES)[number];
+
+/**
+ * 附件元数据。`id` 是内容 sha256 前 16 位 —— 内容寻址，同一张图重复上传天然去重、天然幂等。
+ * 字节落在 `<dataDir>/attachments/<id>.<ext>`（路径由 id + 扩展名推出，不用存）。
+ */
+export type Attachment = {
+  id: string;
+  mime: ImageMime;
+  ext: string;
+  /** 原始文件名（只作记录，不参与落盘路径） */
+  name: string;
+  bytes: number;
+  at: string;
+};
+
 export type SessionState = "idle" | "running" | "ended" | "lost";
 
 export type Session = {
@@ -138,6 +189,11 @@ export type Card = {
   title: string;
   body: string;
   state: CardState;
+  /**
+   * 归属项目（`Project.id`）。必填：老卡片的事件里没有这个字段，投影成 `"local"`（合成项目）。
+   * `repoPath` 由它解析，客户端不再自己填。
+   */
+  projectId: string;
   repoPath?: string;
   issue: IssueRef | null;
   pr: PrRef | null;
@@ -261,9 +317,14 @@ export const commandSchema = z.discriminatedUnion("cmd", [
   z.object({
     cmd: z.literal("open"),
     actor: actorSchema,
-    title: z.string().min(1),
+    /**
+     * 标题**可选**：给空串或干脆不给，由服务端从正文派生（见 `server/engine.ts` 的 `deriveTitle`）。
+     * 派生结果写进事件，所以标题历史稳定，不随规则重算而变。
+     */
+    title: z.string().optional(),
     body: z.string().default(""),
-    repoPath: z.string().optional(),
+    /** 归属项目；缺省 `local`。`repoPath` 不再由客户端填 —— 由项目解析出来落进卡片。 */
+    projectId: z.string().min(1).optional(),
     issue: issueInSchema.optional(),
     partOf: z.string().optional(),
     dedupeKey: z.string().optional(),
@@ -469,3 +530,9 @@ export type CwdClaimResolution = { cardId: string } | { error: { message: string
 export const runtimeActionSchema = z.object({ action: z.enum(["up", "down"]) });
 
 export type RuntimeAction = z.infer<typeof runtimeActionSchema>["action"];
+
+/**
+ * POST /api/projects 的 body：登记一个仓库当项目。
+ * 路径可以是仓库内的任意子目录 —— `git rev-parse --show-toplevel` 自己找到根。
+ */
+export const projectInSchema = z.object({ path: z.string().trim().min(1, "path 不能为空") });

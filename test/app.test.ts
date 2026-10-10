@@ -86,7 +86,8 @@ describe("HTTP 接口", () => {
 
   it("非法 body 回 400 且给出人话原因", async () => {
     const { app } = harness();
-    const bad = await post(app, { cmd: "open", actor: HUMAN });
+    // 标题从 M7 起是可选的（不给就按正文派生），所以拿类型不对的 title 当非法输入。
+    const bad = await post(app, { cmd: "open", actor: HUMAN, title: 42 });
     expect(bad.status).toBe(400);
     expect(bad.data.rejection?.code).toBe("USAGE_ERROR");
     expect(bad.data.rejection?.message).toContain("title");

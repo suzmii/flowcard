@@ -9,7 +9,7 @@
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
 import { shortHash } from "../shared/hash.ts";
-import type { Card, Command, CwdClaimResolution, EventType, Rejection } from "../shared/types.ts";
+import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type Project, type Rejection } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 
 export type CommandOutcome = {
@@ -23,6 +23,41 @@ export type CommandOutcome = {
 };
 
 const MAX_DERIVED_EVENTS = 50;
+
+/** 自动标题的长度上限（中文按 1 个字符计）。 */
+export const DERIVED_TITLE_MAX = 40;
+
+/** 空正文（或整段正文只有图片/markdown 符号）时的兜底标题。 */
+export const UNTITLED = "未命名卡片";
+
+/**
+ * 正文 → 标题：取**第一个有文本的段落** → 去掉 markdown 语法 → 折叠空白 → 截断 40 字符。
+ *
+ * 细节都按"要能当标题读"来定：
+ * - 图片 `![]()` 整段丢掉（alt 通常是文件名，当标题只会误导）；链接 `[](url)` **保留链接文字**（那是人写的字）；
+ * - 代码/强调标记只去标记，不去内容；`#`/`>`/列表符只去**行首的标记**，所以 `#42 修登录` 里的 issue 号留着；
+ * - 按**码点**截断（emoji 不会被切成半个字符）。
+ */
+export function deriveTitle(body: string): string {
+  for (const paragraph of body.split(/\n\s*\n/)) {
+    const text = paragraph
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/`+/g, "")
+      .replace(/\*/g, "")
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+      .replace(/^\s{0,3}>\s?/gm, "")
+      .replace(/^\s{0,3}(?:[-+*]|\d+[.)])\s+/gm, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text === "") continue;
+    const chars = [...text];
+    return chars.length > DERIVED_TITLE_MAX
+      ? `${chars.slice(0, DERIVED_TITLE_MAX).join("")}…`
+      : text;
+  }
+  return UNTITLED;
+}
 
 /** 带 card 的命令的卡片 id；claim 允许不写（由 cwd 解析），所以是 string | undefined。 */
 const cardIdOf = (cmd: Command): string | undefined => ("card" in cmd ? cmd.card : undefined);
@@ -38,6 +73,12 @@ export function runCommand(input: {
    * 引擎自己保持纯函数；没注入（如测试 harness 不关心）时 claim 不给 card 会直接 NOT_FOUND。
    */
   resolveCardByCwd?: (cwd: string) => CwdClaimResolution;
+  /**
+   * `open` 按 `projectId` 解析项目（要 `path` 才算得出卡片上的 repoPath）。与 `getCard` 一样由
+   * store 注入：引擎保持纯函数。没注入时（如测试 harness）只认不写 `projectId` 的 open ——
+   * 显式给 `projectId` 却查不到项目会直接拒绝，免得卡片的归属和实际仓库对不上。
+   */
+  getProject?: (id: string) => Project | undefined;
 }): CommandOutcome {
   const { flow, cmd, now } = input;
   const local = new Map<string, Card>();
@@ -105,16 +146,32 @@ export function runCommand(input: {
     case "open": {
       const id = input.newCardId();
       primaryCardId = id;
+      // 归属项目：显式给了就必须存在（不能悄悄落到 local 让别人以为卡在项目里）；
+      // 没给就是合成项目 local（没归属的卡，含所有老卡片）。
+      const projectId = cmd.projectId ?? LOCAL_PROJECT_ID;
+      const project = input.getProject?.(projectId);
+      if (cmd.projectId && !project) {
+        return fail({
+          code: "NOT_FOUND",
+          message: `项目 ${cmd.projectId} 不存在`,
+          hint: `先登记仓库：flowcard project add <仓库路径>（flowcard project list 看现有项目）`,
+        });
+      }
+      // 标题缺省时从正文派生（标题可选），派生结果落进事件 → 历史稳定、不随规则重算而变。
+      const givenTitle = cmd.title?.trim() ?? "";
+      const title = givenTitle === "" ? deriveTitle(cmd.body) : givenTitle;
+      const repoPath = project && !project.virtual ? project.path : undefined;
       // 幂等键不掺 id（id 每次分配都会变），否则重试会写出一张重复卡片；
       // 内容相同的 open 视为同一次请求，要开两张一样的卡请显式给 --dedupe-key。
-      const fingerprint = shortHash(`${cmd.title}\n${cmd.body}\n${cmd.repoPath ?? ""}`);
+      const fingerprint = shortHash(`${title}\n${cmd.body}\n${projectId}`);
       emit(
         id,
         "card.opened",
         {
-          title: cmd.title,
+          title,
           body: cmd.body,
-          ...(cmd.repoPath ? { repoPath: cmd.repoPath } : {}),
+          projectId,
+          ...(repoPath ? { repoPath } : {}),
           ...(cmd.partOf ? { partOf: cmd.partOf } : {}),
           ...(cmd.issue ? { issue: cmd.issue } : {}),
         },
@@ -554,6 +611,7 @@ export function runCommand(input: {
           title: cmd.title,
           body: cmd.body,
           partOf: cmd.card,
+          projectId: parent.projectId,
           ...(parent.issue ? { issue: parent.issue } : {}),
           ...(parent.repoPath ? { repoPath: parent.repoPath } : {}),
         },

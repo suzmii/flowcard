@@ -27,6 +27,9 @@ npm run web:install && npm run web:build     # 之后改前端只需再跑 web:b
 CLI 是 agent 的唯一写入口，stdout 恒为一行 JSON：
 
 ```bash
+node src/cli/main.ts project add ~/workspace/myrepo     # 先登记项目（看板 Metadata：读 git 远程/分支/最近提交）
+node src/cli/main.ts open --body "## 修好登录页…"        # 建卡：标题可选（服务端按正文派生），项目按 cwd 解析
+node src/cli/main.ts attach ~/shot.png                  # 传图，打印 ![](/api/attachments/<id>) 直接贴进正文
 node src/cli/main.ts open --title "做点事" --issue myrepo#12 --url https://…/issues/12
 node src/cli/main.ts plan c1 --body "方案：改哪、怎么改、怎么验收"
 node src/cli/main.ts gate c1 --gate G1 --approve        # 人来批

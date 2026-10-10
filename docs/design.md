@@ -39,6 +39,7 @@ type Card = {
   title: string;
   body: string;
   state: CardState;
+  projectId: string;               // 归属项目（Project.id）；老卡片投影成 "local"
   issue: IssueRef | null;          // 永远存在，可为 null
   pr: PrRef | null;                // 永远存在，可为 null
   worktree: WorktreeRef | null;    // 永远存在，可为 null
@@ -73,6 +74,39 @@ type PrRef     = { repo: string; number: number; url: string; branch: string;
 type WorktreeRef = { path: string; branch: string;
                    source: "harness" | "flowcard" };   // 谁建的：harness 的 /wt，还是 flowcard 自己 add
 ```
+
+### 2.1 项目 = 看板的 Metadata（进入看板先选项目）
+
+**一个实例管若干 git 仓库，项目就是这些仓库的元数据**：进来先选项目，建卡只填正文，`repo` 不再手填。
+
+```ts
+type Project = {
+  id: string;              // 由仓库根路径派生：仓库目录名 + 路径哈希前 4 位（短、稳定、可读）
+  name: string;            // 默认仓库目录名
+  path: string;            // 仓库根绝对路径（git rev-parse --show-toplevel）
+  remote?: string;         // git remote get-url origin
+  headBranch?: string;     // rev-parse --abbrev-ref HEAD（detached 时缺省）
+  defaultBranch?: string;  // origin/HEAD 指向的分支；拿不到就回退到存在的 main / master
+  lastCommit?: { sha: string; subject: string; at: string };
+  dirtyFiles?: number;     // git status --porcelain 的行数
+  virtual?: boolean;       // 仅本地存在的合成项目（只有 id="local"、name="未归属"）
+  addedAt: string; lastSeenAt: string;
+};
+```
+
+- **`local` 是必有的合成项目**（`virtual:true`、`path:""`）：所有没归属的卡片、以及**升级前的老卡片**都落在这里，看板上一样能看见。所以 `Card.projectId` 必填（缺省就是 `local`）。
+- `repoPath` 仍留在卡片上，但**由 `projectId` 解析出来**（引擎在建卡时把 `project.path` 写进事件），客户端不再传。运行时/探测继续读 `card.repoPath`，不用改。
+- **项目用单独的表，不进事件流**：它是"环境元数据"（仓库现在长这样），刷新它不该在看板历史里堆噪声，也没有"谁在什么时候做了什么"要重放。而**卡片归属（`Card.projectId`）走事件**——那是业务事实，必须能重放。投影版本因此 +1（v3），启动时自动 rebuild 一次，老卡片补成 `local`。
+- 登记幂等：同 `path` 重复登记只刷新元数据（分支/远程/脏文件会变），`id` 与 `addedAt` 不动；解析按**路径段**比较（复用 `src/shared/paths.ts`，`/a/b` 不匹配 `/a/bc`），嵌套仓库取最具体的那个。
+- 只跑只读 git 子命令（`rev-parse` / `remote get-url` / `log` / `status`），**不 fetch、不 push**。
+
+### 2.2 附件 = 图片（正文/评论里直接贴）
+
+- `POST /api/attachments?name=<文件名>`，body 是原始字节 → `{ id, url, markdown, bytes, mime }`；`GET /api/attachments/<id>` 回原始字节。
+- **`id` = 内容 sha256 前 16 位** → 内容寻址：同一张图重复上传是同一个 id（天然去重 + 幂等），字节落 `<dataDir>/attachments/<id>.<ext>`。
+- 白名单只有 `image/png | image/jpeg | image/gif | image/webp`，单文件 ≤ 10MB。**不收 svg**：svg 里能塞脚本，等于把 XSS 面挂到看板上；**声明什么不算数**，一律按文件头字节嗅探，声明与内容不符也拒。
+- GET 带长缓存（`max-age=31536000, immutable`：内容寻址，同一个 id 的内容永不改变）+ `X-Content-Type-Options: nosniff`。
+- **标题可选**：`open` 不给 title 时由**服务端**从正文派生（第一条有文本的段落 → 去 markdown 语法 → 折叠空白 → 截 40 字符；纯图/空正文 → `未命名卡片`），并把派生结果**写进事件**——历史稳定，不随规则重算而变。
 
 ## 3. 卡片上的"必要项目"（checklist，永远显示）
 
@@ -270,15 +304,26 @@ export default defineFlow({
 |---|---|---|
 | POST | `/api/events` | 批量 append，幂等靠 `dedupeKey` |
 | GET | `/api/cards` `/api/cards/:id` | 投影读（卡片恒含 issue/pr/worktree 三槽位） |
+| GET | `/api/projects` | 看板 Metadata：全部项目（**恒含合成项目 `local`**） |
+| POST | `/api/projects` | `{path}` → 读 git 元数据登记；同 path 幂等（`created:false` 并刷新元数据） |
+| GET | `/api/project/current?path=…` | 按路径解析所属项目（给 CLI/看板进来时用）；不在任何项目里 → 404 |
+| POST | `/api/attachments?name=…` | body = 图片原始字节（**不解析 JSON**）→ `{id,url,markdown,bytes,mime}` |
+| GET | `/api/attachments/:id` | 回原始字节 + 正确 `Content-Type` + 长缓存（内容寻址，可 immutable） |
 | GET | `/api/issues/:repo/:number/cards` | 按 Issue 聚合（多 PR 视图） |
 | POST | `/api/session/heartbeat` | 会话上报（适配器用，允许高频） |
 | GET | `/api/stream` | SSE 广播 |
 | POST | `/api/gates/:id/decide` | 人在看板上批准/驳回 |
+| GET POST | `/api/projects` | 看板 Metadata：`GET` 列项目（恒含合成项目 `local`），`POST {path}` 读一个仓库的 git 元数据并登记 |
+| POST GET | `/api/attachments` | 卡片正文的图片输入：`POST /api/attachments?name=…`（body 是图片字节）回 `markdown`，`GET /api/attachments/:id` 发图 |
 
 **CLI**（agent 的唯一写入口，`--json` + `schemaVersion` + 语义化退出码）：
 
 ```
-flowcard open   --title "…" [--body …] [--repo <path>]   # 开卡（inbox）
+flowcard project add <仓库路径>                             # 登记项目（可给仓库内任意子目录，git 自己找根）
+flowcard project list                                     # 全部项目（含「未归属」）
+flowcard project current [--path <路径>]                  # 当前目录属于哪个项目（默认 cwd；解析不到退出码 3）
+flowcard open   [--title "…"] [--body …] [--project <id>]  # 开卡（inbox）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local
+flowcard attach <图片> [--name <文件名>]                    # 传图（png/jpg/jpeg/gif/webp ≤10MB），打印 markdown 直接贴进正文/评论
 flowcard issue  <card> --create | --bind <repo>#<n>      # 建或绑定 Issue（→ issue 列）
 flowcard plan   <card> --body "方案…"                     # 写方案并申请 G1
 flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
@@ -331,7 +376,7 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 
 ## 10. 数据与运行
 
-- 数据目录 `~/.local/share/flowcard/`（`FLOWCARD_DATA_DIR` 可覆盖），`db.sqlite` + WAL；备份即拷目录。**不塞进项目目录**。
+- 数据目录 `~/.local/share/flowcard/`（`FLOWCARD_DATA_DIR` 可覆盖），`db.sqlite` + WAL、以及 `attachments/`（图片附件，按内容 sha 命名）；备份即拷目录。**不塞进项目目录**。
 - 远程写一律经门禁 G2，**看板本身不静默执行远程操作**；执行者只能是"你看板上点了确认之后的 CLI/agent"。
 - 运行：`systemd --user` 常驻 + 回环监听；Node 22 原生跑 TS，无构建步骤；前端另用 Vite。
 
@@ -346,5 +391,6 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M4 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
 | **M5 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |
 | **M6 适配器正式化** | omp 适配器（含 `agentKind` 过滤、失联判定、**按会话 cwd 自动认卡**）装到日常会话；codex/claude 后置 | 日常干活的会话自动出现在对应卡片上（worktree 里启动 omp，不用给卡片 id） |
+| **M7 项目与附件** | 项目 = 看板 Metadata（先选项目再建卡，`repoPath` 由项目解析）；建卡只填正文（标题服务端派生）；图片附件（内容寻址 + 白名单） | `project add` 读真 git 元数据；`open` 不填标题/项目也能落到正确项目与标题；传图后 `GET` 回的字节与 `Content-Type` 与上传一致；老卡片投影成 `local` |
 
-顺序：M1 → M2 → M3 → M4 → M5 → M6（M0、M1 已完成）。
+顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7（M0、M1–M7 已完成）。

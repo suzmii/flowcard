@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { streamSSE } from "hono/streaming";
-import { commandSchema, runtimeActionSchema } from "../shared/types.ts";
+import { commandSchema, projectInSchema, runtimeActionSchema } from "../shared/types.ts";
+import { resolveUserPath } from "../shared/paths.ts";
+import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
+import { readProject } from "./projects.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
 import type { Store } from "./store.ts";
 
@@ -91,6 +94,125 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       },
       status,
     );
+  });
+
+  app.get("/api/projects", (c) => c.json({ projects: store.listProjects() }));
+
+  /**
+   * 登记项目（看板的 Metadata）：读一次 git 元数据存起来。同 path 幂等（`created:false` 并刷新元数据），
+   * 因为"这个仓库现在长这样"是会变的，而重复登记不该产生第二个项目。
+   */
+  app.post("/api/projects", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = projectInSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "USAGE_ERROR",
+            message: parsed.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; "),
+            hint: "flowcard project add <仓库路径>",
+          },
+        },
+        400,
+      );
+    }
+    const read = await readProject(resolveUserPath(parsed.data.path));
+    if (!read.ok) return c.json({ error: read.error }, 400);
+    const { project, created } = store.upsertProject(read.project);
+    broadcast("projects", { project, created });
+    return c.json({ project, created });
+  });
+
+  /** 按路径解析当前项目（CLI / 看板进来时用）：路径可以是仓库内任意目录；不在任何项目里则 404。 */
+  app.get("/api/project/current", (c) => {
+    const raw = c.req.query("path");
+    if (!raw) {
+      return c.json(
+        {
+          error: {
+            code: "USAGE_ERROR",
+            message: "缺少 path 查询参数",
+            hint: "GET /api/project/current?path=<绝对路径>",
+          },
+        },
+        400,
+      );
+    }
+    const resolved = resolveUserPath(raw);
+    const project = store.projectForPath(resolved);
+    if (!project) {
+      return c.json(
+        {
+          error: {
+            code: "NOT_FOUND",
+            message: `${resolved} 不在任何已登记的项目里`,
+            hint: "先登记：flowcard project add <仓库路径>",
+          },
+        },
+        404,
+      );
+    }
+    return c.json({ project });
+  });
+
+  /**
+   * 传附件（图片）。**必须读原始字节**（不是 JSON）：body 就是要存的图。
+   * 只收 png/jpeg/gif/webp 且按文件头嗅探，≤10MB，id = 内容 sha256 前 16 位（内容寻址 → 幂等去重）。
+   */
+  app.post("/api/attachments", async (c) => {
+    // 先看 Content-Length：明知超限就别把 10MB 全读进内存。
+    const declaredLength = Number(c.req.header("content-length") ?? Number.NaN);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_ATTACHMENT_BYTES) {
+      return c.json(
+        {
+          error: {
+            code: "TOO_LARGE",
+            message: `附件 ${declaredLength} 字节，超过上限 ${MAX_ATTACHMENT_BYTES} 字节（10 MB）`,
+            hint: "先压缩或裁剪再传",
+          },
+        },
+        413,
+      );
+    }
+
+    const bytes = new Uint8Array(await c.req.arrayBuffer());
+    const result = store.appendAttachment({
+      name: c.req.query("name") ?? "",
+      mime: c.req.header("content-type"),
+      bytes,
+    });
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.error.code === "TOO_LARGE" ? 413 : 415);
+    }
+    const { attachment, created } = result;
+    return c.json({
+      ...attachmentRef(attachment.id),
+      id: attachment.id,
+      bytes: attachment.bytes,
+      mime: attachment.mime,
+      name: attachment.name,
+      at: attachment.at,
+      created,
+    });
+  });
+
+  // 内容寻址 → 同一个 id 的内容永不改变，可以放心长缓存。
+  app.get("/api/attachments/:id", (c) => {
+    const found = store.getAttachment(c.req.param("id"));
+    if (!found) {
+      return c.json({ error: { code: "NOT_FOUND", message: "附件不存在" } }, 404);
+    }
+    return new Response(found.bytes, {
+      status: 200,
+      headers: {
+        "content-type": found.attachment.mime,
+        "content-length": String(found.bytes.byteLength),
+        "cache-control": "public, max-age=31536000, immutable",
+        // 上传内容一律不许浏览器猜类型，免得被当成 HTML/脚本执行。
+        "x-content-type-options": "nosniff",
+      },
+    });
   });
 
   app.post("/api/rebuild", (c) => c.json({ ok: true, cards: store.rebuild() }));
