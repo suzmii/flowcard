@@ -1,19 +1,31 @@
 /** 提示词模板（`prompts/*.md`）：占位符严格、每次读文件、启动校验。 */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { briefKickoff, cardBrief } from "../src/server/brief.ts";
 import { emptyCard } from "../src/server/project.ts";
-import { listTemplates, promptsDir, renderPrompt, validatePrompts } from "../src/server/prompts.ts";
+import {
+  DEFAULT_NOTICE_PREFIXES,
+  listNoticeTemplates,
+  listTemplates,
+  promptsDir,
+  readNoticePrefixes,
+  renderPrompt,
+  validatePrompts,
+} from "../src/server/prompts.ts";
 
 const dirs: string[] = [];
 
-/** 新建一个临时模板目录并写入给定文件（测完自动删）。 */
+/** 新建一个临时模板目录并写入给定文件（`notices/x.md` 这种带子目录的名字也支持；测完自动删）。 */
 function tmpPrompts(files: Record<string, string> = {}): string {
   const dir = mkdtempSync(join(tmpdir(), "fc-prompts-"));
   dirs.push(dir);
-  for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+  for (const [name, text] of Object.entries(files)) {
+    const file = join(dir, name);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, text);
+  }
   return dir;
 }
 
@@ -78,9 +90,55 @@ describe("提示词渲染器（renderPrompt）", () => {
 });
 
 describe("启动校验（validatePrompts）", () => {
-  it("仓库自带的 prompts/ 通过校验：两份模板都在，默认目录就是仓库根的 prompts/", () => {
+  it("仓库自带的 prompts/ 通过校验：两份会话模板 + notices/ 下的通知模板都在，默认目录就是仓库根的 prompts/", () => {
     expect(promptsDir().endsWith("/prompts")).toBe(true);
-    expect(validatePrompts()).toEqual(["brief.md", "kickoff.md"]);
+    expect(validatePrompts()).toEqual(["brief.md", "kickoff.md", ...listNoticeTemplates()]);
+    // 通知模板确实被算进来了（`notices/*.md`，不含 README.md 与 prefixes.json）
+    expect(listNoticeTemplates().length).toBeGreaterThanOrEqual(11);
+    expect(listNoticeTemplates()).toContain("notices/ci-fail.md");
+  });
+
+  it("notices/ 里的坏模板同样当场抛错：点名文件与占位符（坏模板拒启也管通知）", () => {
+    const dir = tmpPrompts({ ...repoPrompts(), "notices/ci-fail.md": "失败：{{nope}}\n" });
+    const msg = message(() => validatePrompts(dir));
+    expect(msg).toContain("notices/ci-fail.md");
+    expect(msg).toContain("{{nope}}");
+    expect(msg).toContain("cardId"); // 错误信息里带可用清单
+  });
+
+  it("notices/ 里只认 .md 模板：README.md 不是模板，prefixes.json 也不参与渲染", () => {
+    const dir = tmpPrompts({
+      ...repoPrompts(),
+      "notices/README.md": "# 说明 {{随便写}}\n",
+      "notices/prefixes.json": JSON.stringify(DEFAULT_NOTICE_PREFIXES),
+      "notices/ci-pass.md": "PR #{{prNumber}} 绿了\n",
+    });
+    expect(listNoticeTemplates(dir)).toEqual(["notices/ci-pass.md"]);
+    expect(validatePrompts(dir)).toEqual(["brief.md", "kickoff.md", "notices/ci-pass.md"]);
+  });
+
+  it("通知抬头配置（notices/prefixes.json）：缺文件用内置默认，文件在就按文件来", () => {
+    const bare = tmpPrompts(repoPrompts());
+    expect(readNoticePrefixes(bare)).toEqual(DEFAULT_NOTICE_PREFIXES);
+
+    const dir = tmpPrompts({
+      ...repoPrompts(),
+      "notices/prefixes.json": JSON.stringify({ pending: "【未转达】", approvalPending: "【审批未转达】" }),
+    });
+    expect(readNoticePrefixes(dir)).toEqual({
+      pending: "【未转达】",
+      approvalPending: "【审批未转达】",
+      renderFailed: DEFAULT_NOTICE_PREFIXES.renderFailed,
+    });
+  });
+
+  it("抬头配置坏（不是合法 JSON / 值是空串）→ 启动校验抛错点名那个文件与键", () => {
+    const bad = tmpPrompts({ ...repoPrompts(), "notices/prefixes.json": "{ 这不是 JSON" });
+    expect(message(() => validatePrompts(bad))).toContain("prefixes.json");
+    const empty = tmpPrompts({ ...repoPrompts(), "notices/prefixes.json": JSON.stringify({ pending: "" }) });
+    const msg = message(() => validatePrompts(empty));
+    expect(msg).toContain("prefixes.json");
+    expect(msg).toContain("pending");
   });
 
   it("坏模板（多了个没给值的 {{nope}}）→ 当场抛错（服务据此拒启）", () => {

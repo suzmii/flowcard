@@ -17,6 +17,11 @@
  * 判定与文案都是**纯函数**（`approvalSpec` / `approvalNotice` / `ciNotice` / `commentNotice` /
  * `candidateSpec`），IO 只在 `createNotifyHooks` 那个壳里 —— 所以能单独测（`test/notify-hooks.test.ts`）。
  *
+ * **文案在文件里**（用户定的，2026-10）：这些通知的正文一字不落地躺在 `prompts/notices/*.md`
+ * （一决定一文件），代码只负责填值 —— 改文案改文件即可，不用动代码、不用重启（每次渲染现读，
+ * 见 `./prompts.ts`）。占位符清单在 `prompts/notices/README.md`；渲染失败（模板坏 / 缺文件）
+ * **不静默**：warn 一句 + 在卡片上留一条评论（`noticeRenderFailed`），启动校验也会拦坏模板。
+ *
  * 开关：`FLOWCARD_NOTIFY_HOOKS=0` 关掉（默认开）；旧的 `FLOWCARD_APPROVAL_HOOKS=0` **仍然有效**
  * （兼容 —— 它当年只管审批，现在等于总开关），见 `notifyHooksEnabled`。
  */
@@ -24,13 +29,54 @@ import { STATE_LABELS, type Card, type Command } from "../shared/types.ts";
 import type { NewEvent } from "./project.ts";
 import type { ApprovalLedger, ApprovalNotice } from "./store.ts";
 import type { CiJob } from "./sync.ts";
+import {
+  DEFAULT_NOTICE_PREFIXES,
+  NOTICES_SUBDIR,
+  readNoticePrefixes,
+  renderPrompt,
+  type NoticePrefixes,
+  type PromptVars,
+} from "./prompts.ts";
 
 // ---------------------------------------------------------------- 通用：一条待投的通知
 
-/** 投递台账里攒下来的通知抬头（分不出它原来是谁的，只说明"还没转达出去"）。 */
-export const NOTIFY_PENDING_PREFIX = "【通知·待转达】";
-/** 审批通知沿用最早那个抬头（只针对审批那一类）。 */
-export const APPROVAL_PENDING_PREFIX = "【审批通知·待转达】";
+/**
+ * 投递台账里攒下来的通知抬头（分不出它原来是谁的，只说明"还没转达出去"）。
+ * 这是**内置默认**；实际用哪个抬头读 `prompts/notices/prefixes.json`（见 `readNoticePrefixes`）。
+ */
+export const NOTIFY_PENDING_PREFIX = DEFAULT_NOTICE_PREFIXES.pending;
+/** 审批通知沿用最早那个抬头（只针对审批那一类）。同样是内置默认，可被配置文件覆盖。 */
+export const APPROVAL_PENDING_PREFIX = DEFAULT_NOTICE_PREFIXES.approvalPending;
+
+/**
+ * 通知模板（相对 `prompts/`）：哪条决定用哪份文案。文案本体在文件里 —— 这里只是路由表，
+ * 改文案不用动它（见 `prompts/notices/README.md`）。
+ */
+const NOTICE_TEMPLATES = {
+  confirmApprove: `${NOTICES_SUBDIR}/confirm-approve.md`,
+  confirmReject: `${NOTICES_SUBDIR}/confirm-reject.md`,
+  cleanupApprove: `${NOTICES_SUBDIR}/cleanup-approve.md`,
+  cleanupReject: `${NOTICES_SUBDIR}/cleanup-reject.md`,
+  gateApprove: `${NOTICES_SUBDIR}/gate-approve.md`,
+  gateReject: `${NOTICES_SUBDIR}/gate-reject.md`,
+  accept: `${NOTICES_SUBDIR}/accept.md`,
+  acceptReject: `${NOTICES_SUBDIR}/accept-reject.md`,
+  ciPass: `${NOTICES_SUBDIR}/ci-pass.md`,
+  ciFail: `${NOTICES_SUBDIR}/ci-fail.md`,
+  comment: `${NOTICES_SUBDIR}/comment.md`,
+} as const;
+
+/**
+ * 渲染一份通知模板：占位符规则与 kickoff/brief **完全一样**（`renderPrompt`，现读现渲染，
+ * 写错/缺占位符就抛错），只是渲染完再**丢掉空行**（含文件末尾那个换行）—— 通知是"一句一行"的，
+ * 某个占位符没内容时（如没写理由的 `{{reason}}`）不该在中间留一个空行。
+ */
+function renderNotice(name: string, vars: PromptVars, dir: string | undefined): string {
+  return renderPrompt(name, vars, dir)
+    .split("\n")
+    .filter((line) => line !== "")
+    .join("\n");
+}
 
 /** 一条要投给会话的通知（`key` = 幂等键，全局唯一）。 */
 export type NoticeSpec = {
@@ -154,10 +200,17 @@ function afterAcceptance(card: Card): string {
  * 一次审批决定 → 给 agent 的人话通知（纯函数）。
  *
  * 三件事必须都在：**决定**（通过还是驳回）、**理由**（有就带）、**下一步该做什么**。
+ * 文案本体在 `prompts/notices/*.md`（一决定一文件，见本文件顶部的 `NOTICE_TEMPLATES`），这里只选文件 + 填值。
  */
 export function approvalNotice(spec: ApprovalSpec, card: Card): string {
-  const reason = reasonLine(spec.reason);
+  return approvalNoticeIn(spec, card, undefined);
+}
+
+/** `approvalNotice` 的内部形态：多一个模板目录（`undefined` = 默认 `prompts/`）。 */
+function approvalNoticeIn(spec: ApprovalSpec, card: Card, dir: string | undefined): string {
   const approved = spec.decision === "approved";
+  const reason = reasonLine(spec.reason);
+  const base = { cardId: card.id, reason };
 
   // —— G2 远程写确认：一次授权只覆盖一次动作，批的/驳的都是"这一件事"。
   if (spec.confirm) {
@@ -166,74 +219,46 @@ export function approvalNotice(spec: ApprovalSpec, card: Card): string {
     const detail = confirmation?.detail.trim() ?? "";
     const action = confirmation?.action ?? "other";
     const what = detail === "" ? `${id}（${action}）` : `${id}（将执行：${detail}）`;
-    const open = `【flowcard 审批通知】人${approved ? "批准" : "驳回"}了远程写授权 ${what}。`;
-    if (approved) {
-      return [
-        open,
-        reason,
-        `下一步：现在可以执行它；执行完请 \`flowcard confirm ${card.id} --consume ${id}\` 作废这次授权（一次批准只覆盖一次动作，再写一次要重新申请）。`,
-      ]
-        .filter((line) => line !== "")
-        .join("\n");
-    }
-    return [
-      open,
-      reason,
-      `下一步：**不要执行**这次远程写。如果你仍然认为有必要，改 detail（写清将要执行的确切命令或 URL）后重新申请一次：\`flowcard confirm ${card.id} --request --for ${action} --detail "…"\`。`,
-    ]
-      .filter((line) => line !== "")
-      .join("\n");
+    return renderNotice(
+      approved ? NOTICE_TEMPLATES.confirmApprove : NOTICE_TEMPLATES.confirmReject,
+      { ...base, what, confirmId: id, action },
+      dir,
+    );
   }
 
+  // 门禁是干什么的、叫什么：都从卡片投影上读（只有门禁决策事件，没有别的线索）。
+  const kind = spec.gate ? gateKind(spec, card) : "";
+  const name = spec.gate ? gateName(spec, card) : "G3 验收";
+
   // —— 清理门禁（G4）：批的就是"可以拆现场了"。
-  if (spec.gate && gateKind(spec, card) === "cleanup") {
-    const name = gateName(spec, card);
+  if (spec.gate && kind === "cleanup") {
     if (approved) {
-      return [
-        `【flowcard 审批通知】人已批准清理（${name}）。`,
-        reason,
-        card.cleanedAt
-          ? "下一步：清理已经完成（卡片已「完成」）。"
-          : `下一步：现在可以执行清理：\`flowcard cleanup ${card.id}\` 记账，然后把现场清掉（worktree / 分支 / 临时文件）—— 完成后卡片自动进「完成」。`,
-      ]
-        .filter((line) => line !== "")
-        .join("\n");
+      return renderNotice(
+        NOTICE_TEMPLATES.cleanupApprove,
+        {
+          ...base,
+          gateName: name,
+          next: card.cleanedAt
+            ? "下一步：清理已经完成（卡片已「完成」）。"
+            : `下一步：现在可以执行清理：\`flowcard cleanup ${card.id}\` 记账，然后把现场清掉（worktree / 分支 / 临时文件）—— 完成后卡片自动进「完成」。`,
+        },
+        dir,
+      );
     }
-    return [
-      `【flowcard 审批通知】人已驳回清理（${name}）。`,
-      reason,
-      `下一步：**不要拆现场**（worktree / 分支都留着）。如果你仍然认为有必要清理，把理由说清楚后重新提一次清单：\`flowcard cleanup ${card.id} --item "要删的东西"\`，等人再批一次。`,
-    ]
-      .filter((line) => line !== "")
-      .join("\n");
+    return renderNotice(NOTICE_TEMPLATES.cleanupReject, { ...base, gateName: name }, dir);
   }
 
   // —— 不认识的流程门禁：说清决定与状态，不硬套"验收/清理"的说法。
-  if (spec.gate && gateKind(spec, card) !== "review") {
-    const name = gateName(spec, card);
-    const open = `【flowcard 审批通知】人已${approved ? "批准" : "驳回"}门禁 ${name}。`;
-    const next = approved
-      ? afterAcceptance(card)
-      : `下一步：**不要**按"已经通过"往下走。如果你仍然认为有必要，把理由说清楚后重新申请一次。`;
-    return [open, reason, next]
-      .filter((line) => line !== "")
-      .join("\n");
+  if (spec.gate && kind !== "review") {
+    return approved
+      ? renderNotice(NOTICE_TEMPLATES.gateApprove, { ...base, gateName: name, next: afterAcceptance(card) }, dir)
+      : renderNotice(NOTICE_TEMPLATES.gateReject, { ...base, gateName: name }, dir);
   }
 
   // —— 验收门禁（G3）/ `accept`：批的是"这活我认了"。
-  const name = spec.gate ? gateName(spec, card) : "G3 验收";
-  if (approved) {
-    return [`【flowcard 审批通知】人已验收（${name} 通过）。`, reason, afterAcceptance(card)]
-      .filter((line) => line !== "")
-      .join("\n");
-  }
-  return [
-    `【flowcard 审批通知】人已驳回验收（${name}）。`,
-    reason,
-    `下一步：**不要**按「已经验收」往下走（别合并、别拆现场）。如果你仍然认为有必要，把下面说的东西补上 / 改掉之后，再请人验收一次（看板上点「验收」，或 \`flowcard accept ${card.id}\`）。`,
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
+  return approved
+    ? renderNotice(NOTICE_TEMPLATES.accept, { ...base, gateName: name, next: afterAcceptance(card) }, dir)
+    : renderNotice(NOTICE_TEMPLATES.acceptReject, { ...base, gateName: name }, dir);
 }
 
 // ---------------------------------------------------------------- 同步侧：候选（纯数据）
@@ -269,31 +294,39 @@ export function ciNotice(input: {
   pr: { number: number; sha: string; conclusion: "pass" | "fail"; url: string };
   jobs: readonly CiJob[];
 }): string {
+  return ciNoticeIn(input, undefined);
+}
+
+/** `ciNotice` 的内部形态：多一个模板目录（`undefined` = 默认 `prompts/`）。文案在 `notices/ci-pass|ci-fail.md`。 */
+function ciNoticeIn(
+  input: {
+    cardId: string;
+    pr: { number: number; sha: string; conclusion: "pass" | "fail"; url: string };
+    jobs: readonly CiJob[];
+  },
+  dir: string | undefined,
+): string {
   const { pr, jobs, cardId } = input;
   const passed = pr.conclusion === "pass";
-  const sha = pr.sha === "" ? "" : `（commit ${pr.sha.slice(0, 12)}）`;
-  const lines = [
-    `【flowcard 通知】CI 结束了：PR #${pr.number} 的 CI ${passed ? "**通过**（pass）" : "**失败**（fail）"}${sha}。`,
-  ];
-  if (!passed) {
-    const failed = jobs.filter((job) => job.conclusion === "fail");
-    if (failed.length === 0) {
-      lines.push("失败的 job 名远端没给（自己去 PR 页面看详情）。");
-    } else {
-      const listed = failed
-        .slice(0, MAX_LISTED_JOBS)
-        .map((job) => (job.url === "" ? job.name : `${job.name}（${job.url}）`));
-      const rest = failed.length - listed.length;
-      lines.push(`失败 job：${listed.join("、")}${rest > 0 ? `；还有 ${rest} 个没列` : ""}`);
-    }
-  }
-  lines.push(
-    passed
-      ? `下一步：看一下还有没有 review 意见；都处理完就请人验收（看板点「验收」，或 \`flowcard accept ${cardId}\`）。`
-      : "下一步：看一眼失败日志；改完推上去 CI 会重跑。",
+  const failed = passed ? [] : jobs.filter((job) => job.conclusion === "fail");
+  const listed = failed
+    .slice(0, MAX_LISTED_JOBS)
+    .map((job) => (job.url === "" ? job.name : `${job.name}（${job.url}）`));
+  const rest = failed.length - listed.length;
+  return renderNotice(
+    passed ? NOTICE_TEMPLATES.ciPass : NOTICE_TEMPLATES.ciFail,
+    {
+      cardId,
+      prNumber: String(pr.number),
+      sha: pr.sha === "" ? "" : `（commit ${pr.sha.slice(0, 12)}）`,
+      link: pr.url === "" ? "" : `链接：${pr.url}`,
+      jobs:
+        failed.length === 0
+          ? "失败的 job 名远端没给（自己去 PR 页面看详情）。"
+          : `失败 job：${listed.join("、")}${rest > 0 ? `；还有 ${rest} 个没列` : ""}`,
+    },
+    dir,
   );
-  if (pr.url !== "") lines.push(`链接：${pr.url}`);
-  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------- 评论：文案 + 跳过自己（纯）
@@ -345,22 +378,36 @@ export function isSelfComment(card: Card, author: string, extra: readonly string
   return name !== "" && selfAuthors(card, extra).has(name);
 }
 
-/** 新评论 → 给 agent 的人话通知（纯函数）：谁、在哪、链接、正文摘要。 */
+/** 新评论 → 给 agent 的人话通知（纯函数）：谁、在哪、链接、正文摘要。文案在 `notices/comment.md`。 */
 export function commentNotice(input: {
   cardId: string;
   kind: "issue" | "pr";
   comment: { number: number; author: string; body: string; at: string; url: string };
 }): string {
+  return commentNoticeIn(input, undefined);
+}
+
+/** `commentNotice` 的内部形态：多一个模板目录（`undefined` = 默认 `prompts/`）。 */
+function commentNoticeIn(
+  input: {
+    cardId: string;
+    kind: "issue" | "pr";
+    comment: { number: number; author: string; body: string; at: string; url: string };
+  },
+  dir: string | undefined,
+): string {
   const { comment, kind, cardId } = input;
-  const who = comment.author === "" ? "有人" : comment.author;
-  const where = kind === "pr" ? `PR #${comment.number}` : `Issue #${comment.number}`;
-  const lines = [`【flowcard 通知】${who} 在${where}上留言了。`];
-  if (comment.url !== "") lines.push(`链接：${comment.url}`);
-  lines.push(`正文（摘要）：${summarize(comment.body)}`);
-  lines.push(
-    `下一步：读一遍再决定要不要回 —— 要回就在远端评论（或 \`flowcard comment ${cardId} --body "…"\` 记一句本地说明）。`,
+  return renderNotice(
+    NOTICE_TEMPLATES.comment,
+    {
+      cardId,
+      who: comment.author === "" ? "有人" : comment.author,
+      where: kind === "pr" ? `PR #${comment.number}` : `Issue #${comment.number}`,
+      link: comment.url === "" ? "" : `链接：${comment.url}`,
+      summary: summarize(comment.body),
+    },
+    dir,
   );
-  return lines.join("\n");
 }
 
 /**
@@ -373,12 +420,22 @@ export function candidateSpec(
   card: Card,
   extraSelf: readonly string[] = [],
 ): NoticeSpec | null {
+  return candidateSpecIn(candidate, card, extraSelf, undefined);
+}
+
+/** `candidateSpec` 的内部形态：多一个模板目录（`undefined` = 默认 `prompts/`）。 */
+function candidateSpecIn(
+  candidate: NotifyCandidate,
+  card: Card,
+  extraSelf: readonly string[],
+  dir: string | undefined,
+): NoticeSpec | null {
   if (candidate.kind === "ci") {
     const { pr, jobs } = candidate;
     return {
       key: `ci:${pr.number}:${pr.sha}:${pr.conclusion}`,
       cardId: candidate.cardId,
-      text: ciNotice({ cardId: candidate.cardId, pr, jobs }),
+      text: ciNoticeIn({ cardId: candidate.cardId, pr, jobs }, dir),
       pendingPrefix: NOTIFY_PENDING_PREFIX,
     };
   }
@@ -388,7 +445,7 @@ export function candidateSpec(
   return {
     key: `comment:${kind}:${comment.id}`,
     cardId: candidate.cardId,
-    text: commentNotice({ cardId: candidate.cardId, kind, comment }),
+    text: commentNoticeIn({ cardId: candidate.cardId, kind, comment }, dir),
     pendingPrefix: NOTIFY_PENDING_PREFIX,
   };
 }
@@ -422,6 +479,8 @@ export type NotifyHookDeps = {
   maxDelivered?: number;
   /** 额外算作「自己」的远端作者名（`FLOWCARD_NOTIFY_SELF_AUTHORS`，逗号分隔）。 */
   selfAuthors?: readonly string[];
+  /** 通知模板目录（默认 `prompts/`；`FLOWCARD_PROMPTS_DIR` 也认 —— 测试/试验用）。 */
+  promptsDir?: string;
 };
 
 export type NotifyHooks = {
@@ -512,6 +571,34 @@ export function createNotifyHooks(deps: NotifyHookDeps): NotifyHooks {
     deps.ledger.set(cardId, { ...ledger, delivered });
   };
 
+  /**
+   * 通知抬头（`prompts/notices/prefixes.json`，见 `prompts/notices/README.md`）。读坏了**只 warn**
+   * 并退回内置默认 —— 抬头是"给人看的装饰"，不该因为它把通知全卡住（坏文件在启动校验那关就被拦）。
+   */
+  const noticePrefixes = (): NoticePrefixes => {
+    try {
+      return readNoticePrefixes(deps.promptsDir);
+    } catch (error) {
+      warn(`通知抬头配置读不到，改用内置默认：${error instanceof Error ? error.message : String(error)}`);
+      return DEFAULT_NOTICE_PREFIXES;
+    }
+  };
+
+  /**
+   * 渲染失败（模板坏 / 读不到 / 占位符对不上）：**不投**，但绝不静默 —— warn 一句 **+ 在卡片上
+   * 留一条评论**，让人在卡上就看得见"这条通知没发出去，因为文案模板坏了"。
+   */
+  const noticeRenderFailed = (cardId: string, what: string, error: unknown): void => {
+    const detail = error instanceof Error ? error.message : String(error);
+    warn(`通知文案渲染失败（卡片 ${cardId}，${what}）：${detail}`);
+    try {
+      deps.comment(cardId, `${noticePrefixes().renderFailed}（${what}）${detail}`);
+      deps.notify?.(cardId, ["card.comment.added"]);
+    } catch (error2) {
+      warn(`写卡片评论失败（卡片 ${cardId}）：${error2 instanceof Error ? error2.message : String(error2)}`);
+    }
+  };
+
   /** 降级：记 pending + 写一条评论（会话不在线时，评论就是这条通知唯一的可见痕迹）。 */
   const degrade = (spec: NoticeSpec): void => {
     const ledger = deps.ledger.get(spec.cardId);
@@ -523,7 +610,15 @@ export function createNotifyHooks(deps: NotifyHookDeps): NotifyHooks {
       });
     }
     try {
-      const prefix = spec.pendingPrefix ?? NOTIFY_PENDING_PREFIX;
+      // `spec` 里带的是**内置默认**抬头（审批一类 vs 其它）；配置文件的覆盖优先。
+      const configured = noticePrefixes();
+      const wanted = spec.pendingPrefix;
+      const prefix =
+        wanted === undefined || wanted === NOTIFY_PENDING_PREFIX
+          ? configured.pending
+          : wanted === APPROVAL_PENDING_PREFIX
+            ? configured.approvalPending
+            : wanted;
       deps.comment(spec.cardId, `${prefix}${spec.text}`);
       deps.notify?.(spec.cardId, ["card.comment.added"]);
     } catch (error) {
@@ -587,7 +682,14 @@ export function createNotifyHooks(deps: NotifyHookDeps): NotifyHooks {
             warn(`卡片 ${spec.cardId} 不在，跳过审批通知`);
             return;
           }
-          await enqueue({ ...spec, text: approvalNotice(spec, card) });
+          let text: string;
+          try {
+            text = approvalNoticeIn(spec, card, deps.promptsDir);
+          } catch (error) {
+            noticeRenderFailed(spec.cardId, "审批通知", error);
+            return;
+          }
+          await enqueue({ ...spec, text });
         })(),
       );
     },
@@ -601,7 +703,13 @@ export function createNotifyHooks(deps: NotifyHookDeps): NotifyHooks {
               warn(`卡片 ${candidate.cardId} 不在，跳过 ${candidate.kind} 通知`);
               continue;
             }
-            const spec = candidateSpec(candidate, card, extraSelf);
+            let spec: NoticeSpec | null;
+            try {
+              spec = candidateSpecIn(candidate, card, extraSelf, deps.promptsDir);
+            } catch (error) {
+              noticeRenderFailed(candidate.cardId, candidate.kind === "ci" ? "CI 通知" : "评论通知", error);
+              continue;
+            }
             if (!spec) continue; // 自己发的评论：不投
             await enqueue(spec);
           }

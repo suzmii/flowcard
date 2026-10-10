@@ -5,17 +5,27 @@
 
 - 位置：仓库根 `prompts/`，与 `skills/` 并列；`FLOWCARD_PROMPTS_DIR` 可指到别处（测试/试验用）。
 - 渲染器：`src/server/prompts.ts` —— 语法只有一条 `{{名字}}`，无第三方库、无条件/循环。
-- **每次渲染都重新读文件** → 改完保存**即生效，不用重启服务**（下一句 kickoff、下一份 brief 立刻用新文案）。
-- 服务启动时会用样本值把所有模板渲一遍（`validatePrompts()`），坏的当场**拒启**（退出码 3），
-  不等到第一次起会话才发现。
-- 只认 `.md`；`README.md`（本文件）不是模板，不参与渲染与校验。
+- **每次渲染都重新读文件** → 改完保存**即生效，不用重启服务**（下一句 kickoff、下一份 brief、下一条通知立刻用新文案）。
+- 服务启动时会用样本值把所有模板渲一遍（`validatePrompts()`，**含 `notices/` 子目录**），坏的当场**拒启**（退出码 3），
+  不等到第一次起会话 / 第一条通知才发现。
+- 只认 `.md`；`README.md`（本文件、`notices/README.md`）不是模板，不参与渲染与校验。
 
-## 两份模板
+## 两份会话模板
 
 | 文件 | 用途 | 渲染入口 | 占位符 |
 |---|---|---|---|
 | `kickoff.md` | 起会话的第一条 prompt（只说一句「去 read 那份提示」） | `briefKickoff()`（`src/server/brief.ts`） | `{{briefPath}}`、`{{cli}}` |
 | `brief.md` | 开工提示全文（写到 `<dataDir>/briefs/<card>.md`，agent 自己 `read`） | `cardBrief()`（`src/server/brief.ts`） | 见下 8 个 |
+
+## 通知文案（`prompts/notices/*.md`）
+
+审批（批准/驳回）、CI 结束、远端新评论这些**通知**的正文也在文件里（一决定一文件）：
+`confirm-approve.md`、`confirm-reject.md`、`cleanup-approve.md`、`cleanup-reject.md`、`gate-approve.md`、
+`gate-reject.md`、`accept.md`、`accept-reject.md`、`ci-pass.md`、`ci-fail.md`、`comment.md`；
+降级评论的抬头在 `notices/prefixes.json`。**占位符清单、触发时机、改坏会怎样**见
+[`notices/README.md`](notices/README.md)（同一套渲染与校验规则：坏模板拒启、缺文件抛错、改完即生效）。
+
+> 通知模板与顶层模板共用 `SAMPLE_VARS`：写一个代码没给值的占位符，启动校验会点名文件 + 占位符 + 可用清单。
 
 ## 占位符清单
 
@@ -59,17 +69,19 @@
 
 | 你做了什么 | 结果 |
 |---|---|
-| 改文案（不动占位符） | 下一次起会话/写 brief 立刻用新的，**不用重启** |
+| 改文案（不动占位符） | 下一次起会话/写 brief/发通知立刻用新的，**不用重启** |
 | 占位符名字打错（`{{titel}}`） | 渲染抛错；服务启动时就会拒启（退出码 3） |
 | 删掉 `{{todos}}` 那段 | 不报错 —— 但 agent 就看不到待办了（清单行是代码拼的，模板决定它露不露面） |
 | 删掉 `kickoff.md` / `brief.md` | 启动拒启（缺必模板；见 `prompts.ts` 的 `REQUIRED_TEMPLATES`） |
+| 删掉某个 `notices/*.md` | 启动**不拦**；那条通知渲染时读不到 → 不投 + `warn` + 卡片上留一条 `【通知·渲染失败】…` 评论 |
+| 改坏 `notices/prefixes.json` | 启动拒启（不是合法 JSON / 值是空串）；运行中改坏 → warn + 用内置默认抬头 |
 | 加了代码不认识的占位符 | 渲染抛错；要加值得改代码（见下） |
 
 ## 加一份新模板
 
-1. 新建 `prompts/<名字>.md`，占位符**只用 `src/server/prompts.ts` 里 `SAMPLE_VARS` 已有的名字**
-   （新名字要同时加进 `SAMPLE_VARS` 与调用处的 `renderPrompt("<名字>.md", { … })`）；
-2. 调用处 `renderPrompt("<名字>.md", { … })`；
-3. 启动校验会自动把它带上（`prompts/` 下所有 `.md` 都渲一遍），不用登记。
+1. 新建 `prompts/<名字>.md`（通知类放 `prompts/notices/<名字>.md`），占位符**只用 `src/server/prompts.ts`
+   里 `SAMPLE_VARS` 已有的名字**（新名字要同时加进 `SAMPLE_VARS` 与调用处的 `renderPrompt(…)`）；
+2. 调用处 `renderPrompt("<名字>.md", { … })`（通知类：`src/server/notify-hooks.ts` 的 `NOTICE_TEMPLATES` + `renderNotice(…)`）；
+3. 启动校验会自动把它带上（`prompts/` 顶层与 `notices/` 下所有 `.md` 都渲一遍），不用登记。
 
 改完记得跑 `npx vitest run` —— 文案断言就是回归网（改坏哪句会被用例点名）。

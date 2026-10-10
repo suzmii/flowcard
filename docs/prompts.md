@@ -1,189 +1,58 @@
 # flowcard 发给 AI 的全部提示词（逐字，供人工优化）
 
-> 生成方式：从源码**逐字提取**当前生效的文案（改文案请直接改源码里对应的那段）。
-> 触发时机写在每节开头；改完跑 `npx vitest run`，有文案断言会用例告诉我哪里破了。
+> **改哪个文件就改哪个文件，保存即生效（不用重启服务）**——本文件只是"看全"用的提取视图。
+> 渲染规则：`src/server/prompts.ts`（每次渲染现读文件；`{占位符}` 严格校验；模板坏 → 启动拒绝）。
 
-共 6 类：
-
-| # | 提示词 | 位置 | 触发时机 | 体积 |
-|---|---|---|---|---|
-| 1 | **kickoff**（起会话第一条 prompt） | `src/server/brief.ts` `briefKickoff()` | 起会话（自动开工 / 手动 start 的**新会话**） | 一句话 |
-| 2 | **brief 全文**（写成文件让 agent `read`） | `src/server/brief.ts` `cardBrief()` | 每次起会话/切 worktree 时刷新文件 | ~1.9KB |
-| 3 | **skill**（模型指令文件，omp 自动加载） | `skills/flowcard/SKILL.md` | 每个会话常驻（软链 `~/.agents/skills/flowcard`） | ~7KB |
-| 4 | **审批通知**（人批准/驳回后投给会话） | `src/server/notify-hooks.ts` `approvalNotice()` | 人在看板上做决定之后（异步、幂等、离线降级） | 每条约 100–300 字 |
-| 5 | **自动开工写回卡片的评论** | `src/server/autostart.ts` | 自动开工时（成功/失败/异常） | 数行 |
-| 6 | **CI 结束 / 新评论通知** | `src/server/notify-hooks.ts` `ciNotice()` / `commentNotice()` | 同步轮询发现状态变化时 | 每条约 150–300 字 |
+| # | 提示词 | **可编辑的文件** | 触发时机 |
+|---|---|---|---|
+| 1 | kickoff（起会话第一条 prompt） | `prompts/kickoff.md` | 起会话（自动开工 / 手动 start 的新会话） |
+| 2 | brief 全文 | `prompts/brief.md` | 起会话、切 worktree 时写成文件让 agent `read` |
+| 3 | skill（模型指令） | `skills/flowcard/SKILL.md` | 每个会话常驻（omp 自动加载） |
+| 4 | 通知文案（审批 / CI / 评论） | `prompts/notices/*.md` | 人做决定、CI 结束、远端新评论 |
+| 5 | 降级评论抬头 | `prompts/notices/prefixes.json` | 会话不在线时写卡片评论的前缀 |
+| 6 | 自动开工写回卡片的评论 | `src/server/autostart.ts`（源码内） | 自动开工成功/失败/异常 |
 
 ---
 
-## 1. kickoff（起会话第一条 prompt）
+## 1. `prompts/kickoff.md`
 
-`src/server/brief.ts` `briefKickoff(file, cli="flowcard")`：
-
-```ts
- * 起会话时投的第一句 prompt（kickoff）：只说一句「先 `read` 那份提示，按待办走」——
- * 提示全文**不进 argv/系统提示**（见本文件头注释）。自动开工与手动起会话（新会话）用**同一句**。
- */
-export function briefKickoff(file: string, cli = "flowcard"): string {
-  return `开工：第一步先 read \`${file}\`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 \`${cli} comment\` 留痕。`;
-}
-
+```markdown
+开工：第一步先 read `{{briefPath}}`，按里面「☑︎ 接下来你要做的」逐步执行，每步用 `{{cli}} comment` 留痕。
 ```
 
-**为什么这么短**：用户要求"提示词直接接一个 tool use，read brief 行不行，其他说明都省了" —— 全文进
-`--append-system-prompt` 会**每轮请求重发 ~3KB**，所以改成一句话 + 让 agent 自己 `read`。
-
 ---
 
-## 2. brief 全文（`<dataDir>/briefs/<card>.md`）
+## 2. `prompts/brief.md`
 
-`src/server/brief.ts` `cardBrief()`：
+```markdown
+# 卡片 {{cardId}}：{{title}}
 
-```ts
-  ];
-}
-
-export function cardBrief(input: BriefInput): string {
-  const { card } = input;
-  const cli = input.cli ?? "flowcard";
-  const project = input.project;
-  const worktree = input.worktree ?? card.worktree ?? undefined;
-
-  const paths = [
-    project
-      ? `- 项目根：\`${project.path}\`（${project.name}${project.defaultBranch ? `，默认分支 ${project.defaultBranch}` : ""}）`
-      : null,
-    worktree
-      ? `- worktree：\`${worktree.path}\`（分支 \`${worktree.branch}\`）`
-      : `- worktree：未绑（下面第一条待办就是建它）`,
-    project?.remote ? `- 远端：${project.remote}` : null,
-  ]
-    .filter((x): x is string => x !== null)
-    .join("\n");
-
-  return `# 卡片 ${card.id}：${card.title}
-
-**当前状态**：${STATE_LABELS[card.state as CardState] ?? card.state}
+**当前状态**：{{state}}
 
 **正文（需求原文）**：
 
-${card.body.trim() === "" ? "（空）" : card.body.trim()}
+{{body}}
 
 ## 关键路径
 
-${paths}
+{{paths}}
 
 ## 六项交付要件
 
-${checklist(card).join("\n")}
+{{checklist}}
 
 ## ☑︎ 接下来你要做的
 
-${todos(card, cli, worktree).join("\n")}
+{{todos}}
 
 **位置**：会话没进 worktree 就不算开工（在主仓库里改文件不算开工）—— 搬进去用
-\`${cli} worktree use ${card.id} --path <worktree 路径>\`（停当前会话、用新目录续接同一条会话）。
-`;
-}
+`{{cli}} worktree use {{cardId}} --path <worktree 路径>`（停当前会话、用新目录续接同一条会话）。
 
-/** 内容不变就不重写（避免每次都改 mtime）。 */
-export async function writeBriefFile(
-  filePath: string,
-  text: string,
-  io: {
-    readFile?: (p: string) => Promise<string>;
-    writeFile?: (p: string, t: string) => Promise<void>;
-    mkdir?: (p: string) => Promise<void>;
-  } = {},
-): Promise<{ written: boolean }> {
-  const read = io.readFile ?? ((p: string) => readFile(p, "utf8"));
-  const write = io.writeFile ?? ((p: string, t: string) => writeFile(p, t, "utf8"));
-  const existing = await read(filePath).catch(() => null);
-  if (existing === text) return { written: false };
-  // 目录可能还不存在（第一次写），自己建——不该让"开卡"因为一个 mkdir 失败而 500
-  await (io.mkdir ?? ((p: string) => mkdir(p, { recursive: true })))(dirname(filePath));
-  await write(filePath, text);
-  return { written: true };
-}
-
-```
-
-**只写卡片特有事实**；铁律/命令清单已删（`skill` 里都有，omp 自动加载）。
-
-**生成清单行的两个函数**（brief 里那两节就是它们拼出来的，改文案也改这里）：
-
-```ts
-function checklist(card: Card): string[] {
-  const issue = card.issue ? `${card.issue.repo}#${card.issue.number}` : "未绑";
-  const pr = card.pr ? `#${card.pr.number}（${card.pr.state}）` : "未绑";
-  const wt = card.worktree ? `${card.worktree.path}（${card.worktree.branch}）` : "未绑";
-  return [
-    `| Issue | worktree | WIP PR | 推送 | 验收 | 清理 |`,
-    `|---|---|---|---|---|---|`,
-    `| ${issue} | ${wt} | ${pr} | ${card.pushes.length} 条 | ${
-      card.acceptedAt ? "已验收" : "未验收"
-    } | ${card.cleanedAt ? "已清理" : "未清理"} |`,
-  ];
-}
-
-function todos(card: Card, cli: string, worktree: { path: string; branch: string } | undefined): string[] {
-  const out: string[] = [];
-  const wt = worktree ?? card.worktree ?? undefined;
-
-  out.push(
-    wt
-      ? todo(true, `会话就待在 worktree 里干活：\`${wt.path}\`（分支 \`${wt.branch}\`）`)
-      : todo(
-          false,
-          [
-            "**先建 worktree，名字由你起**：目录名与分支名都按这次要干的事取（分支前缀看改动性质——feat / fix / chore / docs / refactor…，跟本仓库惯例走）：",
-            "  ```bash",
-            "  git worktree add .worktrees/<你起的名字> -b <前缀>/<你起的名字>",
-            `  ${cli} worktree use ${card.id} --path .worktrees/<你起的名字>   # 登记 + 把会话搬进去（一步到位）`,
-            "  ```",
-            "  **斜杠命令你执行不了，别尝试 `/move`、`/wt`**：`worktree use` 会替你做——登记 worktree、停掉当前会话、",
-            "  用新目录续接（还是同一条会话，历史都在），新会话起来后自己 claim，卡片随即进「实施中」。",
-          ].join("\n"),
-        ),
-  );
-
-  out.push(
-    card.issue
-      ? todo(true, `Issue 已绑：#${card.issue.number} ${card.issue.url}（干活前先读它，别自己另开一个）`)
-      : todo(
-          false,
-          `绑上对应的 Issue（**只填编号**）：\`${cli} issue ${card.id} --number <编号>\`；确实没有就在评论里写清为什么没有`,
-        ),
-  );
-
-  out.push(
-    card.pr
-      ? todo(true, `WIP PR 已绑：#${card.pr.number} ${card.pr.url}（状态 ${card.pr.state}）`)
-      : todo(false, `开 WIP PR（**任务一开始就开**）：推分支后 \`${cli} pr ${card.id} --number <编号> --url <链接> --branch <分支>\``),
-  );
-
-  out.push(
-    card.pushes.length > 0
-      ? todo(true, `已有 ${card.pushes.length} 条推送记录（最新 ${card.pushes.at(-1)?.sha.slice(0, 8) ?? ""}）`)
-      : todo(false, `推进度要留痕：推送后 \`${cli} push ${card.id} --sha <sha>\`（以后每次 push 都记一条）`),
-  );
-
-  out.push(
-    todo(
-      Boolean(card.acceptedAt),
-      `要件备齐就交回：\`${cli} end ${card.id} --summary "做完什么"\` —— 剩下的验收与清理由人来做`,
-    ),
-  );
-
-  return out;
-}
 ```
 
 ---
 
-## 3. skill（模型指令文件）
-
-`skills/flowcard/SKILL.md`（全文，逐字）：
+## 3. `skills/flowcard/SKILL.md`
 
 ```markdown
 ---
@@ -277,107 +146,210 @@ flowcard probe <card> --number 7 --state merged …   # 汇报 PR 状态（merge
 
 ---
 
-## 4. 审批通知（`approvalNotice()`）
+## 4. 通知文案 `prompts/notices/*.md`（12 份，逐字）
 
-`src/server/notify-hooks.ts`：
+### `prompts/notices/README.md`
 
-```ts
-  }
-}
+```markdown
+# 通知文案模板（改文案改这里）
 
-/**
- * 一次审批决定 → 给 agent 的人话通知（纯函数）。
- *
- * 三件事必须都在：**决定**（通过还是驳回）、**理由**（有就带）、**下一步该做什么**。
- */
-export function approvalNotice(spec: ApprovalSpec, card: Card): string {
-  const reason = reasonLine(spec.reason);
-  const approved = spec.decision === "approved";
+`notify-hooks.ts` 发给 AI 的那些**通知**（人批准/驳回、CI 结束、远端新评论）的正文就躺在这个目录里：
+代码只负责**选文件 + 填值**。渲染器与校验规则与 `prompts/kickoff.md` / `prompts/brief.md`
+**完全同一套**（见 `src/server/prompts.ts`）：语法只有 `{{名字}}`，没有条件/循环。
 
-  // —— G2 远程写确认：一次授权只覆盖一次动作，批的/驳的都是"这一件事"。
-  if (spec.confirm) {
-    const id = spec.confirm.id;
-    const confirmation = card.confirmations.find((c) => c.id === id);
-    const detail = confirmation?.detail.trim() ?? "";
-    const action = confirmation?.action ?? "other";
-    const what = detail === "" ? `${id}（${action}）` : `${id}（将执行：${detail}）`;
-    const open = `【flowcard 审批通知】人${approved ? "批准" : "驳回"}了远程写授权 ${what}。`;
-    if (approved) {
-      return [
-        open,
-        reason,
-        `下一步：现在可以执行它；执行完请 \`flowcard confirm ${card.id} --consume ${id}\` 作废这次授权（一次批准只覆盖一次动作，再写一次要重新申请）。`,
-      ]
-        .filter((line) => line !== "")
-        .join("\n");
-    }
-    return [
-      open,
-      reason,
-      `下一步：**不要执行**这次远程写。如果你仍然认为有必要，改 detail（写清将要执行的确切命令或 URL）后重新申请一次：\`flowcard confirm ${card.id} --request --for ${action} --detail "…"\`。`,
-    ]
-      .filter((line) => line !== "")
-      .join("\n");
-  }
+- **每次渲染都重新读文件** → 改完保存**即生效，不用重启服务**（下一次通知立刻用新文案）。
+- 服务启动时会把 `notices/*.md` 与顶层模板一起渲一遍（`validatePrompts()`）：**坏模板当场拒启**（退出码 3）。
+- 只认 `.md`；`README.md`（本文件）不是模板，`prefixes.json` 也不是模板（它是抬头配置，见下）。
+- 渲染完会**丢掉空行**（含文件末尾那个换行）—— 占位符没内容时（比如没写理由的 `{{reason}}`）不该在
+  通知中间留一个空行。所以别指望用空行在这里排版，它会被吃掉。
 
-  // —— 清理门禁（G4）：批的就是"可以拆现场了"。
-  if (spec.gate && gateKind(spec, card) === "cleanup") {
-    const name = gateName(spec, card);
-    if (approved) {
-      return [
-        `【flowcard 审批通知】人已批准清理（${name}）。`,
-        reason,
-        card.cleanedAt
-          ? "下一步：清理已经完成（卡片已「完成」）。"
-          : `下一步：现在可以执行清理：\`flowcard cleanup ${card.id}\` 记账，然后把现场清掉（worktree / 分支 / 临时文件）—— 完成后卡片自动进「完成」。`,
-      ]
-        .filter((line) => line !== "")
-        .join("\n");
-    }
-    return [
-      `【flowcard 审批通知】人已驳回清理（${name}）。`,
-      reason,
-      `下一步：**不要拆现场**（worktree / 分支都留着）。如果你仍然认为有必要清理，把理由说清楚后重新提一次清单：\`flowcard cleanup ${card.id} --item "要删的东西"\`，等人再批一次。`,
-    ]
-      .filter((line) => line !== "")
-      .join("\n");
-  }
+## 一决定一文件
 
-  // —— 不认识的流程门禁：说清决定与状态，不硬套"验收/清理"的说法。
-  if (spec.gate && gateKind(spec, card) !== "review") {
-    const name = gateName(spec, card);
-    const open = `【flowcard 审批通知】人已${approved ? "批准" : "驳回"}门禁 ${name}。`;
-    const next = approved
-      ? afterAcceptance(card)
-      : `下一步：**不要**按"已经通过"往下走。如果你仍然认为有必要，把理由说清楚后重新申请一次。`;
-    return [open, reason, next]
-      .filter((line) => line !== "")
-      .join("\n");
-  }
+| 文件 | 触发时机 | 占位符 |
+|---|---|---|
+| `confirm-approve.md` | 人**批准**了 G2 远程写授权（`flowcard confirm … --request` 之后人在看板点批准） | `{{what}}` `{{reason}}` `{{cardId}}` `{{confirmId}}` |
+| `confirm-reject.md` | 人**驳回**了远程写授权 | `{{what}}` `{{reason}}` `{{cardId}}` `{{action}}` |
+| `cleanup-approve.md` | 人**批准**了 G4 清理门禁 | `{{gateName}}` `{{reason}}` `{{next}}` |
+| `cleanup-reject.md` | 人**驳回**了 G4 清理门禁 | `{{gateName}}` `{{reason}}` `{{cardId}}` |
+| `gate-approve.md` | 人**批准**了其它流程门禁（不是验收、也不是清理） | `{{gateName}}` `{{reason}}` `{{next}}` |
+| `gate-reject.md` | 人**驳回**了其它流程门禁 | `{{gateName}}` `{{reason}}` |
+| `accept.md` | 人**验收通过**（G3 门禁，或 `flowcard accept`） | `{{gateName}}` `{{reason}}` `{{next}}` |
+| `accept-reject.md` | 人**驳回验收** | `{{gateName}}` `{{reason}}` `{{cardId}}` |
+| `ci-pass.md` | 绑定的 PR 的 CI 从 `pending` 变成 `pass` | `{{prNumber}}` `{{sha}}` `{{cardId}}` `{{link}}` |
+| `ci-fail.md` | 绑定的 PR 的 CI 从 `pending` 变成 `fail` | `{{prNumber}}` `{{sha}}` `{{jobs}}` `{{link}}` |
+| `comment.md` | 绑定的 issue / PR 上出现了**别人**（不是这张卡的 agent）的新评论 | `{{who}}` `{{where}}` `{{link}}` `{{summary}}` `{{cardId}}` |
 
-  // —— 验收门禁（G3）/ `accept`：批的是"这活我认了"。
-  const name = spec.gate ? gateName(spec, card) : "G3 验收";
-  if (approved) {
-    return [`【flowcard 审批通知】人已验收（${name} 通过）。`, reason, afterAcceptance(card)]
-      .filter((line) => line !== "")
-      .join("\n");
-  }
-  return [
-    `【flowcard 审批通知】人已驳回验收（${name}）。`,
-    reason,
-    `下一步：**不要**按「已经验收」往下走（别合并、别拆现场）。如果你仍然认为有必要，把下面说的东西补上 / 改掉之后，再请人验收一次（看板上点「验收」，或 \`flowcard accept ${card.id}\`）。`,
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
-}
+三类通知共用同一条通道：投给这张卡的托管会话；会话不在线时降级成「卡片评论 + 待补投」（抬头见下）。
+幂等（同一条只打扰一次）与降级逻辑都在 `src/server/notify-hooks.ts`，改文案**不用**碰它。
 
-// ---------------------------------------------------------------- 投递（带 IO）
+## 占位符清单
 
+| 占位符 | 含义 | 值长什么样 / 由谁算 |
+|---|---|---|
+| `{{what}}` | 是哪一件远程写授权 | `cf1（将执行：git push origin feat/x）`；申请时没写 detail 就是 `cf1（push）` |
+| `{{confirmId}}` | 那条授权的编号 | `cf1` |
+| `{{action}}` | 授权的动作类型 | `push` / `merge` / `openPr` / `commentRemote` / `other` |
+| `{{gateName}}` | 门禁名 | `G4 清理确认`（流程里的标题；没标题就只给 id，如 `G9`）；验收没有门禁时是 `G3 验收` |
+| `{{reason}}` | 「理由」那一行 | `理由：现场没用了`；人没写理由就是**空串**（那一行整个消失） |
+| `{{next}}` | 「下一步」那一行 | `下一步：…` —— **按卡片当前状态**由代码选（`afterAcceptance()` 与清理分支）。模板没有条件语句，所以"选哪句"留在代码里 |
+| `{{cardId}}` | 卡号 | `c7` |
+| `{{prNumber}}` | PR 编号（只有数字） | `77` |
+| `{{sha}}` | commit 那一小句 | `（commit aaa111222333）`；远端没给 sha 就是**空串** |
+| `{{jobs}}` | 失败 job 那一行 | `失败 job：build（http://ci/build/1）、lint`（最多列 5 个，多的写「；还有 N 个没列」）；远端没给 job 明细时是「失败的 job 名远端没给（自己去 PR 页面看详情）。」 |
+| `{{link}}` | 「链接」那一行 | `链接：https://…`；远端没给链接就是**空串** |
+| `{{who}}` | 评论作者 | `lhk229`；作者名读不出来时是 `有人` |
+| `{{where}}` | 评论挂在哪儿 | `Issue #42` / `PR #77` |
+| `{{summary}}` | 评论正文摘要 | 折掉换行、超 240 字截断（`summarize()`），空正文是 `（空）` |
+
+> `{{next}}` / `{{reason}}` / `{{jobs}}` / `{{link}}` 这几个是**整行**：要么是一句完整的话，要么是空串
+> （空行会被丢掉）。因为模板里没有 `if`，"哪一句"由代码挑；改这些句子的**措辞**要改
+> `src/server/notify-hooks.ts`（`afterAcceptance()` / 清理分支 / `ciNoticeIn()`）。
+
+## 降级评论的抬头（`prefixes.json`）
+
+| 键 | 默认值 | 用在哪 |
+|---|---|---|
+| `pending` | `【通知·待转达】` | 会话不在线时，CI / 评论通知降级写的卡片评论抬头 |
+| `approvalPending` | `【审批通知·待转达】` | 同上，审批那一类（沿用最早那个抬头） |
+| `renderFailed` | `【通知·渲染失败】` | 模板坏 / 读不到时，那条"没发出去"的留痕评论抬头 |
+
+```json
+{ "pending": "【通知·待转达】", "approvalPending": "【审批通知·待转达】", "renderFailed": "【通知·渲染失败】" }
+```
+
+- 文件**不在** → 用内置默认（抬头只是"给人看的装饰"，不为它把整类通知弄坏）。
+- 文件**在但坏**（不是合法 JSON / 值是空串）→ 服务启动**拒启**（点名 `prefixes.json` 与哪个键）；
+  运行中改坏 → 只 `warn` + 退回内置默认，通知照发。
+- 少写某个键 → 那个抬头用默认（不因为少写一行把通知弄坏）。
+
+## 改坏会怎样
+
+| 你做了什么 | 结果 |
+|---|---|
+| 改文案（不动占位符） | 下一条通知立刻用新文案，**不用重启** |
+| 占位符名字打错 / 写了代码不认识的 | 渲染抛错：那条通知**不投**，控制台 `warn` 一句 + 卡片上留一条 `【通知·渲染失败】…` 评论；服务**启动时就拒启**（退出码 3），报错点名文件 + 占位符 + 可用清单 |
+| 删掉某个通知模板 | 那条通知渲染时读不到文件 → 同样「不投 + warn + 卡片评论留痕」（启动校验只拦"坏模板"，不拦"少文件"） |
+| 删/改坏 `prefixes.json` | 启动拒启（JSON 坏 / 值是空串）；运行中改坏 → warn + 用内置默认抬头 |
+| 加一个代码没给值的占位符 | 与"占位符打错"同一条路：拒启 / 渲染失败留痕。真要新占位符得改代码 |
+
+模板坏掉时**绝不静默**：即使会话在线也只会 warn + 在卡片上留痕，不会发出半截通知。
+
+## 加一类新通知
+
+1. 新建 `notices/<名字>.md`，占位符只用 `src/server/prompts.ts` 的 `SAMPLE_VARS` 里已有的名字
+   （新名字要同时加进 `SAMPLE_VARS` 与调用处的 `renderNotice(…)`）；
+2. 在 `src/server/notify-hooks.ts` 顶部的 `NOTICE_TEMPLATES` 里加上这份文件，调用处 `renderNotice(名字, { … })`；
+3. 启动校验会自动带上它（`notices/*.md` 全渲一遍），不用登记。
+
+改完跑 `npx vitest run`：`test/notice-templates.test.ts` / `test/notify-hooks.test.ts` /
+`test/approval-hooks.test.ts` 里的文案断言就是回归网（改坏哪句会被用例点名）。
+```
+
+### `prompts/notices/accept-reject.md`
+
+```markdown
+【flowcard 审批通知】人已驳回验收（{{gateName}}）。
+{{reason}}
+下一步：**不要**按「已经验收」往下走（别合并、别拆现场）。如果你仍然认为有必要，把下面说的东西补上 / 改掉之后，再请人验收一次（看板上点「验收」，或 `flowcard accept {{cardId}}`）。
+```
+
+### `prompts/notices/accept.md`
+
+```markdown
+【flowcard 审批通知】人已验收（{{gateName}} 通过）。
+{{reason}}
+{{next}}
+```
+
+### `prompts/notices/ci-fail.md`
+
+```markdown
+【flowcard 通知】CI 结束了：PR #{{prNumber}} 的 CI **失败**（fail）{{sha}}。
+{{jobs}}
+下一步：看一眼失败日志；改完推上去 CI 会重跑。
+{{link}}
+```
+
+### `prompts/notices/ci-pass.md`
+
+```markdown
+【flowcard 通知】CI 结束了：PR #{{prNumber}} 的 CI **通过**（pass）{{sha}}。
+下一步：看一下还有没有 review 意见；都处理完就请人验收（看板点「验收」，或 `flowcard accept {{cardId}}`）。
+{{link}}
+```
+
+### `prompts/notices/cleanup-approve.md`
+
+```markdown
+【flowcard 审批通知】人已批准清理（{{gateName}}）。
+{{reason}}
+{{next}}
+```
+
+### `prompts/notices/cleanup-reject.md`
+
+```markdown
+【flowcard 审批通知】人已驳回清理（{{gateName}}）。
+{{reason}}
+下一步：**不要拆现场**（worktree / 分支都留着）。如果你仍然认为有必要清理，把理由说清楚后重新提一次清单：`flowcard cleanup {{cardId}} --item "要删的东西"`，等人再批一次。
+```
+
+### `prompts/notices/comment.md`
+
+```markdown
+【flowcard 通知】{{who}} 在{{where}}上留言了。
+{{link}}
+正文（摘要）：{{summary}}
+下一步：读一遍再决定要不要回 —— 要回就在远端评论（或 `flowcard comment {{cardId}} --body "…"` 记一句本地说明）。
+```
+
+### `prompts/notices/confirm-approve.md`
+
+```markdown
+【flowcard 审批通知】人批准了远程写授权 {{what}}。
+{{reason}}
+下一步：现在可以执行它；执行完请 `flowcard confirm {{cardId}} --consume {{confirmId}}` 作废这次授权（一次批准只覆盖一次动作，再写一次要重新申请）。
+```
+
+### `prompts/notices/confirm-reject.md`
+
+```markdown
+【flowcard 审批通知】人驳回了远程写授权 {{what}}。
+{{reason}}
+下一步：**不要执行**这次远程写。如果你仍然认为有必要，改 detail（写清将要执行的确切命令或 URL）后重新申请一次：`flowcard confirm {{cardId}} --request --for {{action}} --detail "…"`。
+```
+
+### `prompts/notices/gate-approve.md`
+
+```markdown
+【flowcard 审批通知】人已批准门禁 {{gateName}}。
+{{reason}}
+{{next}}
+```
+
+### `prompts/notices/gate-reject.md`
+
+```markdown
+【flowcard 审批通知】人已驳回门禁 {{gateName}}。
+{{reason}}
+下一步：**不要**按"已经通过"往下走。如果你仍然认为有必要，把理由说清楚后重新申请一次。
 ```
 
 ---
 
-## 5. 自动开工写回卡片的评论
+## 5. 降级评论抬头 `prompts/notices/prefixes.json`
+
+```json
+{
+  "pending": "【通知·待转达】",
+  "approvalPending": "【审批通知·待转达】",
+  "renderFailed": "【通知·渲染失败】"
+}
+```
+
+---
+
+## 6. 自动开工写回卡片的评论（源码内，暂无独立文件）
 
 `src/server/autostart.ts`：
 
@@ -399,10 +371,3 @@ export function approvalNotice(spec: ApprovalSpec, card: Card): string {
     cardId,
     `已托管会话（工作目录 \`${cwd}\`，提示词见 \`${briefPath}\`）：worktree 由会话自己按提示创建并登记。`,
 ```
-
----
-
-## 6. CI 结束 / 新评论通知
-
-这两个源已经落在 `src/server/notify-hooks.ts`：`ciNotice()` / `commentNotice()`（复用同一条通道 / 台账 / 降级）。
-本节还没有逐字抄文案 —— 抄的时候从这两个函数里取。
