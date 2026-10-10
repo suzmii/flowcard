@@ -47,10 +47,22 @@ type Card = {
   acceptedAt?: string;             // 已验收（等合并）
 };
 
+type Session = {
+  harness: "omp" | "codex" | "claude" | "other";
+  id: string;                      // harness 侧会话标识（omp: getSessionId()，UUID）
+  agentKind: "main" | "sub";       // 只有 main 才绑卡片（subagent 也会 emit session_start）
+  cwd: string;                     // 每次上报都带 —— 用来校验"会话真的在 worktree 里"
+  state: "idle" | "running" | "ended" | "lost";   // lost = 心跳超时
+  startedAt: string;
+  lastSeenAt: string;
+  resumeHint?: string;             // 恢复命令（omp: omp -r <id>）
+};
+
 type IssueRef  = { repo: string; number: number; url: string; title?: string; state: "open" | "closed" };
 type PrRef     = { repo: string; number: number; url: string; branch: string;
                    state: "draft" | "open" | "merged" | "closed"; ci?: "pending" | "pass" | "fail" };
-type WorktreeRef = { path: string; branch: string };   // 约定 .worktrees/<名字>
+type WorktreeRef = { path: string; branch: string;
+                   source: "harness" | "flowcard" };   // 谁建的：harness 的 /wt，还是 flowcard 自己 add
 ```
 
 ## 3. 卡片上的"必要项目"（checklist，永远显示）
@@ -60,7 +72,7 @@ type WorktreeRef = { path: string; branch: string };   // 约定 .worktrees/<名
 | # | 必要项目 | 完成判据 | 动作性质 |
 |---|---|---|---|
 | 1 | **Issue**（建或查） | `issue != null` | 远程写（建 Issue）→ 需确认 |
-| 2 | **worktree + 分支** | `worktree != null`，分支名 `feat/*` `fix/*` | 本地 |
+| 2 | **worktree + 分支** | `worktree != null` **且 `session.cwd` 落在 `worktree.path` 内**（会话真的在里面干活）；分支名 `feat/*` `fix/*` | 本地（或委托 harness 的 `/wt`） |
 | 3 | **WIP PR** | `pr != null`（任务一开始就建） | 远程写 → 需确认 |
 | 4 | **推送记录** | 至少一条 push 事件（每天可见进度） | 远程写 → 需确认 |
 | 5 | **验收** | `acceptedAt != null`（人明确验收） | 人工门禁 |
@@ -70,9 +82,36 @@ type WorktreeRef = { path: string; branch: string };   // 约定 .worktrees/<名
 
 - 未绑 Issue **不许离开 `issue` 列**（即不许开工）。
 - 未建 worktree、未开 PR **不许进入 `review`**。
+- **会话没进 worktree 就不算开工**：`ready → working` 要求 `session.cwd` ⊆ `worktree.path`（见 §3.1）。
 - PR 未 `merged` **不许进入 `merged` 列**。
 - 未清理 **不许 `done`**。
 - **PR 合并前绝不清理**：`merged` 之前的任何清理动作一律拒绝。
+
+### 3.1 会话必须进入 worktree 里工作
+
+光建 worktree 不算数——**必须让会话本身在 worktree 里干活**，否则 agent 会继续在主干目录上改文件，等于白建。
+
+事实（omp 18.8.6 实测命令表）：omp 原生支持这条路径，不用我们造轮子
+
+| omp 命令 | 作用 |
+|---|---|
+| `/wt [<branch>]`（别名 `/worktree`） | **把当前会话移进一个新 worktree，连同未提交改动一起带过去** |
+| `/move [<path>]` | 把当前会话移到另一个目录 |
+| `/dirs` `/add-dir` `/remove-dir` | 会话的工作目录集合（只读/增删） |
+
+于是有两种落地方式，都接受：
+
+| 方式 | 步骤 | 何时用 |
+|---|---|---|
+| **A 委托 harness（默认）** | 会话内执行 `/wt feat/xxx` → 绑定 harness 报回的 cwd | 会话已经开着、手上还有未提交改动 |
+| **B flowcard 建** | `flowcard worktree add <card> --branch feat/xxx` 建 `.worktrees/<名字>` → 要求会话 `/move <worktree>`（或直接在 worktree 里重开会话） | 想严格控制 worktree 路径与分支名 |
+
+配套的校验与兜底（都是自动的，不靠人自觉）：
+
+1. **每次心跳都带 `cwd`**（M0 已验证 payload 含 `cwd`）→ 引擎拿 `cwd` 与 `worktree.path` 做前缀校验，**通过才允许 `ready → working`**。
+2. 未通过时卡片停在 `ready`，并给出确切修复动作：`/wt <branch>`（方式 A）或 `/move <path>`（方式 B）+ 在 worktree 里重开会话的命令。
+3. 进入 `working` 之后若 `cwd` 漂出 worktree（`/move` 回主干等）→ 记 `card.cwd.mismatch` 事件，卡片显示警告并回到"未在 worktree"状态（**不改流程状态**，只提示 + 门禁收紧：不许提交、不许 `review`）。
+4. `worktree` 槽位里的 `path`/`branch` 优先**从 cwd 反查**（`git -C <cwd> rev-parse --show-toplevel --abbrev-ref HEAD`），避免人手工填错；期望落在项目仓库的 `.worktrees/` 下，不在则记警告但仍接受。
 
 ## 4. 流程状态（看板的列）
 
@@ -80,7 +119,7 @@ type WorktreeRef = { path: string; branch: string };   // 约定 .worktrees/<名
 |---|---|---|
 | `inbox` | 收件箱：原始需求刚进来 | 人确认要做 → `issue` |
 | `issue` | **立 Issue**（建或查已有），并写清问题原因与思路 | 门禁 G1：方案批准 **且** `issue != null` → `ready` |
-| `ready` | 待开工（Issue 已绑，方案已批） | agent 领卡：自动建 worktree + WIP PR（远程写走 G2）→ `working` |
+| `ready` | 待开工（Issue 已绑，方案已批） | agent 领卡：建 worktree + WIP PR **并把会话移进 worktree**（`/wt` 或 `/move`，远程写走 G2）→ `working` |
 | `working` | 实施中（worktree + PR 已建，多次推送） | 会话结束 / agent 交回 → `review` |
 | `review` | 待验收（子徽标：待验收 / 已验收待合并） | 门禁 G3 验收 → 等 PR merged；探测到 merged → `merged` |
 | `merged` | 已合并，**待清理**（此处验证现场必须完整保留） | 门禁 G4：报告清理清单 → 同意 → 执行 → `done` |
@@ -137,6 +176,7 @@ gate.requested       gate.decided
 cleanup.proposed     cleanup.completed
 session.started      session.heartbeat     session.ended
 git.probed
+session.cwd.mismatch
 ```
 
 ## 7. 流程 DSL（TS 代码）
@@ -158,7 +198,7 @@ export default defineFlow({
 
   requires: {                      // 硬门禁：缺了就拒绝转换，并回一个"缺哪项"的错误
     "issue -> ready":   ["issue", "planApproved"],
-    "ready -> working": ["worktree", "pr"],
+    "ready -> working": ["worktree", "pr", "sessionInWorktree"],
     "working -> review": ["pr", "pushedAtLeastOnce"],
     "review -> merged": ["accepted", "pr.merged"],
     "merged -> done":   ["cleanupCompleted"],
@@ -196,7 +236,8 @@ export default defineFlow({
 flowcard open   --title "…" [--body …] [--repo <path>]   # 开卡（inbox）
 flowcard issue  <card> --create | --bind <repo>#<n>      # 建或绑定 Issue（→ issue 列）
 flowcard plan   <card> --body "方案…"                     # 写方案并申请 G1
-flowcard claim  <card> --harness omp --session <id>       # 领卡；骨架自动建 worktree
+flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
+flowcard claim  <card> --harness omp --session <id>       # 领卡（会话说：我开始了）
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
 flowcard beat   <card> --harness omp --session <id>
@@ -241,7 +282,7 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0** ✅ | omp 扩展上报 started/heartbeat/ended | 复现：1+3+1 事件，omp `exit 0`（无推理请求） |
-| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→issue→plan→批准→claim→pr→push→end→accept→(模拟 merged)→cleanup`；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
+| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→issue→plan→批准→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示 `/wt <branch>` 或 `/move <path>`）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
 | **M2 看板** | React + Vite + shadcn；列=9 状态；卡片详情六格必要项**空也显示**；按 Issue 聚合多片 | 浏览器完成 M1 全部动作，SSE 实时 |
 | **M3 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
 | **M4 门禁闭环** | G2 远程写确认（一事一议）、G4 清理报告 | agent 申请 push/开 PR → 卡片出现待办 → 点后方可继续 |
