@@ -59,6 +59,11 @@ function log(line: string): void {
   }
 }
 
+/** 每次调用都拿到**当下**的 cwd（`/move`、`/wt` 之后会变）。 */
+function readCwd(ctx: OmpContext): string {
+  return ctx.sessionManager?.getCwd?.() ?? ctx.cwd ?? process.cwd();
+}
+
 function identity(ctx: OmpContext): { id: string; cwd: string; kind: string; file?: string } | undefined {
   const id = ctx.sessionManager?.getSessionId?.();
   if (!id) return undefined;
@@ -127,16 +132,17 @@ export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
       return;
     }
     // 本次会话的身份快照：心跳/结束都只认它（RPC 里 new_session 之后 ctx 会换人，卡片不该跟着漂）
-    const me = current;
+    let me = current;
 
-    const session = {
+    // 每次上报都现算：cwd 会随 /move、/wt 变，不能缓存启动时的值
+    const sessionBody = () => ({
       harness: "omp",
       id: me.id,
       agentKind: "main",
       cwd: me.cwd,
       ...(me.file ? { file: me.file } : {}),
       resumeHint: `omp -r ${me.file ?? me.id}`,
-    };
+    });
 
     // 不给 card 时服务端按 cwd 反查；解析失败/端点不可达都只记日志，绝不抛（会话照常）。
     const claim = async (): Promise<void> => {
@@ -145,7 +151,7 @@ export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
           cmd: "claim",
           actor: { kind: "agent", harness: "omp", sessionId: me.id },
           ...(bound ? { card: bound } : {}),
-          session,
+          session: sessionBody(),
         },
         "claim",
         // 显式给了 card 就是普通上报（照旧记一行 HTTP 日志）；按 cwd 解析的日志下面自己记
@@ -175,12 +181,22 @@ export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
         void claim();
         return;
       }
+      // **cwd 每次都要重新读**：omp 的 /move、/wt 会把会话挪到别的目录（比如挪进 worktree），
+      // 缓存住启动时的 cwd 会让服务端永远不知道会话已经进去了。
+      const here = readCwd(ctx);
+      if (here !== me.cwd) {
+        me = { ...me, cwd: here };
+        log(`cwd 变了：${current?.cwd ?? "?"} → ${here}，重新 claim 让卡片跟上`);
+        // 挪了目录就重新 claim：claim 会把会话记录刷新，并触发"进实施中"的前进
+        void claim();
+        return;
+      }
       void post(
         {
           cmd: "beat",
           actor: { kind: "agent", harness: "omp", sessionId: me.id },
           card: bound,
-          session: { harness: "omp", id: me.id, cwd: me.cwd, agentKind: "main" },
+          session: { harness: "omp", id: me.id, cwd: here, agentKind: "main" },
         },
         "beat",
       );

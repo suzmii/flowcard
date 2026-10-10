@@ -85,6 +85,13 @@ export const personalFlow = defineFlow({
       do: [{ setState: "working" }],
     },
     {
+      // 心跳也参与前进：会话挪进 worktree 后（/move、/wt），下一次心跳就该让卡片进「实施中」
+      name: "beat-advances-to-working",
+      on: "session.heartbeat",
+      when: (c) => c.state === "ready" || c.state === "blocked",
+      do: [{ setState: "working" }],
+    },
+    {
       name: "end-advances-to-review",
       on: "session.ended",
       when: (c) => c.state === "working",

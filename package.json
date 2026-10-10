@@ -28,5 +28,8 @@
     "@types/node": "^22.18.8",
     "typescript": "~5.9.3",
     "vitest": "^3.2.4"
+  },
+  "bin": {
+    "flowcard": "src/cli/main.ts"
   }
 }

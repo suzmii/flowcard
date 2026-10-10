@@ -264,6 +264,33 @@ describe("声明式 setter 的幂等语义", () => {
   });
 });
 
+describe("会话挪进 worktree 后由心跳推进", () => {
+  it("beat 带上的 cwd 落在 worktree 内 → ready 进 working", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "心跳推进", body: "", issue: issueRef }).primaryCardId;
+    h.run({ cmd: "worktree", actor: h.agent, card: id, worktree: worktreeRef });
+    // 会话先起在主仓库（cwd 不在 worktree 内）→ 只能绑上会话，状态不动
+    h.run({
+      cmd: "claim",
+      actor: h.agent,
+      card: id,
+      session: { harness: "omp", id: "s1", agentKind: "main", cwd: OUTSIDE },
+    });
+    expect(h.card(id).state).not.toBe("working");
+
+    // omp 里 /move 进 worktree → 下一次心跳带上新 cwd → 自动进实施中
+    const beat = h.run({
+      cmd: "beat",
+      actor: h.agent,
+      card: id,
+      session: { harness: "omp", id: "s1", cwd: INSIDE, agentKind: "main" },
+    });
+    expect(beat.events.map((e) => e.type)).toContain("card.state.changed");
+    expect(h.card(id).state).toBe("working");
+    expect(h.card(id).session?.cwd).toBe(INSIDE);
+  });
+});
+
 describe("会话规则", () => {
   it("一个卡片同时只能有一个活跃会话", () => {
     const h = createHarness();

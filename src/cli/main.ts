@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * flowcard CLI：agent 的唯一写入口。
  * 契约：stdout 永远是一行 JSON；退出码 0 成功 / 2 用法 / 3 状态不允许 / 4 缺必要条件 / 5 服务不可达。
