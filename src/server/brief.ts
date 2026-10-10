@@ -36,10 +36,11 @@ function steps(card: Card, cli: string, worktree: { path: string; branch: string
             "**先建 worktree，名字由你起**：目录名与分支名都按这次要干的事取（分支前缀看改动性质——feat / fix / chore / docs / refactor…，跟本仓库惯例走）：",
             "  ```bash",
             "  git worktree add .worktrees/<你起的名字> -b <前缀>/<你起的名字>",
-            `  ${cli} worktree ${card.id} --path .worktrees/<你起的名字> --branch <前缀>/<你起的名字>   # 登记到卡片（不登记我认不出这张卡）`,
+            `  ${cli} worktree use ${card.id} --path .worktrees/<你起的名字>   # 登记 + 把会话搬进去（一步到位）`,
             "  ```",
-            "  然后**把当前会话移进去**（omp：`/wt <分支>` 或 `/move <路径>`），再开始改文件——",
-            "  **在主仓库里改文件不算开工**（卡片进不了「实施中」）；建完登记后心跳会自动把会话认到这张卡上。",
+            "  **斜杠命令你执行不了，别尝试 `/move`、`/wt`**：`worktree use` 会替你做——登记 worktree、停掉当前会话、",
+            "  用新目录续接（还是同一条会话，历史都在），新会话起来后自己 claim，卡片随即进「实施中」。",
+            "  会话搬进新目录之前，**在主仓库里改文件不算开工**。",
           ].join("\n"),
         ),
   );
@@ -131,7 +132,9 @@ ${steps(card, cli, worktree).join("\n")}
 1. **远程写要人批，一事一议**：push / 开 PR / 合并 / 远程评论之前先
    \`${cli} confirm ${card.id} --request --for push --detail "git push -u origin <分支>"\`，
    人批了再执行，执行完 \`${cli} confirm ${card.id} --consume <id>\`；被驳回就停下问人，别换个说法再申请。
-2. **会话必须待在 worktree 里**（cwd 不在 worktree 内就不算开工）；omp 用 \`/wt\` 或 \`/move\` 切，别在主仓库改文件。
+2. **会话必须待在 worktree 里**（cwd 不在 worktree 内就不算开工）：会话没在里面就用
+   \`${cli} worktree use ${card.id} --path <worktree 路径>\` 搬进去 —— **斜杠命令（\`/wt\`、\`/move\`）你执行不了，别试**；
+   这条命令会停掉当前会话、用新目录续接（同一条会话），别在主仓库改文件。
 3. **验收、清理只能人点**：\`flowcard accept\` / 清理门禁 G4 不是你能代做的；PR 合并前不要拆任何复现环境。
 4. 缺东西时命令会回**退出码 4**，那不是报错：照 JSON 里 \`blocked.missing\` 补齐再重试；同一缺项连拦两次就停下来问人。
 
@@ -139,6 +142,7 @@ ${steps(card, cli, worktree).join("\n")}
 
 \`\`\`bash
 ${cli} show ${card.id}                          # 看当前状态（缺什么它会说）
+${cli} worktree use ${card.id} --path <已建好的 worktree 路径>   # 把会话搬进去（卡片进「实施中」）
 ${cli} comment ${card.id} --body "进展/结论"     # 留痕
 ${cli} diff ${card.id}                          # 看自己的改动
 ${cli} end ${card.id} --summary "做完什么"        # 交回（自动进待验收）

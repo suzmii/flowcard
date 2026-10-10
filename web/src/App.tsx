@@ -1,29 +1,67 @@
-import { useCallback, useState } from "react";
-import { AlertTriangle, GitFork, LayoutGrid, Plus, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
+import {
+  AlertTriangle,
+  GitFork,
+  LayoutGrid,
+  MessagesSquare,
+  Plus,
+  RefreshCw,
+  Wifi,
+  WifiOff,
+} from "lucide-react";
 import { Board } from "@/components/Board";
 import { CardDetail } from "@/components/CardDetail";
 import { GraphView } from "@/components/GraphView";
 import { NewCardDialog } from "@/components/NewCardDialog";
 import { ProjectSwitcher } from "@/components/ProjectSwitcher";
+import { SessionView } from "@/components/SessionView";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useBoard, type Connection } from "@/lib/useBoard";
 import { useProjects } from "@/lib/useProjects";
 import { projectIssueBase } from "@/lib/projects";
 import { clockTime } from "@/lib/utils";
+import type { CardView } from "@/lib/schema";
 
-/** 主视图：看板 / 提交图（提交图不重排看板，只切换主区）。 */
-type View = "board" | "graph";
+/** 主视图：看板 / 会话 / 提交图（后两个不重排看板，只切换主区）。 */
+type View = "board" | "sessions" | "graph";
 
 const VIEW_KEY = "flowcard.view";
+/** 会话视图选中的卡（换视图/刷新都记得）。 */
+const SESSION_CARD_KEY = "flowcard.sessionCardId";
 
 function readView(): View {
   try {
-    return window.localStorage.getItem(VIEW_KEY) === "graph" ? "graph" : "board";
+    const saved = window.localStorage.getItem(VIEW_KEY);
+    return saved === "graph" || saved === "sessions" ? saved : "board";
   } catch {
     // 隐私模式等拿不到 localStorage：只是不持久化
     return "board";
   }
+}
+
+function readSessionCardId(): string | null {
+  try {
+    return window.localStorage.getItem(SESSION_CARD_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionCardId(id: string | null) {
+  try {
+    if (id === null) window.localStorage.removeItem(SESSION_CARD_KEY);
+    else window.localStorage.setItem(SESSION_CARD_KEY, id);
+  } catch {
+    /* 同上 */
+  }
+}
+
+/** 会话列表顺序：最近心跳在前（同刻按卡的活跃时间兜底）。 */
+function byRecentSession(a: CardView, b: CardView): number {
+  const left = a.session?.lastSeenAt ?? "";
+  const right = b.session?.lastSeenAt ?? "";
+  return right.localeCompare(left) || b.updatedAt.localeCompare(a.updatedAt);
 }
 
 function writeView(view: View) {
@@ -52,6 +90,7 @@ export function App() {
   const projects = useProjects();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>(() => readView());
+  const [sessionCardId, setSessionCardId] = useState<string | null>(() => readSessionCardId());
   const [refreshing, setRefreshing] = useState(false);
   const [newCardOpen, setNewCardOpen] = useState(false);
 
@@ -60,6 +99,22 @@ export function App() {
     writeView(next);
   }, []);
 
+  /** 会话视图的选中：写进 localStorage，切视图/刷新都还在。 */
+  const pickSessionCard = useCallback((id: string | null) => {
+    setSessionCardId(id);
+    writeSessionCardId(id);
+  }, []);
+
+  /** 详情里那行入口：关掉详情、切到会话视图、并把这张卡选中。 */
+  const openSessionView = useCallback(
+    (id: string) => {
+      pickSessionCard(id);
+      switchView("sessions");
+      setSelectedId(null);
+    },
+    [pickSessionCard, switchView],
+  );
+
   const cards = board.cards ?? [];
   // 看板按当前项目过滤（服务端把没归属的卡投影成 projectId="local"）；没有可选项目时不过滤。
   const currentProject = projects.selected;
@@ -67,6 +122,17 @@ export function App() {
     ? cards.filter((card) => card.projectId === currentProject.id)
     : cards;
   const selected = cards.find((card) => card.id === selectedId) ?? null;
+
+  /** 会话视图的列表：所有绑过会话的卡（不分项目，行上标项目），最近心跳在前。 */
+  const sessionCards = useMemo(
+    () => cards.filter((card) => card.session !== null).sort(byRecentSession),
+    [cards],
+  );
+  const projectNames = useMemo(() => {
+    const names: Record<string, string> = {};
+    for (const project of projects.projects) names[project.id] = project.name;
+    return names;
+  }, [projects.projects]);
 
   /** 「刷新」= 卡片 + 项目元数据一起重拉（别处的 CLI 加了项目，这里不刷新就看不到）。 */
   const manualRefresh = useCallback(async () => {
@@ -117,6 +183,17 @@ export function App() {
             >
               <LayoutGrid />
               看板
+            </Button>
+            <Button
+              size="xs"
+              variant={view === "sessions" ? "secondary" : "ghost"}
+              data-testid="view-sessions"
+              role="tab"
+              aria-selected={view === "sessions"}
+              onClick={() => switchView("sessions")}
+            >
+              <MessagesSquare />
+              会话
             </Button>
             <Button
               size="xs"
@@ -203,7 +280,14 @@ export function App() {
       ) : null}
 
       <main className="min-h-0 flex-1">
-        {view === "graph" ? (
+        {view === "sessions" ? (
+          <SessionView
+            cards={sessionCards}
+            projectNames={projectNames}
+            selectedId={sessionCardId}
+            onSelect={pickSessionCard}
+          />
+        ) : view === "graph" ? (
           <GraphView
             project={currentProject}
             version={board.lastChangedAt ?? ""}
@@ -225,6 +309,7 @@ export function App() {
           cards={cards}
           issueBase={projectIssueBase(currentProject)}
           onClose={() => setSelectedId(null)}
+          onOpenSession={() => openSessionView(selected.id)}
           onRefresh={board.refresh}
         />
       ) : null}

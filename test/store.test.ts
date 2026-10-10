@@ -42,6 +42,25 @@ describe("存储", () => {
     store.close();
   });
 
+  it("同一分钟内的重复 open 算重试（回同一张卡）；下一分钟再提交同样内容要能建出新卡", () => {
+    const store = freshStore();
+    const cmd: Command = { cmd: "open", actor: HUMAN, title: "Issue 742", body: "Issue 742" };
+
+    const first = store.execute(cmd, "2026-10-10T08:00:10.000Z");
+    expect(first.inserted).toHaveLength(1);
+
+    const retry = store.execute(cmd, "2026-10-10T08:00:40.000Z");
+    expect(retry.inserted).toHaveLength(0);
+    expect(retry.card?.id).toBe(first.card?.id);
+
+    // 用户实际撞过的坑：想再开一张内容相同的卡，以前永远被当重复吞掉（看着像"创建不了"）
+    const later = store.execute(cmd, "2026-10-10T08:01:10.000Z");
+    expect(later.inserted).toHaveLength(1);
+    expect(later.card?.id).not.toBe(first.card?.id);
+    expect(store.listCards()).toHaveLength(2);
+    store.close();
+  });
+
   it("投影等于从零重放，且 rebuild 不改结果", () => {
     const store = freshStore();
     const id = store.execute(

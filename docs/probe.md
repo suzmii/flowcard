@@ -120,7 +120,7 @@ stdout 一行 JSON，字段：`ok / card / cwd / worktree / isWorktree / detache
 「没有 worktree 或没会话 cwd」时会给出人话 `hint`，例如：
 
 ```
-会话 cwd 是主仓库 /path/to/repo，不是 worktree：请 /wt <branch> 或 /move <worktree 路径>
+会话 cwd 是主仓库 /path/to/repo，不是 worktree：用 `flowcard worktree use <card> --path <worktree 路径>` 把会话搬进去（斜杠命令 /wt、/move 你执行不了）
 会话所在的 worktree /path/to/repo/.worktrees/demo 处于 detached HEAD：未回写 worktree（不覆盖卡片上已有的分支）；请先在里面 git switch -c <前缀>/<名字> 再绑卡
 ```
 

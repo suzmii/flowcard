@@ -105,6 +105,69 @@ export type SessionMessage = z.infer<typeof messageSchema>;
 export type SessionRole = SessionMessage["role"];
 export type SessionState = z.infer<typeof hostedSessionSchema>;
 
+// ------------------------------------------------------------------ 会话列表（左栏）
+/**
+ * 列表那一行状态点的口径：**卡片上的会话事实打底，托管会话快照盖在上面**。
+ * 事实（`card.session.state`）只认 idle/running/ended/lost，`failed`/`starting` 只有快照知道，所以两者都看。
+ */
+export const SESSION_ROW_STATUSES = ["running", "idle", "lost", "ended", "failed"] as const;
+export type SessionRowStatus = (typeof SESSION_ROW_STATUSES)[number];
+
+export const SESSION_ROW_LABELS: Record<SessionRowStatus, string> = {
+  running: "运行中",
+  idle: "空闲",
+  lost: "失联",
+  ended: "已结束",
+  failed: "启动失败",
+};
+
+export const SESSION_ROW_TONE: Record<SessionRowStatus, "success" | "info" | "warning" | "danger" | "muted"> = {
+  running: "success",
+  idle: "info",
+  lost: "danger",
+  ended: "muted",
+  failed: "danger",
+};
+
+/** 状态点的底色（与 `CardTile` 的会话点同一套颜色）。 */
+export const SESSION_ROW_DOT: Record<SessionRowStatus, string> = {
+  running: "bg-emerald-600",
+  idle: "bg-neutral-400",
+  lost: "bg-red-600",
+  ended: "bg-slate-400",
+  failed: "bg-red-600",
+};
+
+/** 画一行需要的会话事实（`card.session` 的子集）。 */
+export type SessionRowFact = { state: "idle" | "running" | "ended" | "lost"; lastSeenAt: string };
+
+export type SessionRowSignals = { status: SessionRowStatus; busy: boolean; at: string };
+
+/**
+ * 一行会话的信号：事实与快照都没有（卡片还没绑会话）→ null，这种卡不进列表。
+ * 快照是 `stopped` 时不算数（那是「托管进程没起」，卡片事实更权威）。
+ */
+export function sessionRowSignals(
+  fact: SessionRowFact | null,
+  live?: SessionState | null,
+): SessionRowSignals | null {
+  if (!fact && !live) return null;
+  const fromLive = live && live.status !== "stopped" ? live.status : null;
+  const status: SessionRowStatus =
+    fromLive === "failed"
+      ? "failed"
+      : fromLive === "starting" || fromLive === "running"
+        ? "running"
+        : fromLive === "ended"
+          ? "ended"
+          : (fact?.state ?? "ended");
+  return {
+    status,
+    busy: live ? live.status === "starting" || live.busy : false,
+    at: live?.lastActivityAt ?? fact?.lastSeenAt ?? "",
+  };
+}
+
 // ------------------------------------------------------------------ 网络
 export type SessionFailure = { ok: false; code: string; message: string; missing: boolean };
 export type SessionResult = { ok: true; data: SessionState } | SessionFailure;

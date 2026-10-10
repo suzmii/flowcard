@@ -154,7 +154,7 @@ export async function runDetect(argv: string[]): Promise<never> {
     );
   } else if (!result.worktree) {
     hints.push(
-      `会话 cwd 是主仓库 ${result.verdict?.mainRoot ?? "?"}，不是 worktree：请 /wt <branch> 或 /move <worktree 路径>`,
+      `会话 cwd 是主仓库 ${result.verdict?.mainRoot ?? "?"}，不是 worktree：用 \`flowcard worktree use <card> --path <worktree 路径>\` 把会话搬进去（斜杠命令 /wt、/move 你执行不了）`,
     );
   }
   if (result.ok && !result.prProbed) {

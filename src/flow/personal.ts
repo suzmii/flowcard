@@ -21,7 +21,7 @@ export const personalFlow = defineFlow({
     },
     {
       id: "sessionInWorktree",
-      describe: "会话必须已经进入 worktree 里工作（omp 用 /wt <branch> 或 /move <path>）",
+      describe: "会话必须已经在 worktree 里工作（用 flowcard worktree use 把会话搬进去）",
       check: sessionInsideWorktree,
     },
     { id: "pr", describe: "必须开 WIP PR（交付要件，不挡开工）", check: (c) => c.pr !== null },

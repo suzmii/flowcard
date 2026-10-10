@@ -1,9 +1,10 @@
 /**
  * 「开工」编排：写开工提示 → 起一个**托管会话**（`omp --mode rpc --no-ui` 子进程）并把提示注入进去。
  *
- * 两件事**不由 flowcard 做**（用户定的）：
+ * 两件事的分工（用户定的，2026-10 起）：
  *   · worktree 由 **AI 自己建**（名字得它按任务起）——写进开工提示的第一步，做没做在清单里看得见；
- *   · 会话进 worktree 也由 AI 自己切（omp 的 `/wt` / `/move`）。
+ *   · 会话**进** worktree 由 **flowcard 自己做**：`flowcard worktree use <card> --path <worktree>` 会
+ *     登记 worktree、停掉当前会话、用新 cwd `-r` 续接（斜杠命令 `/wt`、`/move` 模型调不了，这条死路已废）。
  * flowcard 负责的是把会话起起来、把「现状 + 待办」喂给它、并在失败时**不静默**地留痕。
  *
  * 提示的注入方式：开工提示作为 `--append-system-prompt` 进 omp 的启动参数（走 argv，不过 shell），

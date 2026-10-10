@@ -335,3 +335,10 @@ RAW-FRAME-HISTOGRAM [["event:message_update",130],["response",10],["event:messag
    `rpc-ui` 模式才是「工具 UI 也走协议」。flowcard 用 `--no-ui`。
 8. **`stop()` 的语义**：先关 stdin（omp 走 EOF 收尾路径 → `disposeAndExit()`），默认 2 s 没退才
    SIGTERM、再 2 s 才 SIGKILL；实测 0.03 s 内自己 `exit 0`，`forced:false`。
+9. **`session_settled` 不是终局，子进程没了也不等于会话作废**（真机实测，见 §8 与
+   `docs/design.md` §14.3.9/10）：一轮 `prompt_result{sessionSettled:true}` + `session_settled`
+   之后子进程**还活着**，同一条会话接着发 prompt 照答；omp 只认 stdin EOF（或扩展 `pi.shutdown()`）。
+   反过来说，**往已经死掉的子进程 stdin 写**拿到的是**异步** EPIPE —— `write()` 里的 try/catch 抓不到，
+   没人听就是未捕获异常（能把宿主进程带走）。本模块挂了 stdin 的 `error` 监听，把它降级成
+   `error{scope:"io"}` 事件；`hosted-session.ts` 的 `refreshStats` 也先看 `exited` 再问。
+   续接同一条会话用 `-r <会话文件>`（`--cwd` 在 `-r` 时被忽略，cwd 取文件头里的那个）。

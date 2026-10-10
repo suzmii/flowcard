@@ -6,6 +6,8 @@ import {
   mergeSessionSnapshot,
   mergeToolOutput,
   parseSessionEvent,
+  sessionRowSignals,
+  type SessionState,
   type SessionView,
 } from "./session.ts";
 
@@ -110,5 +112,48 @@ describe("mergeSessionSnapshot", () => {
       ["m0", "在吗"],
       ["m2", "还没落盘"],
     ]);
+  });
+});
+
+describe("sessionRowSignals", () => {
+  const fact = (over: Partial<{ state: "idle" | "running" | "ended" | "lost"; lastSeenAt: string }> = {}) => ({
+    state: "running" as const,
+    lastSeenAt: "2026-10-10T11:00:00.000Z",
+    ...over,
+  });
+  const live = (over: Partial<SessionState> = {}): SessionState => ({
+    status: "running",
+    cwd: "/repo",
+    busy: false,
+    messages: [],
+    ...over,
+  });
+
+  it("事实与快照都没有 → null（这种卡不进会话列表）", () => {
+    expect(sessionRowSignals(null)).toBeNull();
+    expect(sessionRowSignals(null, null)).toBeNull();
+  });
+
+  it("只有卡片事实时用事实的态与心跳时间", () => {
+    expect(sessionRowSignals(fact())).toEqual({ status: "running", busy: false, at: "2026-10-10T11:00:00.000Z" });
+    expect(sessionRowSignals(fact({ state: "lost" }))?.status).toBe("lost");
+  });
+
+  it("快照盖在事实上面：failed / running / ended 都听快照的", () => {
+    expect(sessionRowSignals(fact({ state: "running" }), live({ status: "failed" }))?.status).toBe("failed");
+    expect(sessionRowSignals(fact({ state: "ended" }), live({ status: "running" }))?.status).toBe("running");
+    expect(sessionRowSignals(fact({ state: "running" }), live({ status: "ended" }))?.status).toBe("ended");
+  });
+
+  it("快照是 stopped 时不算数（那只是托管进程没起，卡片事实更权威），时间退回心跳", () => {
+    const signals = sessionRowSignals(fact({ state: "idle" }), live({ status: "stopped", lastActivityAt: undefined }));
+    expect(signals).toEqual({ status: "idle", busy: false, at: "2026-10-10T11:00:00.000Z" });
+  });
+
+  it("starting 与 busy 都算忙，活动时间取快照的 lastActivityAt", () => {
+    expect(
+      sessionRowSignals(fact(), live({ status: "starting", lastActivityAt: "2026-10-10T11:05:00.000Z" })),
+    ).toEqual({ status: "running", busy: true, at: "2026-10-10T11:05:00.000Z" });
+    expect(sessionRowSignals(fact(), live({ busy: true }))?.busy).toBe(true);
   });
 });

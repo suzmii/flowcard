@@ -10,9 +10,11 @@
  *
  * 全程离线：远程一律是本地假 HTTP，端口用完即关，不碰真服务。
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
@@ -32,20 +34,24 @@ afterAll(async () => {
 
 /** 起一个本地假 HTTP：`route(req)` 返回 `{status, body, type}`，没匹配上就是 404 JSON。 */
 async function fakeServer(
-  route: (req: { method: string; url: string }) => { status: number; body: string; type?: string } | null,
+  route: (req: { method: string; url: string; body: string }) => { status: number; body: string; type?: string } | null,
 ): Promise<Fake> {
   const requests: string[] = [];
   const server = createServer((req, res) => {
     const url = req.url ?? "";
     requests.push(`${req.method ?? "GET"} ${url}`);
-    const hit = route({ method: req.method ?? "GET", url });
-    if (hit === null) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "没有这个端点" } }));
-      return;
-    }
-    res.writeHead(hit.status, { "content-type": hit.type ?? "application/json" });
-    res.end(hit.body);
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const hit = route({ method: req.method ?? "GET", url, body: Buffer.concat(chunks).toString("utf8") });
+      if (hit === null) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "没有这个端点" } }));
+        return;
+      }
+      res.writeHead(hit.status, { "content-type": hit.type ?? "application/json" });
+      res.end(hit.body);
+    });
   });
   servers.push(server);
   // `Promise.withResolvers()` 是 ES2024，本仓 tsconfig 的 lib 停在 ES2023：这里用 executor 形态。
@@ -238,5 +244,113 @@ describe("CLI 退出码契约", () => {
     expect(listed.stderr).toBe("");
     expect(jsonObject(listed.stdout)).toMatchObject({ ok: false, error: { code: "BAD_RESPONSE" } });
     await fake.close();
+  });
+});
+
+/**
+ * `worktree use` 是**多步**命令（绑 worktree → 换 cwd → 等卡片进实施中），
+ * 这里用假服务端把三步的请求体都看住：顺序、路径、以及最终那行 JSON。
+ */
+describe("CLI：worktree use（绑 worktree + 把会话搬进去）", () => {
+  it("先绑 worktree 再打 session/cwd，等到 working 才回 ok（退出码 0）", async () => {
+    const bodies: { url: string; body: string }[] = [];
+    let moved = false;
+    const fake = await fakeServer((req) => {
+      if (req.url === "/api/cards/c1") {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            card: { id: "c1", state: moved ? "working" : "ready", projectId: "p", repoPath: "/repo", worktree: null, session: null },
+          }),
+        };
+      }
+      if (req.url === "/api/commands") {
+        bodies.push({ url: req.url, body: req.body });
+        return {
+          status: 200,
+          body: JSON.stringify({
+            ok: true,
+            card: {
+              id: "c1",
+              state: "ready",
+              worktree: { path: "/repo/.worktrees/x", branch: "feat/x", source: "flowcard" },
+            },
+          }),
+        };
+      }
+      if (req.url === "/api/cards/c1/session/cwd") {
+        bodies.push({ url: req.url, body: req.body });
+        moved = true;
+        return {
+          status: 200,
+          body: JSON.stringify({
+            ok: true,
+            status: "starting",
+            cwd: "/repo/.worktrees/x",
+            previousCwd: "/repo",
+            resumed: true,
+            sessionFile: "/repo/.omp/session.jsonl",
+          }),
+        };
+      }
+      return null;
+    });
+
+    const { status, stdout, stderr } = await runCli(
+      ["worktree", "use", "c1", "--path", "/repo/.worktrees/x", "--branch", "feat/x"],
+      fake.url,
+    );
+    expect(stderr).toBe("");
+    expect(status).toBe(0);
+    expect(jsonObject(stdout)).toMatchObject({
+      ok: true,
+      worktree: { path: "/repo/.worktrees/x", branch: "feat/x" },
+      session: { ok: true, resumed: true, cwd: "/repo/.worktrees/x", previousCwd: "/repo" },
+      state: "working",
+      advanced: true,
+    });
+
+    // 顺序与请求体：① 绑 worktree 走既有命令（相对路径交给服务端按项目根解析）② 换 cwd 用**服务端解析后的绝对路径**
+    expect(bodies.map((b) => b.url)).toEqual(["/api/commands", "/api/cards/c1/session/cwd"]);
+    expect(jsonObject(bodies[0]?.body ?? "{}")).toMatchObject({
+      cmd: "worktree",
+      card: "c1",
+      worktree: { path: "/repo/.worktrees/x", branch: "feat/x" },
+    });
+    expect(jsonObject(bodies[1]?.body ?? "{}")).toEqual({ path: "/repo/.worktrees/x" });
+    await fake.close();
+  });
+
+  it("不给 --branch 时按目录里的 git 分支推；推不出来就用法错退出（不瞎绑）", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "fc-wtu-cli-"));
+    execFileSync("git", ["init", "-q", "-b", "feat/from-git", repo]);
+    const bodies: string[] = [];
+    const fake = await fakeServer((req) => {
+      if (req.url === "/api/cards/c1") {
+        return { status: 200, body: JSON.stringify({ card: { id: "c1", state: "working", repoPath: repo, worktree: null } }) };
+      }
+      if (req.url === "/api/commands") {
+        bodies.push(req.body);
+        return { status: 200, body: JSON.stringify({ ok: true, card: { id: "c1", worktree: { path: repo, branch: "feat/from-git" } } }) };
+      }
+      if (req.url === "/api/cards/c1/session/cwd") {
+        return { status: 200, body: JSON.stringify({ ok: true, status: "starting", cwd: repo, resumed: true }) };
+      }
+      return null;
+    });
+
+    const derived = await runCli(["worktree", "use", "c1", "--path", repo], fake.url);
+    expect(derived.status).toBe(0);
+    expect(jsonObject(bodies[0] ?? "{}")).toMatchObject({ worktree: { branch: "feat/from-git" } });
+
+    // 不是 git 工作树 + 没给 --branch → 退出码 2（用法错），一个命令都不发
+    const bare = mkdtempSync(join(tmpdir(), "fc-wtu-bare-"));
+    const noBranch = await runCli(["worktree", "use", "c1", "--path", bare], fake.url);
+    expect(noBranch.status).toBe(2);
+    expect(jsonObject(noBranch.stdout)).toMatchObject({ ok: false, rejection: { code: "USAGE_ERROR" } });
+    expect(bodies).toHaveLength(1);
+    await fake.close();
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
   });
 });

@@ -612,7 +612,12 @@ export type SpawnedProcess = {
   readonly pid?: number;
   stdout: { on(event: "data", listener: (chunk: unknown) => void): unknown } | null;
   stderr: { on(event: "data", listener: (chunk: unknown) => void): unknown } | null;
-  stdin: { write(data: string): unknown; end(): unknown } | null;
+  stdin: {
+    write(data: string): unknown;
+    end(): unknown;
+    /** 管道断了（子进程没了 / EPIPE）是**异步** `error` 事件：不挂监听器会变成未捕获异常。 */
+    on?(event: "error", listener: (error: Error) => void): unknown;
+  } | null;
   kill(signal?: NodeJS.Signals): unknown;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
   on(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
@@ -846,6 +851,12 @@ export function startRpcSession(opts: StartRpcOptions): OmpRpcSession {
   child?.stderr?.on("data", (chunk: unknown) => {
     const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array);
     stderr = (stderr + text).slice(-stderrCap);
+  });
+  // 子进程没了之后往它的 stdin 写会拿到 **异步** 的 EPIPE：`write()` 里的 try/catch 抓不到
+  // （它只会变成 stream 的 `error` 事件，没人听就是未捕获异常，能把整个进程带走）。
+  // 这里按模块契约把它降级成 `error{scope:"io"}` 事件 —— 写失败本身由 `write()` 返回 false 表达。
+  child?.stdin?.on?.("error", (error: Error) => {
+    emit({ kind: "error", scope: "io", message: error.message, code: null, id: null, command: null });
   });
   child?.on("error", (error: Error) => {
     spawnFailure = error.message;

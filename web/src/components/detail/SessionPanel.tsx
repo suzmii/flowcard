@@ -34,13 +34,14 @@ export function SessionPanel({ card }: { card: CardView }) {
   const worktree = card.worktree;
 
   if (!session) {
-    // 卡片天生就有"它自己的会话"——只是那次会话还没启动。启动入口已挪到下面的「对话」区
-    // （托管会话，在网页里直接聊），这里只留事实：还缺什么、去哪儿启动。
+    // 卡片天生就有"它自己的会话"——只是那次会话还没启动。启动入口在「会话」视图里
+    // （托管会话，全高对话），这里只留事实：还缺什么、去哪儿启动。
     return (
       <div className="space-y-2 rounded-lg border border-dashed bg-muted/40 p-2.5 text-xs">
         <p className="text-muted-foreground">
           这张卡的会话<strong className="font-medium text-foreground">还没启动</strong>
-          。会话就是干这活儿的那个 agent 进程——在下面的「对话」里点<strong className="font-medium text-foreground">「启动会话」</strong>
+          。会话就是干这活儿的那个 agent 进程——在上面那行<strong className="font-medium text-foreground">「在会话视图里打开」</strong>
+          进「会话」视图后点<strong className="font-medium text-foreground">「启动会话」</strong>
           ，它会跑在卡片的 worktree 里并自动认到这张卡（按 cwd 解析，不用手填卡片 id）。
         </p>
         {worktree ? null : (

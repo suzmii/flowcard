@@ -7,12 +7,13 @@
  *
  * 不联网、不调模型、不碰用户的 omp 配置。
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { TextDecoder } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import { personalFlow } from "../src/flow/personal.ts";
+import { normalizePath } from "../src/shared/paths.ts";
 import { createApp } from "../src/server/app.ts";
 import {
   createHostedSessions,
@@ -38,6 +39,10 @@ const HUMAN = { kind: "human" as const, name: "tester" };
 const FAKE_OMP_SOURCE = String.raw`
 const NL = "\n";
 const MODE = process.env.FAKE_OMP_MODE || "normal";
+// 真 omp：-r <file> 续接时 get_session_stats 报的是**被续接的那个文件**（cwd 也取自它）。
+// 假 omp 照抄这一点，好在测试里验证 argv 真的透传到了子进程。
+const resumeIdx = process.argv.indexOf("-r");
+const SESSION_FILE = (resumeIdx >= 0 ? process.argv[resumeIdx + 1] : null) || process.env.FAKE_OMP_SESSION_FILE || "/tmp/fake-omp/session.jsonl";
 const out = (obj, done) => { process.stdout.write(JSON.stringify(obj) + NL, done); };
 
 if (MODE !== "die-before-ready") {
@@ -49,8 +54,12 @@ if (MODE === "die-before-ready") { process.exit(3); }
 process.stdout.write("这不是 JSON" + NL);
 
 const sessionId = "fake-session-1";
+// 挂着的那一轮：{ promptId, msgId }（abort 时照着它收尾）。
 let pending = null;
 let buf = "";
+// 真 omp 的 messageId / toolCallId 在**整个会话里递增**（不是每轮从 msg-1 重来）——
+// 假 omp 照抄这一点，两轮的帧/转录才分得清是哪一轮发的。
+let turn = 0;
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -73,7 +82,7 @@ function handleLine(line) {
       out({ id: cmd.id, type: "response", command: "get_state", success: true, data: { sessionId, isStreaming: false, isSettled: true, messageCount: 0 } });
       return;
     case "get_session_stats":
-      out({ id: cmd.id, type: "response", command: "get_session_stats", success: true, data: { sessionId, sessionFile: "/tmp/fake-omp/session.jsonl", tokens: { input: 10, output: 5, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 15 }, cost: 0.5 } });
+      out({ id: cmd.id, type: "response", command: "get_session_stats", success: true, data: { sessionId, sessionFile: SESSION_FILE, tokens: { input: 10, output: 5, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 15 }, cost: 0.5 } });
       return;
     case "set_event_filter":
       out({ id: cmd.id, type: "response", command: "set_event_filter", success: true, data: { events: null, messageUpdates: cmd.messageUpdates || "full" } });
@@ -82,35 +91,40 @@ function handleLine(line) {
       out({ id: cmd.id, type: "response", command: "abort", success: true });
       if (pending === null) return;
       // abort 之后在途帧还会有几条（真机就这样），然后以 aborted 收尾。
-      out({ type: "message_update", messageId: "msg-2", message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "2" } });
-      out({ type: "message_update", messageId: "msg-2", message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "12" } });
-      out({ type: "message_end", messageId: "msg-2", message: { role: "assistant", content: [{ type: "text", text: "12" }], stopReason: "aborted" } });
-      out({ type: "prompt_result", id: pending, agentInvoked: true, status: "aborted", sessionSettled: true });
+      out({ type: "message_update", messageId: pending.msgId, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "2" } });
+      out({ type: "message_update", messageId: pending.msgId, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "12" } });
+      out({ type: "message_end", messageId: pending.msgId, message: { role: "assistant", content: [{ type: "text", text: "12" }], stopReason: "aborted" } });
+      out({ type: "prompt_result", id: pending.promptId, agentInvoked: true, status: "aborted", sessionSettled: true });
       out({ type: "session_settled" });
       pending = null;
       return;
     }
     case "prompt": {
       out({ id: cmd.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
-      pending = cmd.id;
-      out({ type: "message_start", messageId: "msg-1", message: { role: "user", content: [{ type: "text", text: cmd.message }] } });
-      out({ type: "message_end", messageId: "msg-1", message: { role: "user", content: [{ type: "text", text: cmd.message }], stopReason: "stop" } });
+      turn += 1;
+      const user = "msg-" + (turn * 3 - 2);
+      const asked = "msg-" + (turn * 3 - 1);
+      const final = "msg-" + (turn * 3);
+      const callId = "t" + turn;
+      pending = { promptId: cmd.id, msgId: asked };
+      out({ type: "message_start", messageId: user, message: { role: "user", content: [{ type: "text", text: cmd.message }] } });
+      out({ type: "message_end", messageId: user, message: { role: "user", content: [{ type: "text", text: cmd.message }], stopReason: "stop" } });
       out({ type: "agent_start" });
       out({ type: "turn_start" });
-      out({ type: "message_start", messageId: "msg-2", message: { role: "assistant", content: [] } });
-      out({ type: "message_update", messageId: "msg-2", message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "先" } });
-      out({ type: "message_update", messageId: "msg-2", message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "跑一下" } });
+      out({ type: "message_start", messageId: asked, message: { role: "assistant", content: [] } });
+      out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "先" } });
+      out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "跑一下" } });
       if (MODE === "hang") return;
-      out({ type: "message_update", messageId: "msg-2", message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "先跑一下" } });
-      out({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "ls -la" } });
-      out({ type: "tool_execution_update", toolCallId: "t1", toolName: "bash", partialResult: { content: [{ type: "text", text: "total 0\n" }] } });
-      out({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: { content: [{ type: "text", text: "total 0\ndrwxr-xr-x 2 u u 4096 ." }] }, isError: false });
-      out({ type: "message_end", messageId: "msg-2", message: { role: "assistant", content: [{ type: "text", text: "先跑一下" }, { type: "toolCall", id: "t1", name: "bash" }], stopReason: "toolUse" } });
-      out({ type: "message_start", messageId: "msg-3", message: { role: "assistant", content: [] } });
-      out({ type: "message_update", messageId: "msg-3", message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ok" } });
+      out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "先跑一下" } });
+      out({ type: "tool_execution_start", toolCallId: callId, toolName: "bash", args: { command: "ls -la" } });
+      out({ type: "tool_execution_update", toolCallId: callId, toolName: "bash", partialResult: { content: [{ type: "text", text: "total 0\n" }] } });
+      out({ type: "tool_execution_end", toolCallId: callId, toolName: "bash", result: { content: [{ type: "text", text: "total 0\ndrwxr-xr-x 2 u u 4096 ." }] }, isError: false });
+      out({ type: "message_end", messageId: asked, message: { role: "assistant", content: [{ type: "text", text: "先跑一下" }, { type: "toolCall", id: callId, name: "bash" }], stopReason: "toolUse" } });
+      out({ type: "message_start", messageId: final, message: { role: "assistant", content: [] } });
+      out({ type: "message_update", messageId: final, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ok" } });
       process.stdout.write("流中间的乱码" + NL);
-      out({ type: "message_update", messageId: "msg-3", message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ok" } });
-      out({ type: "message_end", messageId: "msg-3", message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" } });
+      out({ type: "message_update", messageId: final, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ok" } });
+      out({ type: "message_end", messageId: final, message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" } });
       out({ type: "turn_end", message: { role: "assistant" }, toolResults: [] });
       out({ type: "agent_end", messages: [] });
       out({ type: "prompt_result", id: cmd.id, agentInvoked: true, status: "completed", sessionSettled: true });
@@ -118,6 +132,7 @@ function handleLine(line) {
       out({ type: "session_settled" }, () => {
         if (MODE === "exit-after-turn") process.exit(0);
       });
+      pending = null;
       return;
     }
     default:
@@ -136,14 +151,20 @@ afterAll(async () => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
-/** 真进程 + 真管道，argv 换成 `node -e <假 omp>`；registry 的其余依赖照生产走。 */
-function spawnFake(mode: string) {
+/** 真进程 + 真管道，argv 换成 `node -e <假 omp> <omp 的真实参数…>`；registry 的其余依赖照生产走。 */
+function spawnFake(mode: string, sessionFile?: string) {
   return (opts: StartRpcOptions): OmpRpcSession => {
     const session = startRpcSession({
       ...opts,
       ompPath: process.execPath,
-      argv: ["-e", FAKE_OMP_SOURCE],
-      env: { ...opts.env, FAKE_OMP_MODE: mode },
+      // omp 的真实参数（`-r`/`--append-system-prompt`…）跟着脚本一起透传，假 omp 才看得见它们。
+      // `--` 不能省：不然 node 会把 `--no-title` 之类当自己的选项，直接报错退出（起不来）。
+      argv: ["-e", FAKE_OMP_SOURCE, "--", ...(opts.args ?? [])],
+      env: {
+        ...opts.env,
+        FAKE_OMP_MODE: mode,
+        ...(sessionFile === undefined ? {} : { FAKE_OMP_SESSION_FILE: sessionFile }),
+      },
       spawn: defaultSpawn,
     });
     live.push(session);
@@ -170,10 +191,13 @@ function openCard(store: Store, worktreePath: string): string {
   return id;
 }
 
-function makeSessions(store: Store, mode: string): HostedSessions {
+function makeSessions(store: Store, mode: string, calls: StartRpcOptions[] = [], sessionFile?: string): HostedSessions {
   return createHostedSessions({
     store,
-    startSession: spawnFake(mode),
+    startSession: (opts) => {
+      calls.push(opts);
+      return spawnFake(mode, sessionFile)(opts);
+    },
     resolveOmpPath: async () => undefined, // 别真去 `sh -c command -v omp`
   });
 }
@@ -209,6 +233,21 @@ class EventLog {
 
   byType(type: SessionEvent["type"]): SessionEvent[] {
     return this.events.filter((event) => event.type === type);
+  }
+
+  /**
+   * 等**第 `nth` 次**匹配的事件（`waitFor` 只认第一次）—— 多轮对话要靠这个数着等：
+   * 每轮结束都会推一条 `state{busy:false}`，只按形状等就分不清是哪一轮。
+   */
+  waitForNth(match: (event: SessionEvent) => boolean, nth: number, timeoutMs = 4_000): Promise<SessionEvent> {
+    const seen = this.events.filter(match);
+    if (seen.length >= nth) return Promise.resolve(seen[nth - 1] as SessionEvent);
+    let remaining = nth - seen.length;
+    return this.waitFor((event) => {
+      if (!match(event)) return false;
+      remaining -= 1;
+      return remaining <= 0;
+    }, timeoutMs);
   }
 }
 
@@ -363,7 +402,8 @@ describe("托管会话（假 omp 真管道）", () => {
 
     await sessions.start(id, { kickoff: "只回答：ok" });
     await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
-    await log.waitFor((e) => e.type === "notice" && e.message === "omp 会话已退出");
+    // 进程没了就说清楚「还能接着聊」：有会话文件 → 下一条消息会自动 `-r` 续接（见 session-resume.test.ts）
+    await log.waitFor((e) => e.type === "notice" && e.message.includes("下一条消息会自动用"));
     expect(sessions.snapshot(id).status).toBe("ended");
     expect(store.getCard(id)?.session?.state).toBe("ended");
     expect(sessions.isLive(id)).toBe(false);
@@ -400,7 +440,7 @@ describe("托管会话（假 omp 真管道）", () => {
     const prompted = await sessions.prompt(id, "在吗");
     expect(prompted).toEqual({
       ok: false,
-      error: { code: "NO_SESSION", message: `卡片 ${id} 没有在跑的会话` },
+      error: { code: "NO_SESSION", message: `卡片 ${id} 没有会话（也没有可续接的会话文件）` },
     });
     expect((await sessions.abort(id)).ok).toBe(false);
 
@@ -420,6 +460,315 @@ describe("托管会话（假 omp 真管道）", () => {
     expect(again.ok).toBe(true);
     expect(again.status).toBe("starting");
     await sessions.stop(id);
+  });
+});
+
+// ---------------------------------------------------------------- 换工作目录（changeCwd）
+
+/** omp 形状的会话文件（头里带 cwd），按 omp 的目录布局放：`<sessions>/<cwd 里 / 换成 ->/<id>.jsonl`。 */
+function writeSessionFixture(root: string, cwd: string, id = "fake-session-1"): string {
+  const file = join(root, normalizePath(cwd).replace(/\//g, "-"), `${id}.jsonl`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(
+    file,
+    [
+      JSON.stringify({ type: "title", v: 1, title: "" }),
+      JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-10-10T00:00:00.000Z", cwd }),
+      JSON.stringify({ type: "message", id: "m1", message: { role: "assistant", content: [{ type: "text", text: "上一轮的结论" }] } }),
+    ].join("\n") + "\n",
+  );
+  return file;
+}
+
+describe("换工作目录（changeCwd：绑 worktree 后的「把会话搬进去」）", () => {
+  it("停旧进程 → 用改过 cwd 头的会话文件 -r 续接 → 重新 claim：卡片进实施中、转录不断", async () => {
+    const { store, dir } = makeStore();
+    const proj = join(dir, "proj");
+    const wt = join(proj, ".worktrees", "x");
+    mkdirSync(wt, { recursive: true });
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), proj);
+    const id = openCard(store, proj);
+    const calls: StartRpcOptions[] = [];
+    const sessions = makeSessions(store, "normal", calls, fixture);
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id, { kickoff: "开工" });
+    const first = await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    expect(first.type === "ready" ? first.cwd : null).toBe(proj);
+    expect(store.getCard(id)?.state).toBe("working");
+    const before = sessions.snapshot(id).messages.length;
+    expect(before).toBeGreaterThan(0);
+
+    const moved = await sessions.changeCwd(id, { cwd: wt });
+    expect(moved.ok).toBe(true);
+    expect(moved.resumed).toBe(true);
+    expect(moved.previousCwd).toBe(proj);
+    expect(moved.cwd).toBe(wt);
+    expect(moved.status).toBe("starting");
+
+    // 续接文件是**新目录对应的会话目录**里的副本，头里的 cwd 已改成新目录；原文件没动
+    const handoff = join(dir, "omp-sessions", normalizePath(wt).replace(/\//g, "-"), "fake-session-1.jsonl");
+    expect(moved.sessionFile).toBe(handoff);
+    const headerLine = readFileSync(handoff, "utf8").split("\n").find((l) => l.includes('"type":"session"'));
+    const header: unknown = JSON.parse(headerLine ?? "{}");
+    expect(typeof header === "object" && header !== null && "cwd" in header ? header.cwd : undefined).toBe(wt);
+    expect(readFileSync(fixture, "utf8")).toContain(`"cwd":"${proj}"`);
+
+    // 第二次起会话：cwd 是新目录，argv 里带 `-r <副本>`（假 omp 从 argv 里认出它并当自己的 sessionFile）
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.cwd).toBe(wt);
+    const args = calls[1]?.args ?? [];
+    expect(args[args.indexOf("-r") + 1]).toBe(handoff);
+
+    // 新会话起来 → 自己 claim（cwd 在新目录）→ 卡片还是「实施中」，会话 cwd 是新目录
+    const second = await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined && e.cwd === wt);
+    expect(second.type === "ready" ? second.ompSessionId : null).toBe("fake-session-1");
+    expect(store.getCard(id)?.session?.cwd).toBe(wt);
+    expect(store.getCard(id)?.state).toBe("working");
+    expect(sessions.snapshot(id).cwd).toBe(wt);
+
+    // 转录连续：老消息还在，续接后接着往同一张卡的转录里追加
+    await sessions.prompt(id, "接着干");
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
+    const messages = sessions.snapshot(id).messages;
+    expect(messages.length).toBeGreaterThan(before);
+    expect(messages.some((m) => m.text === "上一轮的结论" || m.text === "开工")).toBe(true);
+  });
+
+  it("会话文件读不动 / 压根没有 → 退化成新会话，并在 note 里说清（不静默）", async () => {
+    const { store, dir } = makeStore();
+    const proj = join(dir, "proj");
+    const wt = join(proj, ".worktrees", "y");
+    mkdirSync(wt, { recursive: true });
+    const id = openCard(store, proj);
+    const calls: StartRpcOptions[] = [];
+    // 假 omp 报一个**不存在**的会话文件：读不动 → 只能新起一条
+    const sessions = makeSessions(store, "normal", calls, join(dir, "gone.jsonl"));
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+    await sessions.start(id, { kickoff: "开工" });
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+
+    const moved = await sessions.changeCwd(id, { cwd: wt });
+    expect(moved.ok).toBe(true);
+    expect(moved.resumed).toBe(false);
+    expect(moved.sessionFile).toBeUndefined();
+    expect(moved.note).toContain("续接没成");
+    expect(calls[1]?.args ?? []).not.toContain("-r");
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined && e.cwd === wt);
+    expect(store.getCard(id)?.session?.cwd).toBe(wt);
+    expect(store.getCard(id)?.state).toBe("working");
+
+    // 目录不存在：明确报错，不动会话
+    const bad = await sessions.changeCwd(id, { cwd: join(dir, "没有这个目录") });
+    expect(bad.ok).toBe(false);
+    expect(bad.error?.code).toBe("NO_CWD");
+    expect(bad.resumed).toBe(false);
+    expect((await sessions.changeCwd("c404", { cwd: wt })).error?.code).toBe("NOT_FOUND");
+  });
+
+  it("服务重启后（注册表里没有 live 记录）也能按卡片上留的会话文件续接", async () => {
+    const { store, dir } = makeStore();
+    const proj = join(dir, "proj");
+    const wt = join(proj, ".worktrees", "z");
+    mkdirSync(wt, { recursive: true });
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), proj);
+    const id = openCard(store, proj);
+
+    // 第一个实例：起会话（claim 把 session.file 落进卡片投影）→ 停掉
+    const first = makeSessions(store, "normal", [], fixture);
+    const firstLog = new EventLog();
+    first.subscribe(id, firstLog.push);
+    await first.start(id, { kickoff: "开工" });
+    await firstLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await first.stop(id);
+    expect(store.getCard(id)?.session?.file).toBe(fixture);
+
+    // 第二个实例（相当于重启）：注册表是空的，只能靠卡片上的 file
+    const calls: StartRpcOptions[] = [];
+    const second = makeSessions(store, "normal", calls, fixture);
+    const log = new EventLog();
+    second.subscribe(id, log.push);
+    const moved = await second.changeCwd(id, { cwd: wt });
+    expect(moved.resumed).toBe(true);
+    expect(moved.previousCwd).toBe(proj);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined && e.cwd === wt);
+    expect(store.getCard(id)?.session?.cwd).toBe(wt);
+    expect(store.getCard(id)?.state).toBe("working");
+  });
+});
+
+// ---------------------------------------------------------------- 多轮对话（答完一轮 ≠ 会话结束）
+
+describe("多轮对话（同一个子进程接着聊）", () => {
+  it("连着两轮都有回答，会话还在 running：答完一轮不该把会话结束掉", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const calls: StartRpcOptions[] = [];
+    const sessions = makeSessions(store, "normal", calls);
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+
+    // 第一轮
+    const first = await sessions.prompt(id, "第一轮：只回答 ok");
+    expect(first.ok).toBe(true);
+    expect(first.messageId).toContain(":p1");
+    await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-3"));
+    // 每轮跑完的标志：busy 归零（第 1 次是 ready 之后那拍，第 2 次才是第一轮跑完）
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, 2);
+    expect(sessions.snapshot(id).busy).toBe(false);
+
+    // 第二轮：**同一个子进程**（tag 一样）接着发
+    const second = await sessions.prompt(id, "第二轮：还是回答 ok");
+    expect(second.ok).toBe(true);
+    expect(second.messageId).toContain(":p2");
+    expect(second.messageId?.split(":")[0]).toBe(first.messageId?.split(":")[0]);
+    // 第二轮的收尾帧（msg-6 是第二轮的最终回答，第一轮是 msg-3）—— 两轮的帧分得开
+    const answered = await log.waitFor((e) => e.type === "message_end" && e.id.endsWith(":msg-6"));
+    expect(answered.type === "message_end" ? answered.text : "").toBe("ok");
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, 3); // 第 3 次 = 第二轮跑完
+
+    const snapshot = sessions.snapshot(id);
+    expect(snapshot.status).toBe("running"); // 两轮之间会话没被结束
+    expect(snapshot.busy).toBe(false);
+    expect(snapshot.ompSessionId).toBe("fake-session-1");
+    expect(snapshot.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
+    expect(snapshot.messages[0]?.text).toBe("第一轮：只回答 ok");
+    expect(snapshot.messages[4]?.text).toBe("第二轮：还是回答 ok");
+    expect(calls).toHaveLength(1); // 只起过一个子进程：不是"一轮一个进程"
+    expect(sessions.isLive(id)).toBe(true);
+    expect(log.byType("error")).toEqual([]);
+    expect(log.events.some((e) => e.type === "notice" && e.message === "omp 会话已退出")).toBe(false);
+
+    await sessions.stop(id);
+    expect(sessions.snapshot(id).status).toBe("ended");
+  });
+
+  it("服务重启后再「启动会话」：默认拿卡片上留的会话文件 -r 续接（同一段对话、同一会话身份）", async () => {
+    const { store, dir } = makeStore();
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), dir);
+    const id = openCard(store, dir);
+
+    // 重启前：起会话 → 停（stopAll 也是这条路径：关 stdin → omp 自己退）
+    const before = makeSessions(store, "normal", [], fixture);
+    const beforeLog = new EventLog();
+    before.subscribe(id, beforeLog.push);
+    await before.start(id);
+    await beforeLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await before.stop(id);
+    expect(store.getCard(id)?.session?.state).toBe("ended");
+    expect(store.getCard(id)?.session?.file).toBe(fixture);
+
+    // 重启后（注册表是空的）：没被显式要求续接，也该接着原会话 —— 而不是从零开始
+    const calls: StartRpcOptions[] = [];
+    const after = makeSessions(store, "normal", calls, fixture);
+    const log = new EventLog();
+    after.subscribe(id, log.push);
+    await after.start(id);
+    const ready = await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    const args = calls[0]?.args ?? [];
+    expect(args[args.indexOf("-r") + 1]).toBe(fixture);
+    expect(ready.type === "ready" ? ready.ompSessionId : null).toBe("fake-session-1");
+    expect(after.snapshot(id).status).toBe("running");
+    // 同 sessionId 重新 claim：卡片绑的还是同一个会话，cwd 也没变
+    expect(store.getCard(id)?.session?.id).toBe("fake-session-1");
+    expect(store.getCard(id)?.session?.cwd).toBe(dir);
+    expect(store.getCard(id)?.state).toBe("working");
+    expect(log.byType("notice")).toEqual([]); // 顺顺当当续上，没有降级要解释
+    await after.stop(id);
+  });
+
+  it("`fresh: true` 起新对话；会话文件不在了就说一句再起新的（不静默降级）", async () => {
+    // A) 显式 fresh：卡片上有会话文件也不续
+    {
+      const { store, dir } = makeStore();
+      const fixture = writeSessionFixture(join(dir, "omp-sessions"), dir);
+      const id = openCard(store, dir);
+      const first = makeSessions(store, "normal", [], fixture);
+      const firstLog = new EventLog();
+      first.subscribe(id, firstLog.push);
+      await first.start(id);
+      await firstLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+      await first.stop(id);
+
+      const calls: StartRpcOptions[] = [];
+      const second = makeSessions(store, "normal", calls, fixture);
+      const log = new EventLog();
+      second.subscribe(id, log.push);
+      await second.start(id, { fresh: true });
+      await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+      expect(calls[0]?.args ?? []).not.toContain("-r");
+      expect(log.byType("notice")).toEqual([]); // 是你自己要新的，不用解释
+      await second.stop(id);
+    }
+
+    // B) 会话文件已经不在了：退化成新会话，但要把原因说出来
+    {
+      const { store, dir } = makeStore();
+      const gone = join(dir, "gone.jsonl");
+      const id = openCard(store, dir);
+      const first = makeSessions(store, "normal", [], gone);
+      const firstLog = new EventLog();
+      first.subscribe(id, firstLog.push);
+      await first.start(id);
+      await firstLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+      await first.stop(id);
+      expect(store.getCard(id)?.session?.file).toBe(gone);
+
+      const calls: StartRpcOptions[] = [];
+      const second = makeSessions(store, "normal", calls, gone);
+      const log = new EventLog();
+      second.subscribe(id, log.push);
+      await second.start(id);
+      await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+      expect(calls[0]?.args ?? []).not.toContain("-r");
+      const notice = log.byType("notice")[0];
+      expect(notice?.type === "notice" ? notice.message : "").toContain("会话文件不在了");
+      await second.stop(id);
+    }
+  });
+
+  it("会话文件头里的 cwd 跟这次要跑的目录对不上：不硬续（否则会在别的目录里跑）并说清", async () => {
+    const { store, dir } = makeStore();
+    const other = join(dir, "别处");
+    mkdirSync(other, { recursive: true });
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), dir);
+    const id = openCard(store, dir);
+    const first = makeSessions(store, "normal", [], fixture);
+    const firstLog = new EventLog();
+    first.subscribe(id, firstLog.push);
+    await first.start(id);
+    await firstLog.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await first.stop(id);
+
+    // 会话文件还在、id 也对，但头里的 cwd 已经不是这次要跑的目录（比如卡片换了 worktree）。
+    // 头是 writeSessionFixture 用 JSON.stringify 写的，cwd 是最后一个键 —— 直接替换这一段。
+    writeFileSync(fixture, readFileSync(fixture, "utf8").replace(`"cwd":"${dir}"`, `"cwd":"${other}"`));
+
+    const calls: StartRpcOptions[] = [];
+    const second = makeSessions(store, "normal", calls, fixture);
+    const log = new EventLog();
+    second.subscribe(id, log.push);
+    await second.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    expect(calls[0]?.args ?? []).not.toContain("-r");
+    const notice = log.byType("notice")[0];
+    expect(notice?.type === "notice" ? notice.message : "").toContain(other);
+    expect(second.snapshot(id).cwd).toBe(dir);
+    await second.stop(id);
   });
 });
 
@@ -517,6 +866,38 @@ describe("HTTP：会话端点与每卡 SSE", () => {
     const after = (await (await app.request(url(""))).json()) as { status: string };
     expect(after.status).toBe("ended");
     await reader.cancel();
+  });
+
+  it("POST .../session/cwd：把会话搬进 new worktree（续接 + 重新 claim），坏入参/坏卡片都不 5xx", async () => {
+    const { store, dir } = makeStore();
+    const proj = join(dir, "proj");
+    const wt = join(proj, ".worktrees", "x");
+    mkdirSync(wt, { recursive: true });
+    const fixture = writeSessionFixture(join(dir, "omp-sessions"), proj);
+    const id = openCard(store, proj);
+    const sessions = makeSessions(store, "normal", [], fixture);
+    const app = createApp(store, { sessions });
+    const json = { "content-type": "application/json" };
+    const cwdUrl = `/api/cards/${id}/session/cwd`;
+
+    expect((await app.request("/api/cards/c404/session/cwd", { method: "POST", headers: json, body: JSON.stringify({ path: wt }) })).status).toBe(404);
+    expect((await app.request(cwdUrl, { method: "POST", headers: json, body: JSON.stringify({ path: "" }) })).status).toBe(400);
+    expect((await app.request(cwdUrl, { method: "POST", headers: json, body: JSON.stringify({}) })).status).toBe(400);
+
+    // 没起过会话也能直接搬（会在新目录起一条新会话，resumed:false）
+    const fresh = await app.request(cwdUrl, { method: "POST", headers: json, body: JSON.stringify({ path: wt }) });
+    expect(fresh.status).toBe(200);
+    const freshBody = (await fresh.json()) as { ok?: boolean; cwd?: string; resumed?: boolean };
+    expect(freshBody.ok).toBe(true);
+    expect(freshBody.cwd).toBe(wt);
+    expect(freshBody.resumed).toBe(false);
+
+    // 目录不存在 → 409 + NO_CWD（不是 5xx）
+    const missing = await app.request(cwdUrl, { method: "POST", headers: json, body: JSON.stringify({ path: join(dir, "没有这个目录") }) });
+    expect(missing.status).toBe(409);
+    const missingBody = (await missing.json()) as { ok?: boolean; error?: { code?: string } };
+    expect(missingBody.ok).toBe(false);
+    expect(missingBody.error?.code).toBe("NO_CWD");
   });
 });
 

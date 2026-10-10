@@ -120,7 +120,7 @@ type Project = {
 | # | 必要项目 | 完成判据 | 动作性质 |
 |---|---|---|---|
 | 1 | **Issue**（建或查） | `issue != null` | 远程写（建 Issue）→ 需确认 |
-| 2 | **worktree + 分支** | `worktree != null` **且 `session.cwd` 落在 `worktree.path` 内**（会话真的在里面干活）；分支名按改动性质起（前缀跟仓库惯例：feat / fix / chore / docs / refactor…） | 本地（或委托 harness 的 `/wt`） |
+| 2 | **worktree + 分支** | `worktree != null` **且 `session.cwd` 落在 `worktree.path` 内**（会话真的在里面干活）；分支名按改动性质起（前缀跟仓库惯例：feat / fix / chore / docs / refactor…） | 本地：`flowcard worktree use`（把会话搬进去；不再靠斜杠命令） |
 | 3 | **WIP PR** | `pr != null`（任务一开始就建） | 远程写 → 需确认 |
 | 4 | **推送记录** | 至少一条 push 事件（每天可见进度） | 远程写 → 需确认 |
 | 5 | **验收** | `acceptedAt != null`（人明确验收） | 人工门禁 |
@@ -151,18 +151,27 @@ type Project = {
 | `/move [<path>]` | 把当前会话移到另一个目录 |
 | `/dirs` `/add-dir` `/remove-dir` | 会话的工作目录集合（只读/增删） |
 
-于是有两种落地方式，都接受：
+**2026-10-10 修正：斜杠命令是死路 —— 模型调不了它**（真机原话「/move 是斜杠命令，我执行不了」）。
+于是这条路径改由 **flowcard 自己做**，agent 只需一条可执行命令：
 
-| 方式 | 步骤 | 何时用 |
-|---|---|---|
-| **A 委托 harness（默认）** | 会话内执行 `/wt <前缀>/xxx` → 绑定 harness 报回的 cwd | 会话已经开着、手上还有未提交改动 |
-| **B flowcard 建** | `flowcard worktree add <card> --branch <前缀>/xxx` 建 `.worktrees/<名字>` → 要求会话 `/move <worktree>`（或直接在 worktree 里重开会话） | 想严格控制 worktree 路径与分支名 |
+```bash
+git worktree add .worktrees/<名字> -b <前缀>/<名字>          # worktree 还是 AI 自己建（名字按任务起）
+flowcard worktree use <card> --path .worktrees/<名字>        # 登记 + 把会话搬进去（一条命令做完）
+```
+
+`worktree use` 做三件事：① 按既有 `worktree` 命令把 worktree 绑到卡片（**相对路径仍按项目根解析**；
+`--branch` 不给就按目录里的 HEAD 推）；② 停掉当前托管会话、用新 cwd **续接同一条 omp 会话**
+（`POST /api/cards/:id/session/cwd`）；③ 新会话起来后自己重新 claim（cwd 已在新目录）→ 卡片自动进「实施中」。
+
+**omp 的坑（18.8.7 真机实测）**：`omp -r <会话文件>` 时工作目录取自**会话文件头里的 `cwd`**，`--cwd` 会被忽略；
+所以换目录必须给一份**改过 `cwd` 头**的副本（`hosted-session.ts` 的 `writeHandoff`：拷进新目录对应的会话目录，
+原会话文件保持不动）。续接保留同一个 omp sessionId，网页转录在卡片上连续追加。
 
 配套的校验与兜底（都是自动的，不靠人自觉）：
 
 1. **每次心跳都带 `cwd`**（M0 已验证 payload 含 `cwd`）→ 引擎拿 `cwd` 与 `worktree.path` 做前缀校验，**通过才允许 `ready → working`**。
-2. 未通过时卡片停在 `ready`，并给出确切修复动作：`/wt <branch>`（方式 A）或 `/move <path>`（方式 B）+ 在 worktree 里重开会话的命令。
-3. 进入 `working` 之后若 `cwd` 漂出 worktree（`/move` 回主干等）→ 记 `card.cwd.mismatch` 事件，卡片显示警告并回到"未在 worktree"状态（**不改流程状态**，只提示 + 门禁收紧：不许提交、不许 `review`）。
+2. 未通过时卡片停在 `ready`，并给出确切修复动作：`flowcard worktree use <card> --path <worktree 路径>`（建好 worktree 之后一条命令搬进去）。
+3. 进入 `working` 之后若 `cwd` 漂出 worktree（又切回主干等）→ 记 `card.cwd.mismatch` 事件，卡片显示警告并回到"未在 worktree"状态（**不改流程状态**，只提示 + 门禁收紧：不许提交、不许 `review`）。
 4. `worktree` 槽位里的 `path`/`branch` 优先**从 cwd 反查**（`git -C <cwd> rev-parse --show-toplevel --abbrev-ref HEAD`），避免人手工填错；期望落在项目仓库的 `.worktrees/` 下，不在则记警告但仍接受。
 5. **卡片自动识别（M6）**：会话不用再报卡片 id——适配器 `claim` 不给 `card`，服务端按 `session.cwd` 落在谁的 `worktree.path` 里反查（路径段比较，`/a/b` 不匹配 `/a/bc`；多张命中取**路径最长**的那个），零命中或并列最长就回 `NOT_FOUND`，`hint` 里列出可用卡片当参照物。`FLOWCARD_CARD` 保留为显式覆盖。
 
@@ -191,7 +200,7 @@ CLI：`flowcard up <card>` / `flowcard down <card>`；状态变化一样走事�
 
 | 状态 | 含义 | 出口条件 |
 |---|---|---|
-| `ready` | 待开工（建卡即此状态，Issue 可有可无） | 建好 worktree **并把会话移进 worktree**（`/wt` 或 `/move`，远程写走 G2）→ `working` |
+| `ready` | 待开工（建卡即此状态，Issue 可有可无） | 建好 worktree **并用 `flowcard worktree use` 把会话搬进去** → `working` |
 | `working` | 实施中（worktree 已建、会话在里面干活，多次推送） | 会话结束 / agent 交回 → `review`（`end` 要求 PR 已开 + 至少一次推送） |
 | `review` | 待验收（子徽标：待验收 / 已验收待合并） | 人验收（G3）+ 探测到 PR `merged` → `merged` |
 | `merged` | 已合并，**待清理**（此处验证现场必须完整保留） | 门禁 G4：报告清理清单 → 同意 → 执行 → `done` |
@@ -366,7 +375,8 @@ flowcard project issue-base <项目 id 或路径> [--repo <owner/repo>] [--templ
 flowcard open   [--title "…"] [--body …] [--project <id>] [--issue 742 | --issue <owner/repo>#742] [--url <链接>]  # 开卡（落 ready）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local；带 Issue 就顺手绑
 flowcard attach <图片> [--name <文件名>]                    # 传图（png/jpg/jpeg/gif/webp ≤10MB），打印 markdown 直接贴进正文/评论
 flowcard issue  <card> --number 742 [--repo …] [--url …]   # 绑 Issue 槽位（只填编号，repo/url 由项目基址补）；这是必要项目，不是阶段
-flowcard worktree <card> --add --branch <前缀>/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
+flowcard worktree <card> --path .worktrees/x --branch <前缀>/x   # 只登记 worktree（已建好时）
+flowcard worktree use <card> --path .worktrees/x                # 登记 + 把会话搬进去（卡片进 working；--branch 不给按 HEAD 推）
 flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 会话进入卡片（不给 card 时服务端按 cwd 反查）→ 自动进 working
 flowcard pr     <card> --open --base main [--draft]       # 开 WIP PR（走 G2）或 --bind <url>
 flowcard push   <card> --sha <sha>                        # 记录一次推送
@@ -431,7 +441,7 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0** ✅ | omp 扩展上报 started/heartbeat/ended | 复现：1+3+1 事件，omp `exit 0`（无推理请求） |
-| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示 `/wt <branch>` 或 `/move <path>`）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
+| **M1 内核** | 事件日志 + 投影 + 引擎纯函数 + CLI + HTTP + SSE，含 **Issue/PR/worktree 三槽位与 requires 硬门禁**（先手工绑定） | CLI 走完 `open→worktree→claim→pr→push→end→accept→(模拟 merged)→cleanup`；**cwd 不在 worktree 内时 `working` 转换被拒（退出码 4，并提示用 `flowcard worktree use` 把会话搬进去）**；缺必要项时退出码 4 并指明缺哪项；重启后状态一致、`rebuild` 可重放 |
 | **M2 看板** | React + Vite + shadcn；列=7 状态；卡片详情六格必要项**空也显示**；按 Issue 聚合多片 | 浏览器完成 M1 全部动作，SSE 实时 |
 | **M3 运行时** | 每卡启动按钮：项目启动配置（`.flowcard.toml`）、进程组启停与日志、**单例不变式**（启动一张卡就停掉其他卡的运行时）、状态进事件流 | 配好配置的项目能一键起停；启 B 之后 A 的进程确实死了（`ps` 验证）；进程组杀干净 |
 | **M4 探测** | `git`/`gh`/`tea` 探测：PR 状态、CI、merged、分支/worktree 实况 | 打开卡片能自动反映 PR 与 CI 状态，merged 自动推进 |
@@ -605,6 +615,10 @@ GET  /api/cards/:id/session/stream  （每卡一条 SSE）
 6. **自动开工**：`autostart.ts` 调 `sessions.start(cardId)`（**不再 spawn konsole**）；开工提示作为 `--append-system-prompt` 进 argv（走 argv 不过 shell，不需要引号转义），"开工"那句话作为第一条 prompt。`FLOWCARD_AUTOSTART=0` 语义不变。
 7. **收尾**：`stop()` 关 stdin → omp 走 EOF 收尾自己退出（退之前上报 `end`）；服务 `SIGINT/SIGTERM` 时逐个 `stopAll()`。**孤儿 omp 不收**：它是我们的直接子进程，我们的 stdin 管道一断它就 EOF 自退（连崩溃都不留孤儿）。
 8. **上报扩展照旧挂**（`-e src/adapters/omp/flowcard-omp-adapter.ts` + `FLOWCARD_CARD`/`FLOWCARD_URL`/`FLOWCARD_OMP_LOG`）：心跳还是适配器报的（claim/end 与 flowcard 自己发的那两条同幂等键，重复会被 `dedupeKey` 吸收），cwd 被 `/move`、`/wt` 改过之后卡片也能跟上。
+9. **`session_settled` 是「这一程静下来了」，不是「会话结束了」**：omp 的 rpc 模式**不会**在一轮 `prompt_result` 之后自己退出（真机实测：同一个子进程接着发第二、第三句都照答；它只认 stdin EOF，见 `docs/omp-rpc.md` §9）。所以托管会话不把 `settled` 当终局：`prompt_result.sessionSettled=false`（还有排队/后台的活）时 `busy` 要挂到 `session_settled` 才放下；`status` 只在子进程真的没了（用户点停止 / 崩溃 / 服务重启）时才离开 `running`。
+10. **进程没了能自动续接（`-r`）**：子进程不在了（崩溃，或服务重启时上一轮的 `stopAll()` 关掉 stdin）不等于会话作废 —— 下一条 `prompt` **先**用卡片上留的会话文件 `-r` 把**同一条**会话续起来（同 ompSessionId、同转录、卡片绑定不变，只是消息 id 前缀换一段以免和旧 `msg-N` 撞车），再把这句话发出去；续不起来（没有会话文件）就报 409 `NO_SESSION` 并说明原因，**绝不悄悄换一条新会话**。用户点过「停止」的不续接 —— 那是人的明确意图。（`-r` 时 omp 认会话文件头里的 `cwd`、忽略 `--cwd`，所以续接的 cwd 只能取卡片上记着的那个。）
+
+11. **重启后再「启动会话」默认也是续接，不是从零开始**：`start()` 没被显式指定 `resume` 时，看卡片上留的会话文件 —— 文件还在、且**头里的 `sessionId` 就是卡片绑的那个、`cwd` 就是这次要跑的目录**，就自动 `-r` 续接（同 ompSessionId、同转录，重新 claim 后卡片回到「实施中」）；对不上（文件没了/头不符）就退化成新会话，并推一条 `notice` 把原因说清（不静默），`fresh: true` 才强制开一段新的（`changeCwd` 的 handoff 副本走显式 `resume`，优先级最高）。
 
 > **注意既有语义**：`end` 事件在流程里挂的是「`working → review`」，所以**停会话当前一轮等于交回**（和以前关掉终端时适配器上报 `end` 一样）。这是流程定死的规则，不是托管会话引入的。
 

@@ -384,6 +384,14 @@ export const sessionStartSchema = z.object({
   cwd: z.string().min(1).optional(),
 });
 
+/**
+ * `POST /api/cards/:id/session/cwd`：把这张卡的托管会话搬到新的工作目录
+ * （停掉当前进程 → 用 `-r` 续接同一条 omp 会话 → 重新 claim）。见 `server/hosted-session.ts` 的 `changeCwd`。
+ */
+export const sessionCwdSchema = z.object({
+  path: z.string().min(1),
+});
+
 export const sessionPromptSchema = z.object({
   text: z.string(),
   images: z

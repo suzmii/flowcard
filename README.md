@@ -35,6 +35,7 @@ node src/cli/main.ts open --body "## 修好登录页…"        # 建卡：标�
 node src/cli/main.ts attach ~/shot.png                  # 传图，打印 ![](/api/attachments/<id>) 直接贴进正文
 node src/cli/main.ts open --title "做点事" --issue myrepo#12 --url https://…/issues/12
 node src/cli/main.ts worktree c1 --path .worktrees/x --branch <前缀>/x   # 前缀看改动性质：feat/fix/chore/…
+node src/cli/main.ts worktree use c1 --path .worktrees/x                 # 登记 + 把托管会话搬进去 → 卡片进 working（--branch 不给按 HEAD 推）
 node src/cli/main.ts claim c1 --harness omp --session <id> --cwd .worktrees/x
 node src/cli/main.ts pr c1 --number 7 --url https://…/pulls/7 --branch <前缀>/x
 node src/cli/main.ts push c1 --sha <sha>

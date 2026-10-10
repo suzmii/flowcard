@@ -274,9 +274,11 @@ export function runCommand(input: {
       const issue = cmd.issue ? resolveIssueRef(cmd.issue, project) : undefined;
       if (issue && !issue.ok) return fail(issue.rejection);
       const resolved = issue?.ok ? issue.issue : undefined;
-      // 幂等键不掺 id（id 每次分配都会变），否则重试会写出一张重复卡片；
-      // 内容相同的 open 视为同一次请求，要开两张一样的卡请显式给 --dedupe-key。
-      const fingerprint = shortHash(`${title}\n${cmd.body}\n${projectId}`);
+      // 幂等键不掺 id（id 每次分配都会变），否则重试会写出一张重复卡片。
+      // 但**只把"同一分钟内的同样内容"当重试**：否则想再开一张内容相同的卡就永远建不出来
+      // （用户实际撞过：正文写 "Issue 742"，第一次建出来了，之后每次都被当重复吞掉，看着像"创建不了"）。
+      const minuteBucket = Math.floor(Date.parse(now) / 60_000);
+      const fingerprint = shortHash(`${title}\n${cmd.body}\n${projectId}\n${minuteBucket}`);
       emit(
         id,
         "card.opened",

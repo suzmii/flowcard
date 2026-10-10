@@ -17,8 +17,14 @@
  */
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { normalizePath } from "../shared/paths.ts";
+import { shortHash } from "../shared/hash.ts";
+import type { Card } from "../shared/types.ts";
+import { cardBrief } from "./brief.ts";
 import { resolveOmpPath } from "./launch.ts";
 import { startRpcSession, type OmpEvent, type OmpRpcSession, type StartRpcOptions } from "./omp-rpc.ts";
 import type { SessionToolEvent, Store } from "./store.ts";
@@ -93,6 +99,41 @@ export type StartSessionOptions = {
   kickoff?: string;
   /** 追加到 argv 之后的参数（如 `--model`）。 */
   args?: readonly string[];
+  /**
+   * 用 `-r` 续接一条已有的 omp 会话（`changeCwd` 用）。
+   * **注意**：omp 的 `-r` 认会话文件头里的 `cwd`，`--cwd` 在续接时会被忽略 ——
+   * 要换目录必须传一份改过 `cwd` 的会话文件（见 `writeHandoff`）。
+   *
+   * 给了它就**只**用它（不再自动续接卡片自己的会话文件，见 `fresh`）。
+   */
+  resume?: { file?: string | undefined } | undefined;
+  /**
+   * `true` = 不续接卡片已有的 omp 会话，起一段**新的**对话。
+   *
+   * 默认（`false`）在卡片已经有会话文件、且文件头跟这张卡/这个 cwd 对得上时自动 `-r` 续接：
+   * 一张卡始终是同一段对话 —— 服务重启（托管子进程跟着走）之后再点「启动会话」，
+   * 接着聊的是原来的上下文，而不是从零开始。对不上（文件没了/头里的 sessionId 或 cwd 不符）
+   * 就退化成新会话，并推一条 `notice` 说明原因。
+   */
+  fresh?: boolean;
+};
+
+/** `changeCwd` 的结果：新 cwd、旧 cwd、以及**是不是真的续接了原会话**。 */
+export type ChangeCwdResult = {
+  ok: boolean;
+  status: HostedSessionStatus;
+  /** 新工作目录。 */
+  cwd?: string;
+  /** 搬之前的工作目录。 */
+  previousCwd?: string;
+  ompSessionId?: string;
+  /** true = 用 `-r` 续接了原会话（同 sessionId、历史都在）；false = 新起了一条会话。 */
+  resumed: boolean;
+  /** 续接用的会话文件（改过 `cwd` 的 handoff 副本）。 */
+  sessionFile?: string;
+  /** `ok:false` 或退化成新会话时，说明为什么。 */
+  note?: string;
+  error?: SessionError;
 };
 
 /**
@@ -141,12 +182,16 @@ export function briefPromptArg(
 }
 
 export type CardChange = { cardId: string; types: string[] };
-
 export type HostedSessions = {
   start(cardId: string, opts?: StartSessionOptions): Promise<StartSessionResult>;
   prompt(cardId: string, text: string, images?: readonly SessionImage[]): Promise<PromptResult>;
   abort(cardId: string): Promise<SimpleResult>;
   stop(cardId: string): Promise<SimpleResult>;
+  /**
+   * 把会话搬到新的工作目录（卡片进 worktree 的正规路径）：
+   * 停掉当前进程 → 原会话（`-r`，cwd 头改到新目录）续接 → 起来后自己重新 claim（卡片进「实施中」）。
+   */
+  changeCwd(cardId: string, opts: { cwd: string; brief?: string }): Promise<ChangeCwdResult>;
   /** 服务退出时用：逐个优雅停（关 stdin → omp 自己收尾），并行等。 */
   stopAll(): Promise<void>;
   snapshot(cardId: string): SessionSnapshot;
@@ -262,6 +307,135 @@ function clip(text: string): string {
 
 // ---------------------------------------------------------------- 编排
 
+/**
+ * 换工作目录时给 omp 的续接文件：把会话文件头里的 `cwd` 改成新目录，拷一份 handoff 副本。
+ *
+ * 为什么必须拷 + 改头：`omp -r <file>` 拿**文件头里的 `cwd`** 当工作目录，`--cwd` 会被忽略
+ * （omp 18.8.7 真机验过）—— 直接 `-r` 原文件的话，会话还在旧目录里跑，卡片永远进不了「实施中」。
+ * 副本放进新目录对应的会话目录（omp 把 cwd 里的 `/` 换成 `-` 当目录名），
+ * 这样在新目录里用 `omp -r` 的 picker 也能捡到它。认不出会话头时原样返回（不比原来更糟）。
+ */
+async function writeHandoff(sourceFile: string, oldCwd: string, newCwd: string): Promise<string> {
+  const lines = (await readFile(sourceFile, "utf8")).split("\n");
+  let patched = false;
+  const out = lines.map((line) => {
+    if (patched || !line.includes('"type":"session"')) return line;
+    let head: unknown;
+    try {
+      head = JSON.parse(line);
+    } catch {
+      return line;
+    }
+    const rec = asRecord(head);
+    if (rec?.["type"] !== "session") return line;
+    patched = true;
+    return JSON.stringify({ ...rec, cwd: newCwd });
+  });
+  if (!patched) return sourceFile;
+  const dir = dirname(sourceFile);
+  // omp 的会话目录名 = cwd 里的 `/` 换成 `-`（真机上 `-tmp-fc-wtu-proj` 就是这个形状）。
+  const newDirName = normalizePath(newCwd).replace(/\//g, "-");
+  const oldDirName = oldCwd === "" ? "" : normalizePath(oldCwd).replace(/\//g, "-");
+  const target =
+    oldDirName !== "" && basename(dir) === oldDirName
+      ? join(dirname(dir), newDirName, basename(sourceFile))
+      : join(dir, `handoff-${shortHash(newCwd)}-${basename(sourceFile)}`);
+  if (target === sourceFile) return sourceFile;
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, out.join("\n"), "utf8");
+  return target;
+}
+
+/** 会话文件头里我们认的两个字段（`-r` 续接前必须核对，见 `resolveResumeFile`）。 */
+type SessionHead = { sessionId: string; cwd: string };
+
+/** 会话文件头（`{"type":"session",...}`）在文件最前面，读前 8 KiB 就够 —— 别为了一行头把整个转录读进内存。 */
+const SESSION_HEAD_BYTES = 8 * 1024;
+
+/**
+ * 读 omp 会话文件头里的 `{id, cwd}`；读不到（文件没了/头不完整/不是 omp 会话文件）返回 `null`。
+ *
+ * 为什么续接前非读不可：`omp -r <file>` 拿**文件头里的 cwd** 当工作目录（`--cwd` 被忽略），
+ * 头里的 id 又是会话身份 —— 头跟「这张卡 + 这次要跑的 cwd」对不上就不能续：
+ * 那会让会话在别的目录里跑，还会把卡片绑到另一段会话上。
+ */
+async function readSessionHead(file: string): Promise<SessionHead | null> {
+  let handle: FileHandle;
+  try {
+    handle = await open(file, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.alloc(SESSION_HEAD_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    for (const line of buf.subarray(0, bytesRead).toString("utf8").split("\n")) {
+      if (!line.includes('"type":"session"')) continue;
+      let head: unknown;
+      try {
+        head = JSON.parse(line);
+      } catch {
+        return null; // 头行本身就是坏的（被截断/不是 JSON）：当作读不出来
+      }
+      const rec = asRecord(head);
+      if (rec?.["type"] !== "session") continue;
+      const sessionId = asString(rec["id"]);
+      const cwd = asString(rec["cwd"]);
+      if (sessionId === null || cwd === null) return null;
+      return { sessionId, cwd };
+    }
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * `start()` 到底要不要 `-r`、以及为什么（`note` 是给用户看的一句话，不静默降级）。
+ *
+ * 优先级：
+ *   1. 显式 `opts.resume.file`（`changeCwd` 的 handoff 副本）→ 照用；
+ *   2. `opts.fresh` 或带 `kickoff`（「开工」= 故意开一段新的）→ 不续接；
+ *   3. 卡片上次的会话文件还在、且**头里的 sessionId 就是卡片绑定的会话、cwd 就是这次要跑的 cwd** → 续接；
+ *   4. 其它 → 新会话（把原因写进 `note`；卡片压根没有会话时不说多余的话）。
+ *
+ * 这张卡还没有会话、或本来就要开新的，都算正常路径，不报 `note`。
+ */
+async function resolveResumeFile(
+  card: Card,
+  cwd: string,
+  opts: StartSessionOptions,
+): Promise<{ file: string | null; note?: string }> {
+  const explicit = opts.resume?.file;
+  if (explicit !== undefined && explicit !== "") return { file: explicit };
+  if (opts.fresh === true || opts.kickoff !== undefined) return { file: null };
+
+  const bound = card.session;
+  const file = bound?.file ?? "";
+  const sessionId = bound?.id ?? "";
+  if (bound === null || file === "" || sessionId === "") return { file: null };
+  if (!existsSync(file)) {
+    return { file: null, note: `上次的会话文件不在了（${file}）：这次从新的一段对话开始` };
+  }
+  const head = await readSessionHead(file);
+  if (head === null) {
+    return { file: null, note: `读不出会话文件头（${file}）：这次从新的一段对话开始` };
+  }
+  if (head.sessionId !== sessionId) {
+    return {
+      file: null,
+      note: `会话文件里的 id（${head.sessionId}）和卡片绑的会话（${sessionId}）对不上：这次从新的一段对话开始`,
+    };
+  }
+  if (normalizePath(head.cwd) !== normalizePath(cwd)) {
+    return {
+      file: null,
+      note: `上次的会话在 ${head.cwd} 里跑，这次要在 ${cwd}：这次从新的一段对话开始（要带着历史换目录用 \`flowcard worktree use\`）`,
+    };
+  }
+  return { file };
+}
+
 /** omp 的会话状态快照（只取我们用的字段）。 */
 type OmpState = { sessionId?: unknown; sessionFile?: unknown };
 
@@ -275,10 +449,22 @@ type Live = {
   lastActivityAt: string;
   status: HostedSessionStatus;
   ompSessionId: string | null;
+  /** omp 落盘的会话文件（`get_session_stats.sessionFile`）；`changeCwd` 用它做 `-r` 续接。 */
+  sessionFile: string | null;
   cost: SessionCost | null;
   busy: boolean;
   claimed: boolean;
   exited: boolean;
+  /**
+   * 用户点过「停止」（`stop()`）：进程没了之后**不要再自动续接**——那是人的明确意图。
+   * 崩溃 / 服务重启（`stopAll()`）不置这一位：那种情况要能自动续接，不然会话就永久作废了。
+   */
+  stoppedByUser: boolean;
+  /**
+   * omp 说过"还没静默"（`prompt_result.sessionSettled:false`）：还有排队/后台的活在跑，
+   * 得等 `session_settled` 才算这一程结束（**`session_settled` 是"静下来了"，不是"会话结束了"**）。
+   */
+  awaitingSettle: boolean;
   /** 是否真的见过 `ready` 帧（决定退出时怎么报：起来了才说"会话已退出"）。 */
   readyOk: boolean;
   promptSeq: number;
@@ -338,6 +524,15 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     return undefined;
   };
 
+  /**
+   * 续接这个会话该用哪个会话文件：进程内记住的那份（`get_session_stats.sessionFile`）优先，
+   * 退到卡片事实里的 `session.file`（服务重启后进程内那份就没了）。都没有 → null（续接不了）。
+   */
+  const resumableFile = (live: Live): string | null => {
+    const file = live.sessionFile ?? store.getCard(live.cardId)?.session?.file ?? null;
+    return file === null || file === "" ? null : file;
+  };
+
   /** 转录落库（失败只报一条 notice：事件已经推出去了，不该因此拆掉会话）。 */
   const persist = (live: Live, message: SessionMessage): void => {
     try {
@@ -384,6 +579,8 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
   };
 
   const refreshStats = async (live: Live): Promise<void> => {
+    // 进程没了就别再问它了（写死管道只会白报一条 io 错）。
+    if (live.exited) return;
     const out = await live.session.request<Record<string, unknown>>(
       { type: "get_session_stats" },
       { timeoutMs: 10_000 },
@@ -416,6 +613,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     }
     live.ompSessionId = sid;
     const file = stats.ok ? asString(stats.data?.["sessionFile"]) : null;
+    live.sessionFile = file;
     const result = store.execute({
       cmd: "claim",
       actor: { kind: "agent", harness: "omp", sessionId: sid },
@@ -452,6 +650,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     // 还没起来就退 = 起的失败；起来过再退 = 结束。
     live.status = live.status === "starting" ? "failed" : "ended";
     live.busy = false;
+    live.awaitingSettle = false;
     live.off();
     if (live.claimed) {
       const sessions = live.ompSessionId === null ? {} : { sessionId: live.ompSessionId };
@@ -470,7 +669,15 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     }
     // 没起来就退的细节（退出码/stderr）由 bringUp 报，别在这里报一句"没什么信息"的话。
     if (live.readyOk) {
-      emit(live, { type: "notice", level: "info", message: "omp 会话已退出" });
+      emit(live, {
+        type: "notice",
+        level: live.stoppedByUser ? "info" : "warning",
+        message: live.stoppedByUser
+          ? "会话已停止"
+          : resumableFile(live) === null
+            ? "omp 会话进程没了（没留下会话文件，续接不了）"
+            : "omp 会话进程没了：下一条消息会自动用 `-r` 续接同一条会话（历史与卡片绑定都不变）",
+      });
     }
     emitState(live);
   };
@@ -548,12 +755,25 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         }
         break;
       case "result":
-        live.busy = false;
+        // `sessionSettled:false` = 这一轮虽然交了卷，但 omp 那边还有排队/后台的活在跑：
+        // 先别把 busy 放下（放置 `awaitingSettle`，等 `session_settled` 收尾）。
+        live.awaitingSettle = !event.sessionSettled;
+        live.busy = !event.sessionSettled;
         if (event.status === "error" && event.error !== null) {
           emit(live, { type: "error", message: `这一轮出错了：${event.error}` });
         }
         emitState(live);
         void refreshStats(live);
+        break;
+      case "settled":
+        // `session_settled` 的语义是**「这一程静下来了」**（没有在跑的 run、没有排队、没有后台活），
+        // **不是「会话结束了」**——会话照常活着，下一条 prompt 照收。
+        // 只有确实在等它（`awaitingSettle`）时才把 busy 放下：免得把新一轮刚置上的 busy 抹掉。
+        live.awaitingSettle = false;
+        if (live.busy) {
+          live.busy = false;
+          emitState(live);
+        }
         break;
       case "ui":
         // `--no-ui` 下扩展是 headless，正常不会来；真来了也没人能答 —— 一律取消，别让会话挂住。
@@ -568,7 +788,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         handleExit(live);
         break;
       default:
-        // ready/response/thinking/turn/agent/queue/command_output/other/settled：不进网页也不落库。
+        // ready/response/thinking/turn/agent/queue/command_output/other：不进网页也不落库。
         break;
     }
   };
@@ -661,11 +881,21 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     }
 
     const ompPath = await resolveOmpPathOnce();
+    /**
+     * 续接：`-r <会话文件>`。
+     * 真机验过（omp 18.8.7）：**`-r` 时 omp 拿会话文件头里的 `cwd` 当工作目录，`--cwd` 被忽略** ——
+     * 换目录必须给一份改过头的会话文件（`writeHandoff`），只传 `--cwd` 是白搭。
+     *
+     * 没显式指定就去认卡片自己的会话文件（见 `resolveResumeFile`）：一张卡始终是同一段对话，
+     * 服务重启把托管子进程带走之后，再点「启动会话」接着的是原来的上下文。
+     */
+    const { file: resumeFile, note: resumeNote } = await resolveResumeFile(card, cwd, opts);
     const args = [
       ...(deps.args ?? ["--no-title"]),
       ...(deps.adapterPath === undefined ? [] : ["-e", deps.adapterPath]),
       // brief 可能是正文，也可能是落盘后的路径（超大提示走路径，见 briefPromptArg）
       ...(opts.brief === undefined ? [] : ["--append-system-prompt", briefPromptArg(opts.brief, cardId)]),
+      ...(resumeFile === null ? [] : ["-r", resumeFile]),
       ...(opts.args ?? []),
     ];
     const session = startSession({
@@ -685,10 +915,13 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       lastActivityAt: now(),
       status: "starting",
       ompSessionId: null,
+      sessionFile: null,
       cost: null,
       busy: false,
       claimed: false,
       exited: false,
+      stoppedByUser: false,
+      awaitingSettle: false,
       readyOk: false,
       promptSeq: 0,
       seenAt: new Map(),
@@ -697,9 +930,59 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     records.set(cardId, live);
     live.off = session.on((event) => handle(live, event));
     emitState(live);
+    // 降级成新会话的原因（文件没了/头对不上）—— 说清一句，别让"上下文丢了"变成看不见的事
+    if (resumeNote !== undefined) emit(live, { type: "notice", level: "warning", message: resumeNote });
     void bringUp(live, opts);
 
     return { ok: true, status: "starting", cwd };
+  };
+
+  /** `revive()` 的结果：判别式联合，`ok:false` 一定带得出原因（HTTP 层直接透给用户看）。 */
+  type ReviveOutcome = { ok: true } | { ok: false; error: SessionError };
+
+  /**
+   * 会话进程没了之后把**同一条**会话续起来（`-r <会话文件>`）——「会话要能一直对话」的兜底：
+   *   · 用户点过「停止」→ 不续（那是人的明确意图，要接着聊就重新起会话）；
+   *   · 有会话文件 → `start({cwd, resume:{file}})`：同 sessionId、同转录、卡片绑定不变；
+   *   · 没有会话文件 → 说清楚为什么，**绝不悄悄起一条新会话**（那会把"接着聊"偷换成"换了会话"）。
+   * `cwd` 只能取会话文件头里的那个（`-r` 时 omp 忽略 `--cwd`，真机验过，见 docs/omp-rpc.md）。
+   */
+  const revive = async (cardId: string, live: Live | undefined): Promise<ReviveOutcome> => {
+    if (live?.stoppedByUser) {
+      return {
+        ok: false,
+        error: { code: "STOPPED", message: `卡片 ${cardId} 的会话已被停止：要接着聊请重新起会话` },
+      };
+    }
+    const card = store.getCard(cardId);
+    if (!card) return { ok: false, error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } };
+    const file = live === undefined ? (card.session?.file ?? null) : resumableFile(live);
+    const cwd = live?.cwd ?? card.session?.cwd ?? defaultCwd(cardId);
+    if (file === null || cwd === undefined || cwd === "") {
+      return {
+        ok: false,
+        error: {
+          code: "NO_SESSION",
+          message:
+            live === undefined
+              ? `卡片 ${cardId} 没有会话（也没有可续接的会话文件）`
+              : `卡片 ${cardId} 的会话进程已退出，而且没留下会话文件：续接不了，请重新起会话`,
+        },
+      };
+    }
+    const started = await start(cardId, { cwd, resume: { file } });
+    if (!started.ok) {
+      return { ok: false, error: started.error ?? { code: "NO_SESSION", message: `卡片 ${cardId} 的会话续不起来` } };
+    }
+    const next = records.get(cardId);
+    if (next) {
+      emit(next, {
+        type: "notice",
+        level: "info",
+        message: `会话进程不在了：已用 \`-r\` 续接同一条 omp 会话（${file}）`,
+      });
+    }
+    return { ok: true };
   };
 
   const prompt = async (
@@ -707,9 +990,15 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     text: string,
     images: readonly SessionImage[] = [],
   ): Promise<PromptResult> => {
-    const live = records.get(cardId);
-    if (!live || live.exited) {
-      return { ok: false, error: { code: "NO_SESSION", message: `卡片 ${cardId} 没有在跑的会话` } };
+    let live = records.get(cardId);
+    // 进程没了（崩溃 / 服务重启时被 stopAll 收掉）不代表会话作废：先把它续起来再说话。
+    if (live === undefined || live.exited) {
+      const revived = await revive(cardId, live);
+      if (!revived.ok) return { ok: false, error: revived.error };
+      live = records.get(cardId);
+      if (live === undefined) {
+        return { ok: false, error: { code: "NO_SESSION", message: `卡片 ${cardId} 的会话没起来` } };
+      }
     }
     // 起会话的流程还在跑就先等它：命令早于 ready 会被 omp 丢掉（ready 永不 reject）。
     if (live.status === "starting") {
@@ -755,8 +1044,74 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     const live = records.get(cardId);
     if (!live) return { ok: true };
     // 关 stdin → omp 自己收尾退出 → exit 事件里发 `end`；幂等（已经退了就直接返回）。
+    // 这一位只在**人**点停止时置上：之后进程没了也不再自动续接（崩溃/服务重启不置，那种要能续）。
+    live.stoppedByUser = true;
     await live.session.stop();
     return { ok: true };
+  };
+
+  /**
+   * 把会话搬到新 cwd —— 卡片进 worktree 的正规路径（`flowcard worktree use` 的第二步）：
+   * 停掉旧进程 → 用改过 `cwd` 头的会话文件 `-r` 续接（同 sessionId、历史不断）→ 起来后 bringUp
+   * 自己重新 claim（cwd 已在新目录）→ 卡片自动进「实施中」。
+   *
+   * 原会话没留下会话文件（或文件没了/读不动）就退化成新起一条会话：卡片照样能进「实施中」，
+   * 但 omp 侧的历史断了——这种情况在 `note` 里明说，不静默。
+   */
+  const changeCwd = async (cardId: string, opts: { cwd: string; brief?: string }): Promise<ChangeCwdResult> => {
+    const card = store.getCard(cardId);
+    if (!card) {
+      return { ok: false, status: "stopped", resumed: false, error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } };
+    }
+    if (!existsSync(opts.cwd)) {
+      return {
+        ok: false,
+        status: "failed",
+        resumed: false,
+        error: { code: "NO_CWD", message: `会话的新工作目录不存在：${opts.cwd}` },
+      };
+    }
+    const live = records.get(cardId);
+    const previousCwd = live?.cwd ?? card.session?.cwd ?? defaultCwd(cardId);
+    const source = live?.sessionFile ?? card.session?.file ?? null;
+
+    // 1) 先停：会话文件正被 omp 写着，不停就拷到半截（stop() 会等进程真的退）。
+    if (live && !live.exited) await live.session.stop();
+
+    // 2) 续接来源：改过 `cwd` 头的 handoff 副本（`-r` 时 omp 忽略 `--cwd`，见 writeHandoff）。
+    let resume: { file: string } | null = null;
+    let note: string | undefined;
+    if (source === null) {
+      note =
+        live === undefined && card.session === null
+          ? "这张卡还没有会话：已在新目录起一条会话"
+          : "原会话没留下会话文件：已在新目录起一条会话（omp 侧历史断了）";
+    } else {
+      const handoff = await writeHandoff(source, previousCwd ?? "", opts.cwd).catch((error: unknown) => {
+        note = `续接没成（${error instanceof Error ? error.message : String(error)}）：已在新目录起一条会话`;
+        return null;
+      });
+      if (handoff !== null) resume = { file: handoff };
+    }
+
+    // 3) 起会话：brief 按绑定后的新 worktree 重新生成（调用方没给才自己算）。
+    const project = store.getProject(card.projectId);
+    const fresh = store.getCard(cardId) ?? card;
+    const brief =
+      opts.brief ??
+      cardBrief({
+        card: fresh,
+        ...(project === undefined ? {} : { project }),
+        ...(fresh.worktree === null ? {} : { worktree: { path: fresh.worktree.path, branch: fresh.worktree.branch } }),
+      });
+    const started = await start(cardId, { cwd: opts.cwd, brief, ...(resume === null ? {} : { resume }) });
+    return {
+      ...started,
+      ...(previousCwd === undefined ? {} : { previousCwd }),
+      resumed: resume !== null,
+      ...(resume === null ? {} : { sessionFile: resume.file }),
+      ...(note === undefined ? {} : { note }),
+    };
   };
 
   const snapshot = (cardId: string): SessionSnapshot => {
@@ -824,6 +1179,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     prompt,
     abort,
     stop,
+    changeCwd,
     async stopAll() {
       await Promise.all([...records.values()].map((live) => live.session.stop().catch(() => undefined)));
     },

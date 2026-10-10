@@ -4,7 +4,7 @@
  * 契约：stdout 永远是一行 JSON；退出码 0 成功 / 2 用法 / 3 状态不允许 / 4 缺必要条件 / 5 服务不可达。
  */
 import { readFileSync } from "node:fs";
-import { basename, extname } from "node:path";
+import { basename, extname, isAbsolute } from "node:path";
 import { parseArgs } from "node:util";
 import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
 import { summarizeDiff } from "../server/diff.ts";
@@ -532,6 +532,124 @@ async function fetchCard(cardId: string): Promise<Card> {
 }
 
 /**
+ * `flowcard worktree use <card> --path <worktree 路径> [--branch <分支>]`：
+ * 把会话**搬进** worktree —— 斜杠命令（`/wt`、`/move`）模型调不了，这一步只能由 flowcard 做。
+ *
+ *   ① 按既有 `worktree` 命令把 worktree 绑到卡片（相对路径仍由服务端按项目根解析）；
+ *   ② 打 `POST .../session/cwd`：停掉当前托管会话、用新 cwd `-r` 续接同一条 omp 会话；
+ *   ③ 会话起来后自己重新 claim（cwd 已在新目录）→ 卡片自动进「实施中」。
+ *
+ * 起在**别人的**会话里跑这条命令时，自己的 omp 进程会被停掉（正是要点），所以命令的输出未必看得到 ——
+ * 以 `flowcard show <card>` 为准。
+ */
+async function runWorktreeUse(): Promise<never> {
+  const card = positionals[2];
+  if (!card) die(2, "worktree use 需要卡片 id：flowcard worktree use <card> --path <worktree 路径>");
+  const rawPath = opt("path") ?? die(2, "worktree use 需要 --path <worktree 路径>（worktree 的目录，相对路径按项目根算）");
+
+  // 服务端把相对路径按项目根解析；这里照同一语义算出绝对路径，只为在本地 git 里读分支名。
+  const known = await fetchCard(card);
+  const abs = isAbsolute(rawPath) ? rawPath : resolveUserPath(rawPath, known.repoPath ?? process.cwd());
+  let branch = opt("branch");
+  if (branch === undefined) {
+    // 用 symbolic-ref（不是 rev-parse --abbrev-ref）：新建的 worktree/仓库可能还没有提交，
+    // 那时 HEAD 指向一个还不存在的分支 —— symbolic-ref 照样给名字，rev-parse 会失败。
+    const probed = await defaultRun("git", ["-C", abs, "symbolic-ref", "--short", "HEAD"]).catch(() => null);
+    const name = probed?.code === 0 ? probed.stdout.trim() : "";
+    if (name === "") {
+      die(2, `推不出 ${abs} 的分支（不是 git 工作树？detached HEAD？）：显式给 --branch <分支>`);
+    }
+    branch = name;
+  }
+
+  // ① 绑到卡片：一条命令一个意图，worktree 的解析/幂等全在服务端
+  const bound = await postCommand({
+    cmd: "worktree",
+    actor: actor(),
+    card,
+    worktree: { path: rawPath, branch, source: "flowcard" },
+  });
+  if (bound.ok !== true) return finish(`${JSON.stringify(bound)}\n`, payloadExitCode(bound));
+  const worktreePath = bound.card?.worktree?.path;
+  if (worktreePath === undefined) {
+    return finish(
+      `${JSON.stringify({ ok: false, rejection: { code: "SERVER_ERROR", message: "worktree 绑上了，但响应里没有卡片（没法接着搬会话）" } })}\n`,
+      5,
+    );
+  }
+
+  // ② 会话换 cwd：停旧进程 → `-r` 续接 → 新会话自己 claim
+  const moved = await postSessionCwd(card, worktreePath);
+  if (moved.ok !== true) {
+    return finish(`${JSON.stringify(moved)}\n`, moved.error?.code === "USAGE_ERROR" ? 2 : 3);
+  }
+
+  // ③ claim 是会话起来之后自己发的，等它落到「实施中」再回话（拿不到也不谎报，state 原样给出）
+  const state = await waitForState(card, "working", 20_000);
+  return finish(
+    `${JSON.stringify({
+      ok: true,
+      card,
+      worktree: { path: worktreePath, branch },
+      session: moved,
+      state,
+      advanced: state === "working",
+      ...(state === "working"
+        ? {}
+        : { hint: `会话已在新目录起来，但卡片还没进「实施中」（现在 ${state}）：稍后用 \`flowcard show ${card}\` 再看一眼` }),
+    })}\n`,
+    0,
+  );
+}
+
+/** `POST /api/cards/:id/session/cwd` 的响应（端点在 `server/app.ts`）。 */
+type SessionCwdResponse = {
+  ok?: unknown;
+  status?: string;
+  cwd?: string;
+  previousCwd?: string;
+  ompSessionId?: string;
+  resumed?: boolean;
+  sessionFile?: string;
+  note?: string;
+  error?: { code?: string; message?: string };
+};
+
+/** `POST /api/cards/:id/session/cwd`：把托管会话搬到新目录（停旧进程 → 用新 cwd `-r` 续接）。 */
+async function postSessionCwd(card: string, path: string): Promise<SessionCwdResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}/session/cwd`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+  } catch (error) {
+    return unreachable(error);
+  }
+  const payload = (await res.json().catch(() => null)) as SessionCwdResponse | null;
+  if (payload === null) {
+    return finish(
+      `${JSON.stringify({ ok: false, error: { code: "SERVER_ERROR", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` } })}\n`,
+      5,
+    );
+  }
+  return payload;
+}
+
+/** 轮询卡片状态直到等于 `want`（拿不到就把最新状态原样返回，绝不谎报）。 */
+async function waitForState(card: string, want: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let state = "";
+  for (;;) {
+    const current = await fetchCard(card);
+    state = current.state;
+    if (state === want || Date.now() > deadline) return state;
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+  }
+}
+
+/**
  * `flowcard diff <card> [--patch]`：只读。
  * 默认打 JSON 摘要（文件级 + hunk 头，不含行体）；`--patch` 打 git 的原始 unified diff 文本。
  */
@@ -653,12 +771,19 @@ async function buildReviewCommand(): Promise<Command> {
 /** `/api/commands` 的响应体：字段全可选 —— 非 JSON、缺字段都要能兜住。 */
 type CommandResponse = {
   ok?: unknown;
+  card?: Card;
   rejection?: { code?: string };
   blocked?: { missing?: string[] };
 };
 
-/** 把一条命令 POST 给服务端，按 `rejection.code` 定退出码（写入口只有这一条路）。 */
-async function submit(command: Command): Promise<never> {
+/** 按响应体定退出码：用法错 2 / 状态不允许 3 / 缺必要条件 4 / 成功 0。 */
+function payloadExitCode(payload: CommandResponse): number {
+  if (payload.ok !== true) return payload.rejection?.code === "USAGE_ERROR" ? 2 : 3;
+  return (payload.blocked?.missing?.length ?? 0) > 0 ? 4 : 0;
+}
+
+/** 把一条命令 POST 给服务端（写入口只有这一条路）；响应体原样返回，由调用方决定怎么收尾。 */
+async function postCommand(command: Command): Promise<CommandResponse> {
   let res: Response;
   try {
     res = await fetch(`${DEFAULT_URL}/api/commands`, {
@@ -692,10 +817,12 @@ async function submit(command: Command): Promise<never> {
       5,
     );
   }
-  if (payload.ok !== true) {
-    return finish(`${JSON.stringify(payload)}\n`, payload.rejection?.code === "USAGE_ERROR" ? 2 : 3);
-  }
-  return finish(`${JSON.stringify(payload)}\n`, (payload.blocked?.missing?.length ?? 0) > 0 ? 4 : 0);
+  return payload;
+}
+
+async function submit(command: Command): Promise<never> {
+  const payload = await postCommand(command);
+  return finish(`${JSON.stringify(payload)}\n`, payloadExitCode(payload));
 }
 
 async function main(): Promise<void> {
@@ -794,6 +921,9 @@ async function main(): Promise<void> {
   // 提交图与评审的读动作（diff / review --list）：只读接口，直接打端点。
   if (name === "diff") await runDiff();
   if (name === "review") await submit(await buildReviewCommand());
+
+  // `worktree use`：绑 worktree + 把会话搬进去（多步，不是单条命令）。
+  if (name === "worktree" && positionals[1] === "use") await runWorktreeUse();
 
   // 项目（看板 Metadata）与附件不是命令：直接打各自的端点。
   if (name === "project") await runProject(positionals.slice(1));

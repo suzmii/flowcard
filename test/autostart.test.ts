@@ -51,6 +51,9 @@ function fakeSessions(outcome: Partial<StartSessionResult> = {}): {
     async stop() {
       return { ok: true };
     },
+    async changeCwd() {
+      return { ok: false, status: "stopped", resumed: false, error: { code: "NO_SESSION", message: "假注册表没有会话" } };
+    },
     async stopAll() {
       return undefined;
     },
@@ -187,15 +190,15 @@ describe("自动开工编排", () => {
     expect(fake.started).toHaveLength(0);
   });
 
-  it("提示里把「建 worktree」交回给会话：名字自定 + 要登记 + 要切进去", async () => {
+  it("提示里把「建 worktree」交回给会话：名字自定 + 一步搬进去（不再让 AI 用斜杠命令）", async () => {
     const d = deps();
     const outcome = await autostartCard("c7", d as never);
     const text = cardBrief({ card: card(), project });
     expect(outcome.status).toBe("started");
     expect(text).toMatch(/名字由你起/);
     expect(text).toMatch(/git worktree add \.worktrees\/<你起的名字>/);
-    expect(text).toMatch(/flowcard worktree c7 --path/);
-    expect(text).toMatch(/\/wt <分支>|\/move <路径>/);
+    expect(text).toMatch(/flowcard worktree use c7 --path/);
+    expect(text).toMatch(/斜杠命令你执行不了/);
     expect(text).toMatch(/在主仓库里改文件不算开工/);
   });
 

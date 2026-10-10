@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { CheckCheck, CircleSlash, ExternalLink, X } from "lucide-react";
+import { CheckCheck, CircleSlash, ExternalLink, MessagesSquare, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
 import { StateActions } from "@/components/detail/StateActions";
@@ -8,7 +8,6 @@ import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
 import { SessionPanel } from "@/components/detail/SessionPanel";
-import { SessionChat } from "@/components/detail/SessionChat";
 import { SlotGrid } from "@/components/detail/SlotGrid";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,6 +38,7 @@ export function CardDetail({
   cards,
   issueBase,
   onClose,
+  onOpenSession,
   onRefresh,
 }: {
   card: CardView;
@@ -46,6 +46,8 @@ export function CardDetail({
   /** 当前项目的 Issue 基址（repo 短形 + URL 模板）：Issue 绑定入口只填数字就靠它 */
   issueBase?: IssueBase;
   onClose: () => void;
+  /** 对话已独立成「会话」视图：这里只留入口，点了就切过去并选中这张卡。 */
+  onOpenSession: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
@@ -186,8 +188,17 @@ export function CardDetail({
             <SessionPanel card={card} />
           </Section>
 
-          <Section title="对话" hint="托管会话：在网页里直接跟这张卡说话，工具/终端输出同页可见">
-            <SessionChat card={card} />
+          <Section title="对话" hint="完整对话搬到了「会话」视图（左栏列表 / 全高转录 / 输入框贴底）">
+            <button
+              type="button"
+              data-testid="open-session-view"
+              onClick={onOpenSession}
+              className="flex w-full items-center gap-2 rounded-lg border bg-background px-3 py-2 text-left text-xs transition-colors hover:border-foreground/30 hover:bg-accent/40"
+            >
+              <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
+              <span className="font-medium">在会话视图里打开 →</span>
+              <span className="ml-auto text-muted-foreground">默认贴在最底，新消息跟着滚</span>
+            </button>
           </Section>
 
           <CodeChanges card={card} onRefresh={onRefresh} />

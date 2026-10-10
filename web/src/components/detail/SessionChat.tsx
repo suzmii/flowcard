@@ -1,13 +1,17 @@
 /**
- * 「对话」面板：在卡片详情里直接跟这张卡的**托管会话**说话，助手文本流式出现，
- * 工具调用与终端输出同页可见（等宽、可折叠、可滚动）——不再另开 konsole 窗口。
+ * 一个托管会话的完整对话面板（「会话」视图右栏的唯一渲染体）：顶部状态栏固定、
+ * 中间转录自己滚、输入框钉在底部。
  *
  * 数据来源：`GET /api/cards/:id/session`（快照）+ `GET /api/cards/:id/session/stream`（每卡一条 SSE）。
  * 断线时 EventSource 自己重连，这里只把「重连中」亮出来，并在恢复后补一次快照。
+ *
+ * 滚动：**默认贴底**。进视图/换会话/首次拉到历史后立刻滚到底，内容（markdown、图片）晚一步撑高
+ * 也再跟一次；只有用户自己往上翻（离底 > `AT_BOTTOM_PX`）才不抢，并亮出「跳到最新」。
  */
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent,
@@ -47,6 +51,7 @@ import {
   subscribeSession,
   type SessionImage,
   type SessionMessage,
+  type SessionState,
   type SessionTool,
 } from "@/lib/session";
 import type { CardView } from "@/lib/schema";
@@ -55,6 +60,9 @@ const ROLE_LABELS: Record<SessionMessage["role"], string> = { user: "我", assis
 
 /** 工具输出超过这个长度就先折一半（**只影响首屏**，点「展开全部」看全量，绝不截断丢弃）。 */
 const TOOL_PREVIEW_CHARS = 4000;
+
+/** 离底多少像素内算「还贴着底」：超过就当用户自己往上翻了，新内容不抢滚动。 */
+const AT_BOTTOM_PX = 40;
 
 /** 待发图片：校验复用 `lib/uploads.ts` 的口径，字节按契约内联成 base64。 */
 type PendingImage = { key: string; name: string; bytes: number; dataBase64: string };
@@ -180,7 +188,14 @@ function MessageRow({ message }: { message: SessionMessage }) {
   );
 }
 
-export function SessionChat({ card }: { card: CardView }) {
+export function SessionChat({
+  card,
+  onSnapshot,
+}: {
+  card: CardView;
+  /** 每次会话状态变化回报一次（左栏列表要画选中项的实时点/busy）；纯通知，不参与渲染。 */
+  onSnapshot?: (cardId: string, session: SessionState) => void;
+}) {
   const [view, setView] = useState(initialSessionView);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<{ message: string; missing: boolean } | null>(null);
@@ -196,6 +211,7 @@ export function SessionChat({ card }: { card: CardView }) {
   const [stick, setStick] = useState(true);
 
   const listRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const stickRef = useRef(true);
   const aliveRef = useRef(true);
@@ -305,18 +321,49 @@ export function SessionChat({ card }: { card: CardView }) {
     return () => window.clearInterval(timer);
   }, [card.id]);
 
-  // 自动滚到底；用户往上翻时（stick=false）不抢滚动。
-  // 依赖整个 view：流式文本、工具输出、提示流都会换掉它的引用，只盯「最后一条消息」会漏（工具消息在尾部时）。
-  useEffect(() => {
+  /**
+   * 贴底：在**布局阶段**（浏览器已经算完高度、还没画）就把转录滚到底，避开「先渲染再撑高」的闪烁。
+   * 依赖整个 view：流式文本、工具输出、提示流都会换掉它的引用，只盯「最后一条消息」会漏。
+   */
+  useLayoutEffect(() => {
     if (!stickRef.current) return;
     const element = listRef.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [view]);
 
+  /**
+   * 内容**晚一步**撑高（markdown 渲染完、图片加载完、工具块展开）时再跟一次底：直接改 scrollTop，
+   * 不进 state（每次增量都 setState 会把对话多渲一遍）。用户往上翻时不打扰。
+   */
+  useEffect(() => {
+    const content = contentRef.current;
+    const list = listRef.current;
+    if (!content || !list) return;
+    const observer = new ResizeObserver(() => {
+      if (!stickRef.current) return;
+      list.scrollTop = list.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
+
+  /** 换会话：重新贴底（新转录还没来，先把位置摆正；历史到了上面的 effect 会再跟一次）。 */
+  useLayoutEffect(() => {
+    stickRef.current = true;
+    setStick(true);
+    const element = listRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [card.id]);
+
+  // 左栏列表要画选中项的实时状态/busy：会话状态变了就报一次。
+  useEffect(() => {
+    onSnapshot?.(card.id, view.session);
+  }, [card.id, view.session, onSnapshot]);
+
   const onScroll = () => {
     const element = listRef.current;
     if (!element) return;
-    const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+    const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight <= AT_BOTTOM_PX;
     stickRef.current = atBottom;
     setStick(atBottom);
   };
@@ -419,8 +466,8 @@ export function SessionChat({ card }: { card: CardView }) {
           : null;
 
   return (
-    <div className="space-y-2 rounded-lg border bg-background p-2.5">
-      <div className="flex flex-wrap items-center gap-1.5">
+    <div className="flex h-full min-h-0 flex-col gap-2 rounded-lg border bg-background p-2.5">
+      <div className="flex shrink-0 flex-wrap items-center gap-1.5">
         <Badge variant={SESSION_STATUS_TONE[status]} data-testid="session-status" data-status={status}>
           {SESSION_STATUS_LABELS[status]}
         </Badge>
@@ -494,7 +541,7 @@ export function SessionChat({ card }: { card: CardView }) {
       {loadError ? (
         <div
           className={cn(
-            "rounded border p-2 text-xs",
+            "shrink-0 rounded border p-2 text-xs",
             loadError.missing
               ? "border-amber-500/50 bg-amber-50 text-amber-900"
               : "border-red-600/30 bg-red-50 text-red-800",
@@ -506,7 +553,7 @@ export function SessionChat({ card }: { card: CardView }) {
       ) : null}
 
       {connection !== "live" && streamFailures >= 3 ? (
-        <p className="rounded border border-amber-500/50 bg-amber-50 p-2 text-xs text-amber-900">
+        <p className="shrink-0 rounded border border-amber-500/50 bg-amber-50 p-2 text-xs text-amber-900">
           对话流连不上：服务端可能还没实现 <code className="font-mono">GET /api/cards/:id/session/stream</code>。
           转录仍可读，接口上线后会自动恢复。
         </p>
@@ -516,8 +563,8 @@ export function SessionChat({ card }: { card: CardView }) {
         <p
           className={
             notice.tone === "ok"
-              ? "rounded border border-emerald-600/30 bg-emerald-50 p-2 text-xs text-emerald-800"
-              : "rounded border border-red-600/30 bg-red-50 p-2 text-xs text-red-800"
+              ? "shrink-0 rounded border border-emerald-600/30 bg-emerald-50 p-2 text-xs text-emerald-800"
+              : "shrink-0 rounded border border-red-600/30 bg-red-50 p-2 text-xs text-red-800"
           }
           data-testid="session-action-notice"
         >
@@ -526,7 +573,7 @@ export function SessionChat({ card }: { card: CardView }) {
       ) : null}
 
       {messages.length === 0 && !loading && status !== "running" ? (
-        <p className="rounded border border-dashed bg-muted/40 p-2 text-xs text-muted-foreground">
+        <p className="shrink-0 rounded border border-dashed bg-muted/40 p-2 text-xs text-muted-foreground">
           这张卡的托管会话
           {status === "ended" ? "已经结束了" : status === "failed" ? "启动失败" : "还没启动"}
           ：点「启动会话」就能在这里直接对话 —— 会话在卡片自己的 worktree 里跑，助手的回复、
@@ -535,58 +582,65 @@ export function SessionChat({ card }: { card: CardView }) {
         </p>
       ) : null}
 
-      <div
-        ref={listRef}
-        onScroll={onScroll}
-        className="max-h-[30rem] min-h-[8rem] space-y-2 overflow-y-auto rounded-md border bg-muted/20 p-2"
-        data-testid="session-transcript"
-      >
-        {loading && messages.length === 0 ? (
-          <p className="text-xs text-muted-foreground">读取会话转录…</p>
-        ) : null}
-        {messages.map((message) => (
-          <MessageRow key={message.id} message={message} />
-        ))}
-        {view.notices.length > 0 ? (
-          <ul className="space-y-0.5" data-testid="session-notices">
-            {view.notices.map((item, index) => (
-              <li
-                key={`${item.at}-${index}`}
-                className={cn(
-                  "rounded border px-1.5 py-1 text-[11px]",
-                  item.level === "error"
-                    ? "border-red-600/30 bg-red-50 text-red-800"
-                    : item.level === "warn"
-                      ? "border-amber-500/40 bg-amber-50 text-amber-900"
-                      : "border-border bg-muted/40 text-muted-foreground",
-                )}
-              >
-                {item.message}
-              </li>
+      {/* 转录：**自己滚**（外层给高度，内层 absolute 铺满），别指望整页滚 */}
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={listRef}
+          onScroll={onScroll}
+          className="absolute inset-0 overflow-y-auto rounded-md border bg-muted/20 p-2"
+          data-testid="session-transcript"
+        >
+          {/* 内容用一层包起来：ResizeObserver 才量得到「撑高」这件事 */}
+          <div ref={contentRef} className="space-y-2">
+            {loading && messages.length === 0 ? (
+              <p className="text-xs text-muted-foreground">读取会话转录…</p>
+            ) : null}
+            {messages.map((message) => (
+              <MessageRow key={message.id} message={message} />
             ))}
-          </ul>
-        ) : null}
+            {view.notices.length > 0 ? (
+              <ul className="space-y-0.5" data-testid="session-notices">
+                {view.notices.map((item, index) => (
+                  <li
+                    key={`${item.at}-${index}`}
+                    className={cn(
+                      "rounded border px-1.5 py-1 text-[11px]",
+                      item.level === "error"
+                        ? "border-red-600/30 bg-red-50 text-red-800"
+                        : item.level === "warn"
+                          ? "border-amber-500/40 bg-amber-50 text-amber-900"
+                          : "border-border bg-muted/40 text-muted-foreground",
+                    )}
+                  >
+                    {item.message}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        </div>
+
+        {stick ? null : (
+          <Button
+            size="xs"
+            variant="outline"
+            className="absolute bottom-2 right-2 bg-background shadow-md"
+            data-testid="session-jump-latest"
+            onClick={() => {
+              stickRef.current = true;
+              setStick(true);
+              const element = listRef.current;
+              if (element) element.scrollTop = element.scrollHeight;
+            }}
+          >
+            <ChevronDown />
+            跳到最新
+          </Button>
+        )}
       </div>
 
-      {stick ? null : (
-        <Button
-          size="xs"
-          variant="outline"
-          data-testid="session-jump-latest"
-          onClick={() => {
-            stickRef.current = true;
-            setStick(true);
-            const element = listRef.current;
-            if (element) element.scrollTop = element.scrollHeight;
-          }}
-        >
-          <ChevronDown />
-          跳到最新
-        </Button>
-      )}
-
       <div
-        className="space-y-1.5"
+        className="shrink-0 space-y-1.5"
         onDragOver={(event) => {
           if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) event.preventDefault();
         }}

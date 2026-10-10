@@ -11,6 +11,7 @@ import {
   issueBaseInSchema,
   projectInSchema,
   runtimeActionSchema,
+  sessionCwdSchema,
   sessionPromptSchema,
   sessionStartSchema,
   syncRequestSchema,
@@ -647,6 +648,7 @@ export function createApp(store: Store, opts: AppOptions = {}) {
    * | POST | `/api/cards/:id/session/prompt` | `{text,images?}` → `{ok,messageId?}` |
    * | POST | `/api/cards/:id/session/abort` | 中断当前一轮 |
    * | POST | `/api/cards/:id/session/stop` | 收尾（关 stdin → omp 自己退 → 上报 `end`） |
+   * | POST | `/api/cards/:id/session/cwd` | `{path}` → 停旧进程、用新 cwd `-r` 续接（卡片随之 claim 进「实施中」） |
    * | GET  | `/api/cards/:id/session/stream` | 这张卡一条 SSE：ready/message/message_end/tool/state/notice/error |
    */
   app.get("/api/cards/:id/session", (c) => {
@@ -711,6 +713,28 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     }
     const result = await sessions.stop(cardId);
     return c.json(result, result.ok ? 200 : 409);
+  });
+
+  /**
+   * 把会话搬进新的工作目录（`flowcard worktree use` 的第二步）：
+   * 停掉当前托管进程 → 用 `-r` 续接同一条 omp 会话（cwd 改到新目录）→ 起来后自己 claim。
+   * 「卡片进实施中」是 claim 的后果，不在这里直接改状态。
+   */
+  app.post("/api/cards/:id/session/cwd", async (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    const body = await c.req.json().catch(() => null);
+    const parsed = sessionCwdSchema.safeParse(body);
+    if (!parsed.success) {
+      const message = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+        .join("; ");
+      return c.json({ ok: false, status: "stopped", resumed: false, error: { code: "USAGE_ERROR", message } }, 400);
+    }
+    const result = await sessions.changeCwd(cardId, { cwd: parsed.data.path });
+    return c.json(result, result.ok ? 200 : result.error?.code === "NOT_FOUND" ? 404 : 409);
   });
 
   // 每卡一条 SSE（**不把增量灌进全局 `/api/stream`**）：连上先收到 `ready` + `state` 的现况，
