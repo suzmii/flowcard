@@ -253,6 +253,8 @@ export function runCommand(input: {
         notes.push(`忽略未知会话 ${cmd.session.id} 的心跳（卡片绑定的是 ${card.session.id}）`);
         break;
       }
+      // 心跳按 30s 分桶去重：分桶粒度就是 lastSeenAt 的分辨率，
+      // 所以存活判定的 TTL 必须 ≥ 3 个桶（设计里取 90s）。
       const bucket = Math.floor(Date.parse(now) / 30_000);
       emit(
         cmd.card,

@@ -1,3 +1,28 @@
+# 现状：已经接到 flowcard（不再是 spike 占位契约）
+
+适配器现在直接调 flowcard 的命令接口，实测链路：
+
+```
+在卡片的 worktree 里：
+  FLOWCARD_CARD=c1 omp -e /path/to/workspace/flowcard/src/adapters/omp/flowcard-omp-adapter.ts
+
+omp 启动 → POST /api/commands {cmd:"claim"}  → 卡片 ready → working（前提：Issue/worktree/PR 已绑齐）
+每 HEARTBEAT_MS → POST {cmd:"beat"}          → lastSeenAt 前进；cwd 漂出 worktree 会记 session.cwd.mismatch
+omp 退出 → POST {cmd:"end"}                  → session.state=ended
+```
+
+环境变量：`FLOWCARD_URL`（默认 `http://127.0.0.1:47825`）、`FLOWCARD_CARD`（**必给**，否则只写日志不上报）、
+`FLOWCARD_HEARTBEAT_MS`（默认 15000）、`FLOWCARD_OMP_LOG`（默认 `/tmp/omp-adapter.log`）。
+
+行为约定（都来自下面的 M0 实测）：
+
+- 只上报 `agentKind === "main"` 的会话；subagent 会话跳过（设计里 subagent 不绑卡片，归 harness 自己管）。
+- 端点不可达/超时 → 只写日志，绝不抛错、绝不影响会话（实测把端点指向死端口时 omp 仍 `exit 0`）。
+- 定时器一律用 `ctx.setInterval`；`fetch` 超时 1.5s（`session_shutdown` 只有 2s 预算）。
+- 已知小瑕疵：`session_shutdown` 里那次 POST 的**日志行**可能来不及写盘就被 omp 收走（事件本身是到了服务端的，实测 events 表里能看到 `session.ended`）。
+
+---
+
 # flowcard ⇄ omp adapter（M0 spike）
 
 结论：**可行**。用 `-e/--hook` 直接指定仓库里的一个 `.ts` 文件，就能在 omp 进程内拿到会话生命周期，
