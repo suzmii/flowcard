@@ -237,7 +237,7 @@ function build(): Command {
         body: opt("body") ?? "",
       };
     default:
-      return die(2, `未知命令 "${name ?? ""}"。可用：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn list show`);
+      return die(2, `未知命令 "${name ?? ""}"。可用：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show`);
   }
 }
 
@@ -245,8 +245,14 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn list show" })}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：open issue plan gate worktree claim beat pr push end accept block unblock probe cleanup comment spawn up down detect list show" })}\n`);
     process.exit(0);
+  }
+
+  if (name === "detect") {
+    // 探测是只读 + 回写，与"用户命令"性质不同，实现在 detect.ts，这里只做转发。
+    const { runDetect } = await import("./detect.ts");
+    await runDetect(process.argv.slice(3));
   }
 
   if (name === "list") {
@@ -259,6 +265,31 @@ async function main(): Promise<void> {
     const res = await fetch(`${DEFAULT_URL}/api/cards/${requireCard()}`);
     process.stdout.write(`${JSON.stringify(await res.json())}\n`);
     process.exit(res.ok ? 0 : 3);
+  }
+
+  // 启动/停止卡片运行时：不是命令（引擎不碰进程），直接打运行时端点。
+  if (name === "up" || name === "down") {
+    const card = requireCard();
+    const url = `${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}/runtime`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: name }),
+      });
+    } catch (error) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${DEFAULT_URL}：${String(error)}` } })}\n`,
+      );
+      process.exit(5);
+    }
+    const payload = (await res.json()) as { ok?: boolean; error?: { code?: string } };
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+    if (!res.ok || payload.ok === false) {
+      process.exit(payload.error?.code === "USAGE_ERROR" ? 2 : 3);
+    }
+    process.exit(0);
   }
 
   const command = build();

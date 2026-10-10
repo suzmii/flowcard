@@ -10,6 +10,7 @@ import type {
   Event,
   IssueRef,
   PrRef,
+  Runtime,
   Session,
   WorktreeRef,
 } from "../shared/types.ts";
@@ -35,6 +36,7 @@ export function emptyCard(id: string, at: string): Card {
     pr: null,
     worktree: null,
     session: null,
+    runtime: null,
     gates: {},
     pushes: [],
     comments: [],
@@ -189,6 +191,50 @@ export function applyEvent(card: Card, event: NewEvent | Event): Card {
     case "session.cwd.mismatch":
     case "git.probed":
       break;
+
+    case "runtime.starting": {
+      const runtime: Runtime = { status: "starting", startedAt: at };
+      if (typeof p.pid === "number") runtime.pid = p.pid;
+      if (Array.isArray(p.ports)) runtime.ports = p.ports as number[];
+      if (typeof p.logPath === "string") runtime.logPath = p.logPath;
+      next.runtime = runtime;
+      break;
+    }
+
+    case "runtime.started": {
+      const runtime: Runtime = {
+        status: "running",
+        startedAt: typeof p.startedAt === "string" ? p.startedAt : at,
+      };
+      if (typeof p.pid === "number") runtime.pid = p.pid;
+      if (Array.isArray(p.ports)) runtime.ports = p.ports as number[];
+      if (typeof p.logPath === "string") runtime.logPath = p.logPath;
+      next.runtime = runtime;
+      break;
+    }
+
+    case "runtime.failed": {
+      const runtime: Runtime = {
+        status: "failed",
+        startedAt: typeof p.startedAt === "string" ? p.startedAt : at,
+      };
+      if (typeof p.pid === "number") runtime.pid = p.pid;
+      if (Array.isArray(p.ports)) runtime.ports = p.ports as number[];
+      if (typeof p.logPath === "string") runtime.logPath = p.logPath;
+      next.runtime = runtime;
+      break;
+    }
+
+    case "runtime.stopped": {
+      const runtime: Runtime = {
+        status: "stopped",
+        startedAt: typeof p.startedAt === "string" ? p.startedAt : at,
+      };
+      if (Array.isArray(p.ports)) runtime.ports = p.ports as number[];
+      if (typeof p.logPath === "string") runtime.logPath = p.logPath;
+      next.runtime = runtime;
+      break;
+    }
   }
 
   return next;

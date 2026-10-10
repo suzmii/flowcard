@@ -428,6 +428,46 @@ export function runCommand(input: {
       );
       break;
     }
+
+    /**
+     * 运行时状态事件。引擎不管进程（spawn/kill 在适配层）：这里只校验卡片存在、
+     * 把「状态 + 进程身份」原样落成事件，投影后就是卡片上的启动按钮状态。
+     */
+    case "runtime": {
+      const card = get(cmd.card);
+      if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      if (cmd.to === "running" && cmd.pid === undefined) {
+        return fail({ code: "USAGE_ERROR", message: "runtime running 事件必须带 pid" });
+      }
+      const type: EventType =
+        cmd.to === "starting"
+          ? "runtime.starting"
+          : cmd.to === "running"
+            ? "runtime.started"
+            : cmd.to === "failed"
+              ? "runtime.failed"
+              : "runtime.stopped";
+      emit(
+        cmd.card,
+        type,
+        {
+          ...(cmd.pid !== undefined ? { pid: cmd.pid } : {}),
+          ...(cmd.pgid !== undefined ? { pgid: cmd.pgid } : {}),
+          ...(cmd.exitCode !== undefined ? { exitCode: cmd.exitCode } : {}),
+          ...(cmd.signal !== undefined ? { signal: cmd.signal } : {}),
+          ...(cmd.reason !== undefined ? { reason: cmd.reason } : {}),
+          ...(cmd.error !== undefined ? { error: cmd.error } : {}),
+          ...(cmd.startedAt !== undefined ? { startedAt: cmd.startedAt } : {}),
+          ...(cmd.ports !== undefined ? { ports: cmd.ports } : {}),
+          ...(cmd.logPath !== undefined ? { logPath: cmd.logPath } : {}),
+          ...(cmd.procStart !== undefined ? { procStart: cmd.procStart } : {}),
+        },
+        // 同一「次运行」的状态变化用同一把键：重复 down 不会写出第二条 stopped；
+        // 新的 up 带新的 startedAt，键自然不同（不会因为幂等把新事件吃掉）。
+        `runtime:${cmd.card}:${cmd.to}:${cmd.startedAt ?? "-"}:${cmd.pid ?? "-"}`,
+      );
+      break;
+    }
   }
 
   applyPending();

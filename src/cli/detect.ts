@@ -1,69 +1,77 @@
 /**
- * flowcard detect：独立可执行探测入口（M3）。
- *
- *   node src/cli/detect.ts <card> [--port 47825] [--url http://127.0.0.1:47825] [--cwd <路径>]
- *
- * 做三件事：从 cwd 反查 worktree/分支 → 探测 PR/CI 与进度信号 → 把**能拿到的部分**通过
- * `POST /api/commands` 回写卡片（`worktree` / `bindPr` / `probePr`）。stdout 一行 JSON。
+ * flowcard detect：从会话 cwd 反查 worktree/分支，只读探测 PR/CI，并把**能拿到的部分**
+ * 回写到卡片（`worktree` / `bindPr` / `probePr`）。stdout 一行 JSON。
  * 退出码沿用约定：0 成功 / 2 用法错 / 3 状态不允许或服务端拒绝 / 4 缺必要条件 / 5 服务不可达。
  *
- * 不改 `src/cli/main.ts`（那条通道只做"用户命令"）；这里是只读探测 + 回写的独立入口。
+ * 两处入口共用同一实现：
+ *   flowcard detect <card> [--port 47825] [--cwd <路径>]      ← 推荐
+ *   node src/cli/detect.ts <card> […]
+ *
  * 探测失败不会把卡片搞坏：拿不到就不回写，只回写拿得到的那部分。
  */
 import { parseArgs } from "node:util";
 import type { Card, Command } from "../shared/types.ts";
 import { probe, probeCommands, type ProbeCommand } from "../server/probe.ts";
 
-const { values, positionals } = parseArgs({
-  args: process.argv.slice(2),
-  allowPositionals: true,
-  strict: false,
-  options: {
-    port: { type: "string" },
-    url: { type: "string" },
-    cwd: { type: "string" },
-    help: { type: "boolean", short: "h" },
-  },
-});
+const OPTIONS = {
+  port: { type: "string" },
+  url: { type: "string" },
+  cwd: { type: "string" },
+  help: { type: "boolean", short: "h" },
+} as const;
 
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
 
-const baseUrl =
-  str(values.url) ??
-  process.env.FLOWCARD_URL ??
-  `http://127.0.0.1:${str(values.port) ?? process.env.FLOWCARD_PORT ?? "47825"}`;
-
-function say(payload: unknown): void {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-}
-
-/** stdout 一行 JSON + 退出码，与 main.ts 的错误形状保持一致（`ok:false` + `rejection.code`）。 */
-function die(code: number, message: string, extra: Record<string, unknown> = {}): never {
-  say({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra });
-  process.exit(code);
-}
-
-async function post(command: Command): Promise<{ ok: boolean; rejection?: { code: string; message: string }; blocked?: { missing: string[] } }> {
-  const res = await fetch(`${baseUrl}/api/commands`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(command),
+export async function runDetect(argv: string[]): Promise<never> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    strict: false,
+    options: OPTIONS,
   });
-  return (await res.json()) as { ok: boolean; rejection?: { code: string; message: string }; blocked?: { missing: string[] } };
-}
 
-/** 探测计划 → `Command`（actor 用 system：这是机器探测，不是人的命令）。 */
-function toCommand(card: string, plan: ProbeCommand): Command {
-  const actor = { kind: "system" as const };
-  if (plan.cmd === "worktree") return { cmd: "worktree", actor, card, worktree: plan.worktree };
-  if (plan.cmd === "bindPr") return { cmd: "bindPr", actor, card, pr: plan.pr };
-  return { cmd: "probePr", actor, card, pr: plan.pr };
-}
+  const baseUrl =
+    str(values.url) ??
+    process.env.FLOWCARD_URL ??
+    `http://127.0.0.1:${str(values.port) ?? process.env.FLOWCARD_PORT ?? "47825"}`;
 
-async function main(): Promise<void> {
+  const say = (payload: unknown): void => {
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+  };
+
+  /** stdout 一行 JSON + 退出码，与 main.ts 的错误形状保持一致（`ok:false` + `rejection.code`）。
+   *  用函数声明而不是 const 箭头：只有前者能让 TS 在调用后把类型收窄（never 返回）。 */
+  function die(code: number, message: string, extra: Record<string, unknown> = {}): never {
+    say({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra });
+    process.exit(code);
+  }
+
+  const post = async (
+    command: Command,
+  ): Promise<{ ok: boolean; rejection?: { code: string; message: string }; blocked?: { missing: string[] } }> => {
+    const res = await fetch(`${baseUrl}/api/commands`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(command),
+    });
+    return (await res.json()) as {
+      ok: boolean;
+      rejection?: { code: string; message: string };
+      blocked?: { missing: string[] };
+    };
+  };
+
+  /** 探测计划 → `Command`（actor 用 system：这是机器探测，不是人的命令）。 */
+  const toCommand = (card: string, plan: ProbeCommand): Command => {
+    const actor = { kind: "system" as const };
+    if (plan.cmd === "worktree") return { cmd: "worktree", actor, card, worktree: plan.worktree };
+    if (plan.cmd === "bindPr") return { cmd: "bindPr", actor, card, pr: plan.pr };
+    return { cmd: "probePr", actor, card, pr: plan.pr };
+  };
+
   if (values.help === true || positionals.length === 0) {
     say({
-      usage: "node src/cli/detect.ts <card> [--port 47825] [--url <base>] [--cwd <路径>]",
+      usage: "flowcard detect <card> [--port 47825] [--url <base>] [--cwd <路径>]",
       note: "从会话 cwd 反查 worktree/分支并探测 PR/CI，回写卡片；拿不到的信号会明确报告「未探测」。",
     });
     process.exit(values.help === true ? 0 : 2);
@@ -113,7 +121,12 @@ async function main(): Promise<void> {
 
   // 4) 回写拿得到的那部分
   const plan = probeCommands({ worktree: card.worktree ?? null, pr: card.pr ?? null }, result);
-  const applied: Array<{ cmd: string; ok: boolean; rejection?: { code: string; message: string }; blocked?: { missing: string[] } }> = [];
+  const applied: Array<{
+    cmd: string;
+    ok: boolean;
+    rejection?: { code: string; message: string };
+    blocked?: { missing: string[] };
+  }> = [];
   for (const item of plan) {
     applied.push({ cmd: item.cmd, ...(await post(toCommand(cardId, item))) });
   }
@@ -159,4 +172,7 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-await main();
+// 直接执行（`node src/cli/detect.ts …`）时才跑；被 main.ts import 时由那边调 runDetect。
+if (process.argv[1]?.endsWith("detect.ts") === true) {
+  await runDetect(process.argv.slice(2));
+}

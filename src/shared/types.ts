@@ -75,6 +75,7 @@ export type Session = {
 };
 
 export type GateStatus = "open" | "approved" | "rejected";
+
 export type Gate = {
   id: string;
   kind: "approve" | "confirm" | "review" | "cleanup";
@@ -91,6 +92,18 @@ export type PushRecord = { sha: string; at: string; actor: Actor };
 
 export type Comment = { id: string; at: string; actor: Actor; body: string };
 
+/** 卡片自己的项目运行时（启动按钮管的就是它）。进程的 spawn/kill 在适配层，这里只是事件投影。 */
+export type RuntimeStatus = "stopped" | "starting" | "running" | "failed";
+
+export type Runtime = {
+  status: RuntimeStatus;
+  /** 只记 flowcard 自己启动的那个进程组 leader 的 pid */
+  pid?: number;
+  startedAt?: string;
+  ports?: number[];
+  logPath?: string;
+};
+
 /** 卡片投影：issue / pr / worktree 三个槽位永远存在（可为 null），空也要能渲染。 */
 export type Card = {
   id: string;
@@ -102,6 +115,7 @@ export type Card = {
   pr: PrRef | null;
   worktree: WorktreeRef | null;
   session: Session | null;
+  runtime: Runtime | null;
   gates: Record<string, Gate>;
   pushes: PushRecord[];
   comments: Comment[];
@@ -136,6 +150,10 @@ export type EventType =
   | "session.heartbeat"
   | "session.ended"
   | "session.cwd.mismatch"
+  | "runtime.starting"
+  | "runtime.started"
+  | "runtime.failed"
+  | "runtime.stopped"
   | "git.probed";
 
 export type Event = {
@@ -343,6 +361,33 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     body: z.string().default(""),
     dedupeKey: z.string().optional(),
   }),
+  /**
+   * 运行时状态事件：进程本身由适配层（src/server/runtime.ts）管，引擎只把状态写进事件流。
+   * 启动按钮的 POST /api/cards/:id/runtime 最终就是落成这条命令。
+   */
+  z.object({
+    cmd: z.literal("runtime"),
+    actor: actorSchema,
+    card: z.string().min(1),
+    to: z.enum(["starting", "running", "failed", "stopped"]),
+    pid: z.number().int().positive().optional(),
+    pgid: z.number().int().positive().optional(),
+    exitCode: z.number().int().optional(),
+    signal: z.string().min(1).optional(),
+    reason: z.string().min(1).optional(),
+    error: z.string().min(1).optional(),
+    startedAt: z.string().min(1).optional(),
+    ports: z.array(z.number().int().positive()).optional(),
+    logPath: z.string().min(1).optional(),
+    /** 进程启动时刻（/proc/<pid>/stat 第 22 字段），重启后用它判断 pid 是否被复用 */
+    procStart: z.string().min(1).optional(),
+    dedupeKey: z.string().optional(),
+  }),
 ]);
 
 export type Command = z.infer<typeof commandSchema>;
+
+/** POST /api/cards/:id/runtime 的 body。 */
+export const runtimeActionSchema = z.object({ action: z.enum(["up", "down"]) });
+
+export type RuntimeAction = z.infer<typeof runtimeActionSchema>["action"];
