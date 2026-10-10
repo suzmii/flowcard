@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { createHarness, issueRef, prRef, worktreeRef } from "./harness.ts";
+import type { Project } from "../src/shared/types.ts";
 
 const INSIDE = `${worktreeRef.path}/packages/app`;
 const OUTSIDE = "/home/u/workspace/proj";
+
+/** 带 Issue 基址的项目（模拟 `project add` 按 remote 派生后的结果）。 */
+const PROJECT: Project = {
+  id: "proj-0001",
+  name: "proj",
+  path: "/tmp/fc-issue-proj",
+  issueRepo: "git/owner/repo",
+  issueUrlTemplate: "https://gitea.example.com/git/owner/repo/issues/{number}",
+  addedAt: "2026-10-10T00:00:00.000Z",
+  lastSeenAt: "2026-10-10T00:00:00.000Z",
+};
 
 describe("流程硬门禁", () => {
   it("无 Issue 时不许批准方案（G1 缺项被拦）", () => {
@@ -365,7 +377,7 @@ describe("首页那一步：确认要做 / 放弃", () => {
     const id = h.run({ cmd: "open", actor: h.human, title: "从看板记的需求", body: "" }).primaryCardId;
     expect(h.card(id).state).toBe("inbox");
 
-    h.run({ cmd: "bindIssue", actor: h.human, card: id, issue: issueRef });
+    h.run({ cmd: "bindIssue", actor: h.human, card: id, number: issueRef.number, repo: issueRef.repo, url: issueRef.url });
     expect(h.card(id).state).toBe("issue");
   });
 
@@ -501,5 +513,135 @@ describe("阻塞与投影一致性", () => {
     h.run({ cmd: "comment", actor: h.agent, card: id, body: "一条评论" });
 
     expect(h.rebuild(id)).toEqual(h.card(id));
+  });
+});
+
+describe("Issue 基址：绑 Issue 只填编号", () => {
+  it("bindIssue 只给 number：按项目基址补 repo/url，rebuild 一致，重发幂等", () => {
+    const h = createHarness({ projects: [PROJECT] });
+    const id = h.run({
+      cmd: "open",
+      actor: h.human,
+      title: "卡片",
+      body: "",
+      projectId: PROJECT.id,
+    }).primaryCardId;
+
+    const out = h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 742 });
+    expect(out.rejection).toBeUndefined();
+    expect(h.card(id).issue).toEqual({
+      repo: "git/owner/repo",
+      number: 742,
+      url: "https://gitea.example.com/git/owner/repo/issues/742",
+      state: "open",
+    });
+    // 绑 Issue 就是立项（自动节点照旧生效）
+    expect(h.card(id).state).toBe("issue");
+    // 事件里存的是补齐后的完整 IssueRef → 从零重放得到同一张卡
+    expect(h.rebuild(id).issue).toEqual(h.card(id).issue);
+    expect(h.rebuild(id).state).toBe("issue");
+
+    const again = h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 742 });
+    expect(again.events).toHaveLength(0);
+    expect(again.notes.join(" ")).toContain("跳过");
+  });
+
+  it("项目没有基址、也没给 url → USAGE_ERROR，hint 说清两条出路，且什么都不写", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "卡片", body: "" }).primaryCardId;
+
+    const out = h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 742 });
+    expect(out.rejection?.code).toBe("USAGE_ERROR");
+    expect(out.rejection?.message).toContain("742");
+    expect(out.rejection?.hint).toContain("issue-base");
+    expect(out.rejection?.hint).toContain("--url");
+    expect(out.events).toHaveLength(0);
+    expect(h.card(id).issue).toBeNull();
+  });
+
+  it("显式 repo / url 优先于项目基址（各覆盖各的）", () => {
+    const h = createHarness({ projects: [PROJECT] });
+    const id = h.run({
+      cmd: "open",
+      actor: h.human,
+      title: "卡片",
+      body: "",
+      projectId: PROJECT.id,
+    }).primaryCardId;
+
+    // 只覆盖 url：repo 仍从项目补
+    h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 7, url: "https://elsewhere/issues/7" });
+    expect(h.card(id).issue).toEqual({
+      repo: "git/owner/repo",
+      number: 7,
+      url: "https://elsewhere/issues/7",
+      state: "open",
+    });
+
+    // 两个都覆盖
+    h.run({ cmd: "bindIssue", actor: h.human, card: id, number: 8, repo: "me/mine", url: "https://x/8" });
+    expect(h.card(id).issue).toEqual({ repo: "me/mine", number: 8, url: "https://x/8", state: "open" });
+  });
+
+  it("open --issue 742 走同一套补齐规则（只给编号也行）", () => {
+    const h = createHarness({ projects: [PROJECT] });
+    const id = h.run({
+      cmd: "open",
+      actor: h.human,
+      title: "带 issue 开卡",
+      body: "",
+      projectId: PROJECT.id,
+      issue: { number: 742, state: "open" },
+    }).primaryCardId;
+    expect(h.card(id).issue?.url).toBe(
+      "https://gitea.example.com/git/owner/repo/issues/742",
+    );
+    expect(h.card(id).state).toBe("issue");
+    expect(h.rebuild(id).issue).toEqual(h.card(id).issue);
+
+    // 开卡时显式 url 覆盖模板
+    const other = h.run({
+      cmd: "open",
+      actor: h.human,
+      title: "显式 url",
+      body: "",
+      projectId: PROJECT.id,
+      issue: { number: 9, url: "https://x/9", state: "open" },
+    }).primaryCardId;
+    expect(h.card(other).issue).toEqual({
+      repo: "git/owner/repo",
+      number: 9,
+      url: "https://x/9",
+      state: "open",
+    });
+  });
+
+  it("open 只给编号但项目没基址 → USAGE_ERROR（卡都不开）", () => {
+    const h = createHarness();
+    const out = h.run({
+      cmd: "open",
+      actor: h.human,
+      title: "x",
+      body: "",
+      issue: { number: 1, state: "open" },
+    });
+    expect(out.rejection?.code).toBe("USAGE_ERROR");
+    expect(out.events).toHaveLength(0);
+    expect(h.cards.size).toBe(0);
+  });
+
+  it("显式给全三样时照旧（不查项目也能绑）", () => {
+    const h = createHarness();
+    const id = h.run({ cmd: "open", actor: h.human, title: "卡片", body: "" }).primaryCardId;
+    const out = h.run({
+      cmd: "bindIssue",
+      actor: h.human,
+      card: id,
+      number: issueRef.number,
+      repo: issueRef.repo,
+      url: issueRef.url,
+    });
+    expect(out.rejection).toBeUndefined();
+    expect(h.card(id).issue?.url).toBe(issueRef.url);
   });
 });

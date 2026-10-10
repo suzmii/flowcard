@@ -56,7 +56,9 @@ function driveToReview(store: Store, pushShas: string[] = ["A"]): string {
     cmd: "bindIssue",
     actor: HUMAN,
     card: id,
-    issue: { repo: "r", number: 1, url: "http://i/1", state: "open" },
+    number: 1,
+    repo: "r",
+    url: "http://i/1",
   });
   run(step++, { cmd: "plan", actor: HUMAN, card: id, body: "方案" });
   run(step++, { cmd: "decideGate", actor: HUMAN, card: id, gate: "G1", decision: "approved" });

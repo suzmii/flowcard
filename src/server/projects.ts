@@ -14,6 +14,7 @@ import { normalizePath } from "../shared/paths.ts";
 import {
   LOCAL_PROJECT_ID,
   LOCAL_PROJECT_NAME,
+  type IssueBase,
   type Project,
 } from "../shared/types.ts";
 import { defaultRun, firstLine, GIT_TIMEOUT_MS, type Run } from "./probe.ts";
@@ -54,6 +55,54 @@ export function localProject(addedAt: string): Project {
     virtual: true,
     addedAt,
     lastSeenAt: addedAt,
+  };
+}
+
+/**
+ * 从 git remote 派生 Issue 基址（纯函数，认不出就两条都空 —— **不瞎猜**）。
+ *
+ * 认得的形态（`.git` 后缀与结尾斜杠都去掉后，整段 path 保留，Gitea 的 `/git/Owner/Repo` 也照样）：
+ *   `git@host:owner/repo(.git)`              → scheme 取 `https`（scp 形态没有 scheme）
+ *   `ssh://git@host[:port]/owner/repo(.git)` → scheme 取 `ssh`，端口带上
+ *   `https?://host[:port]/owner/repo(.git)`  → scheme 原样（http 保持 http，本地 Gitea 常见）
+ *
+ * `issueUrlTemplate` 里 `{number}` 占位，绑 Issue 时换成编号。`file://`、本地路径、
+ * 只有一段的 path（`git@host:repo.git`）、Windows 盘符（`C:\…`）都算认不出。
+ */
+export function deriveIssueBase(remote: string | undefined): IssueBase {
+  const raw = remote?.trim() ?? "";
+  if (raw === "") return {};
+
+  let scheme: string;
+  let host: string;
+  let port: string;
+  let path: string;
+
+  const url = /^(https?|ssh):\/\/(?:[^@/]+@)?([^/:]+)(?::(\d+))?\/(.+)$/.exec(raw);
+  if (url) {
+    scheme = url[1]!;
+    host = url[2]!;
+    port = url[3] ?? "";
+    path = url[4]!;
+  } else if (!raw.includes("://")) {
+    const scp = /^(?:[^@/]+@)?([^/:]+):(.+)$/.exec(raw);
+    // 单字母 host 基本是 Windows 盘符（`C:\repo`），不是主机名
+    if (!scp || /^[A-Za-z]$/.test(scp[1]!)) return {};
+    scheme = "https";
+    host = scp[1]!;
+    port = "";
+    path = scp[2]!;
+  } else {
+    // 其它 scheme（`file://`、`git://`…）：不知道 web 基址长什么样，不猜
+    return {};
+  }
+
+  const repoPath = path.replace(/\/+$/, "").replace(/\.git$/, "");
+  // 至少要有 `owner/repo` 两段；只有一段说明不是 forge 的路径约定
+  if (!repoPath.includes("/")) return {};
+  return {
+    issueRepo: repoPath,
+    issueUrlTemplate: `${scheme}://${host}${port === "" ? "" : `:${port}`}/${repoPath}/issues/{number}`,
   };
 }
 
@@ -116,6 +165,7 @@ export async function readProject(
   }
 
   const lastCommit = lastCommitOf(logR.stdout);
+  const issueBase = deriveIssueBase(remote);
 
   const project: Project = {
     id: projectIdFor(root),
@@ -125,6 +175,9 @@ export async function readProject(
     ...(headBranch !== "" && headBranch !== "HEAD" ? { headBranch } : {}),
     ...(defaultBranch !== "" && defaultBranch !== "HEAD" ? { defaultBranch } : {}),
     ...(lastCommit ? { lastCommit } : {}),
+    // Issue 基址按 remote 派生：绑 Issue 只填编号，repo/url 从这里补。
+    ...(issueBase.issueRepo ? { issueRepo: issueBase.issueRepo } : {}),
+    ...(issueBase.issueUrlTemplate ? { issueUrlTemplate: issueBase.issueUrlTemplate } : {}),
     // 脏文件数 = git status --porcelain 的行数；干净时输出为空串（不是一行空行），所以单独判。
     ...(statusR.code === 0
       ? { dirtyFiles: statusR.stdout === "" ? 0 : statusR.stdout.replace(/\n+$/, "").split("\n").length }

@@ -83,11 +83,22 @@ export type Project = {
   lastCommit?: { sha: string; subject: string; at: string };
   /** `git status --porcelain` 行数（脏文件数） */
   dirtyFiles?: number;
+  /**
+   * Issue 基址：绑 Issue 时只给编号，`repo`/`url` 从这里补齐（省得每张卡手填三样）。
+   * 添加项目时按 `remote` 派生（`server/projects.ts` 的 `deriveIssueBase`），也允许显式覆盖；
+   * 认不出 remote 就缺省（此时绑 Issue 必须显式给 `--url`，或先 `flowcard project issue-base`）。
+   */
+  issueRepo?: string;
+  /** 形如 `https://host/owner/repo/issues/{number}`；`{number}` 换成 Issue 编号 */
+  issueUrlTemplate?: string;
   /** 仅本地存在的合成项目（只有 `local`） */
   virtual?: boolean;
   addedAt: string;
   lastSeenAt: string;
 };
+
+/** 从 remote 派生的 Issue 基址；两条都不给 = 认不出 remote（不瞎猜）。 */
+export type IssueBase = { issueRepo?: string; issueUrlTemplate?: string };
 
 /** 合成项目 id：没归属的卡片都落在这里。 */
 export const LOCAL_PROJECT_ID = "local";
@@ -327,10 +338,14 @@ export const sessionInSchema = z.object({
   resumeHint: z.string().min(1).optional(),
 });
 
+/**
+ * Issue 输入：**编号是唯一必填的**，`repo`/`url` 缺省时由卡片所属项目的 Issue 基址补齐
+ * （见 `server/engine.ts` 的 `resolveIssueRef`）。HTTP 客户端仍可像以前那样三样都给。
+ */
 export const issueInSchema = z.object({
-  repo: z.string().min(1),
   number: z.number().int().positive(),
-  url: z.string().min(1),
+  repo: z.string().min(1).optional(),
+  url: z.string().min(1).optional(),
   title: z.string().optional(),
   state: z.enum(["open", "closed"]).default("open"),
 });
@@ -371,7 +386,11 @@ export const commandSchema = z.discriminatedUnion("cmd", [
     cmd: z.literal("bindIssue"),
     actor: actorSchema,
     card: z.string().min(1),
-    issue: issueInSchema,
+    /** 只给编号就行：`repo`/`url` 缺省时用卡片所属项目的 Issue 基址补齐。 */
+    number: z.number().int().positive(),
+    repo: z.string().min(1).optional(),
+    url: z.string().min(1).optional(),
+    title: z.string().optional(),
     dedupeKey: z.string().optional(),
   }),
   z.object({
@@ -611,8 +630,23 @@ export type RuntimeAction = z.infer<typeof runtimeActionSchema>["action"];
 /**
  * POST /api/projects 的 body：登记一个仓库当项目。
  * 路径可以是仓库内的任意子目录 —— `git rev-parse --show-toplevel` 自己找到根。
+ * `issueRepo` / `issueUrlTemplate` **不传就按 remote 派生**（`deriveIssueBase`），传了就覆盖。
  */
-export const projectInSchema = z.object({ path: z.string().trim().min(1, "path 不能为空") });
+export const projectInSchema = z.object({
+  path: z.string().trim().min(1, "path 不能为空"),
+  issueRepo: z.string().trim().min(1).optional(),
+  issueUrlTemplate: z.string().trim().min(1).optional(),
+});
+
+/**
+ * POST /api/projects/:id/issue-base 的 body：改一个项目的 Issue 基址。
+ * `clear: true` 清掉两条（此时忽略给出的值）；不然只更新传了的那些，没传的保持不动。
+ */
+export const issueBaseInSchema = z.object({
+  issueRepo: z.string().trim().min(1).optional(),
+  issueUrlTemplate: z.string().trim().min(1).optional(),
+  clear: z.boolean().optional(),
+});
 
 // ---------------------------------------------------------------- 只读视图：提交图 / diff
 

@@ -14,7 +14,8 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { personalFlow } from "../src/flow/personal.ts";
 import { DERIVED_TITLE_MAX, UNTITLED, deriveTitle } from "../src/server/engine.ts";
-import { projectIdFor, readProject } from "../src/server/projects.ts";
+import { deriveIssueBase, projectIdFor, readProject } from "../src/server/projects.ts";
+import { createApp } from "../src/server/app.ts";
 import { createStore, type Store } from "../src/server/store.ts";
 import { resolveUserPath } from "../src/shared/paths.ts";
 import { LOCAL_PROJECT_ID, type Command } from "../src/shared/types.ts";
@@ -316,5 +317,103 @@ describe("自动标题（服务端派生）", () => {
 
     const emoji = `${"🙂".repeat(DERIVED_TITLE_MAX)}🙂`;
     expect(deriveTitle(emoji)).toBe(`${"🙂".repeat(DERIVED_TITLE_MAX)}…`);
+  });
+});
+
+describe("deriveIssueBase 从 remote 派生 Issue 基址", () => {
+  it("scp 形态（git@host:path）→ scheme 取 https，.git 去掉、多段 path 保留", () => {
+    expect(deriveIssueBase("git@gitea.example.com:git/owner/repo.git")).toEqual({
+      issueRepo: "git/owner/repo",
+      issueUrlTemplate: "https://gitea.example.com/git/owner/repo/issues/{number}",
+    });
+    expect(deriveIssueBase("git@github.com:owner/repo")).toEqual({
+      issueRepo: "owner/repo",
+      issueUrlTemplate: "https://github.com/owner/repo/issues/{number}",
+    });
+  });
+
+  it("ssh:// 形态：scheme 原样，端口带上", () => {
+    expect(deriveIssueBase("ssh://git@example.com/owner/repo.git")).toEqual({
+      issueRepo: "owner/repo",
+      issueUrlTemplate: "ssh://example.com/owner/repo/issues/{number}",
+    });
+    expect(deriveIssueBase("ssh://git@example.com:2222/o/r.git")).toEqual({
+      issueRepo: "o/r",
+      issueUrlTemplate: "ssh://example.com:2222/o/r/issues/{number}",
+    });
+  });
+
+  it("http(s):// 形态：scheme 原样（http 保持 http）、结尾斜杠去掉、Gitea 多段路径整段保留", () => {
+    expect(deriveIssueBase("https://gitea.example.com/git/owner/repo")).toEqual({
+      issueRepo: "git/owner/repo",
+      issueUrlTemplate: "https://gitea.example.com/git/owner/repo/issues/{number}",
+    });
+    expect(deriveIssueBase("http://localhost:3000/o/r.git/")).toEqual({
+      issueRepo: "o/r",
+      issueUrlTemplate: "http://localhost:3000/o/r/issues/{number}",
+    });
+  });
+
+  it("认不出就两条都空（不瞎猜）", () => {
+    expect(deriveIssueBase(undefined)).toEqual({});
+    expect(deriveIssueBase("")).toEqual({});
+    expect(deriveIssueBase("   ")).toEqual({});
+    expect(deriveIssueBase("/home/u/repo.git")).toEqual({});
+    expect(deriveIssueBase("file:///srv/git/r.git")).toEqual({});
+    expect(deriveIssueBase("git://host/o/r.git")).toEqual({});
+    expect(deriveIssueBase("git@host:repo.git")).toEqual({}); // 只有一段 path
+    expect(deriveIssueBase("C:\\work\\repo.git")).toEqual({}); // Windows 盘符不是主机
+  });
+});
+
+describe("项目带 Issue 基址", () => {
+  it("readProject 按 remote 派生；没有 remote 就不给（不瞎猜）", async () => {
+    const withRemote = await readProject(
+      makeRepo("issuebase", { remote: "git@git.example.com:team/issuebase.git" }).root,
+    );
+    expect(withRemote.ok).toBe(true);
+    if (!withRemote.ok) return;
+    expect(withRemote.project.issueRepo).toBe("team/issuebase");
+    expect(withRemote.project.issueUrlTemplate).toBe(
+      "https://git.example.com/team/issuebase/issues/{number}",
+    );
+
+    const without = await readProject(makeRepo("issuebase-none").root);
+    expect(without.ok).toBe(true);
+    if (!without.ok) return;
+    expect(without.project.issueRepo).toBeUndefined();
+    expect(without.project.issueUrlTemplate).toBeUndefined();
+  });
+
+  it("登记时落库（JSON 里带字段）；POST /api/projects 不传按 remote 派生、传了就覆盖", async () => {
+    const { store } = freshStore();
+    const repo = makeRepo("override", { remote: "https://git.example.com/team/override.git" });
+    const app = createApp(store);
+    const postProject = async (body: unknown): Promise<{ issueRepo?: string; issueUrlTemplate?: string }> => {
+      const res = await app.request("/api/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as { project: { issueRepo?: string; issueUrlTemplate?: string } };
+      return data.project;
+    };
+
+    const derived = await postProject({ path: repo.root });
+    expect(derived.issueRepo).toBe("team/override");
+    expect(derived.issueUrlTemplate).toBe("https://git.example.com/team/override/issues/{number}");
+    expect(store.projectForPath(repo.root)?.issueRepo).toBe("team/override");
+
+    const overridden = await postProject({
+      path: repo.root,
+      issueRepo: "me/mine",
+      issueUrlTemplate: "https://my.host/me/mine/issues/{number}",
+    });
+    expect(overridden.issueRepo).toBe("me/mine");
+    expect(overridden.issueUrlTemplate).toBe("https://my.host/me/mine/issues/{number}");
+    // 覆盖不产生第二个项目
+    expect(store.listProjects().filter((p) => !p.virtual)).toHaveLength(1);
+    store.close();
   });
 });

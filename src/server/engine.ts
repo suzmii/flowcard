@@ -9,7 +9,7 @@
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
 import { shortHash } from "../shared/hash.ts";
-import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type Project, type Rejection } from "../shared/types.ts";
+import { LOCAL_PROJECT_ID, type Card, type Command, type CwdClaimResolution, type EventType, type IssueRef, type Project, type Rejection } from "../shared/types.ts";
 import { applyEvent, emptyCard, type NewEvent } from "./project.ts";
 import { reviewAnchor } from "./review.ts";
 
@@ -62,6 +62,56 @@ export function deriveTitle(body: string): string {
 
 /** 带 card 的命令的卡片 id；claim 允许不写（由 cwd 解析），所以是 string | undefined。 */
 const cardIdOf = (cmd: Command): string | undefined => ("card" in cmd ? cmd.card : undefined);
+
+/**
+ * 绑 Issue 的补齐：**编号是命令给的，`repo`/`url` 缺省时用卡片所属项目的 Issue 基址补**。
+ *
+ * 纯函数（项目由调用方传进来，引擎不碰 IO）。项目没基址、调用方也没给 → `USAGE_ERROR`，
+ * 并把两条出路写进 hint：给项目配基址（`flowcard project issue-base`），或这次显式给 `--url`。
+ */
+export function resolveIssueRef(
+  input: {
+    number: number;
+    repo?: string | undefined;
+    url?: string | undefined;
+    title?: string | undefined;
+    state: "open" | "closed";
+  },
+  project: Project | undefined,
+): { ok: true; issue: IssueRef } | { ok: false; rejection: Rejection } {
+  const repo = input.repo ?? project?.issueRepo;
+  const url =
+    input.url ??
+    (project?.issueUrlTemplate
+      ? project.issueUrlTemplate.replaceAll("{number}", String(input.number))
+      : undefined);
+
+  if (repo && url) {
+    return {
+      ok: true,
+      issue: {
+        repo,
+        number: input.number,
+        url,
+        ...(input.title ? { title: input.title } : {}),
+        state: input.state,
+      },
+    };
+  }
+
+  const missing = [...(repo ? [] : ["repo"]), ...(url ? [] : ["url"])];
+  const projectId = project?.id ?? LOCAL_PROJECT_ID;
+  return {
+    ok: false,
+    rejection: {
+      code: "USAGE_ERROR",
+      message: `Issue 只给了编号 ${input.number}，却补不出 ${missing.join(" 与 ")}（项目 ${projectId} 没有 Issue 基址）`,
+      hint:
+        `给 flowcard project issue-base ${projectId} --repo <owner/repo> --template "https://<host>/<owner/repo>/issues/{number}"，` +
+        `或这次显式 --repo <owner/repo> --url <链接>`,
+    },
+  };
+}
 
 export function runCommand(input: {
   flow: Flow;
@@ -162,6 +212,10 @@ export function runCommand(input: {
       const givenTitle = cmd.title?.trim() ?? "";
       const title = givenTitle === "" ? deriveTitle(cmd.body) : givenTitle;
       const repoPath = project && !project.virtual ? project.path : undefined;
+      // 开卡就带 Issue：同样只要求编号，repo/url 由项目的基址补齐。
+      const issue = cmd.issue ? resolveIssueRef(cmd.issue, project) : undefined;
+      if (issue && !issue.ok) return fail(issue.rejection);
+      const resolved = issue?.ok ? issue.issue : undefined;
       // 幂等键不掺 id（id 每次分配都会变），否则重试会写出一张重复卡片；
       // 内容相同的 open 视为同一次请求，要开两张一样的卡请显式给 --dedupe-key。
       const fingerprint = shortHash(`${title}\n${cmd.body}\n${projectId}`);
@@ -174,16 +228,16 @@ export function runCommand(input: {
           projectId,
           ...(repoPath ? { repoPath } : {}),
           ...(cmd.partOf ? { partOf: cmd.partOf } : {}),
-          ...(cmd.issue ? { issue: cmd.issue } : {}),
+          ...(resolved ? { issue: resolved } : {}),
         },
         `open:${fingerprint}`,
       );
-      if (cmd.issue) {
+      if (resolved) {
         emit(
           id,
           "issue.bound",
-          { issue: cmd.issue },
-          `issue:${cmd.issue.repo}#${cmd.issue.number}:${fingerprint}`,
+          { issue: resolved },
+          `issue:${resolved.repo}#${resolved.number}:${fingerprint}`,
         );
       }
       break;
@@ -192,8 +246,13 @@ export function runCommand(input: {
     case "bindIssue": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      const sameIssue =
-        card.issue?.repo === cmd.issue.repo && card.issue?.number === cmd.issue.number;
+      const built = resolveIssueRef(
+        { number: cmd.number, repo: cmd.repo, url: cmd.url, title: cmd.title, state: "open" },
+        input.getProject?.(card.projectId),
+      );
+      if (!built.ok) return fail(built.rejection);
+      const issue = built.issue;
+      const sameIssue = card.issue?.repo === issue.repo && card.issue?.number === issue.number;
       if (sameIssue) {
         notes.push("Issue 已经是该值，跳过");
         break;
@@ -201,8 +260,8 @@ export function runCommand(input: {
       emit(
         cmd.card,
         "issue.bound",
-        { issue: cmd.issue },
-        `issue:${cmd.card}:${cmd.issue.repo}#${cmd.issue.number}:from:${card.issue ? `${card.issue.repo}#${card.issue.number}` : "-"}`,
+        { issue },
+        `issue:${cmd.card}:${issue.repo}#${issue.number}:from:${card.issue ? `${card.issue.repo}#${card.issue.number}` : "-"}`,
       );
       break;
     }

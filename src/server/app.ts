@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { streamSSE } from "hono/streaming";
-import { commandSchema, projectInSchema, runtimeActionSchema } from "../shared/types.ts";
+import { commandSchema, issueBaseInSchema, projectInSchema, runtimeActionSchema } from "../shared/types.ts";
+import type { Project } from "../shared/types.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
 import { readProject } from "./projects.ts";
@@ -198,9 +199,66 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     }
     const read = await readProject(resolveUserPath(parsed.data.path));
     if (!read.ok) return c.json({ error: read.error }, 400);
-    const { project, created } = store.upsertProject(read.project);
+    // 基址默认按 remote 派生；body 里给了就用给的（显式覆盖）。
+    const { project, created } = store.upsertProject({
+      ...read.project,
+      ...(parsed.data.issueRepo ? { issueRepo: parsed.data.issueRepo } : {}),
+      ...(parsed.data.issueUrlTemplate ? { issueUrlTemplate: parsed.data.issueUrlTemplate } : {}),
+    });
     broadcast("projects", { project, created });
     return c.json({ project, created });
+  });
+
+  /**
+   * 改一个项目的 Issue 基址（绑 Issue 时只填编号，`repo`/`url` 从这里补）。
+   * 不传的字段保持不动；`clear:true` 把两条都清掉。
+   */
+  app.post("/api/projects/:id/issue-base", async (c) => {
+    const id = c.req.param("id");
+    const project = store.getProject(id);
+    if (!project) {
+      return c.json(
+        {
+          error: {
+            code: "NOT_FOUND",
+            message: `项目 ${id} 不存在`,
+            hint: "flowcard project list 看现有项目；也可以直接给路径：flowcard project issue-base <路径>",
+          },
+        },
+        404,
+      );
+    }
+
+    const body = await c.req.json().catch(() => null);
+    const parsed = issueBaseInSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            code: "USAGE_ERROR",
+            message: parsed.error.issues
+              .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+              .join("; "),
+            hint: 'flowcard project issue-base <项目> --repo <owner/repo> --template "…{number}"（或 --clear）',
+          },
+        },
+        400,
+      );
+    }
+
+    const next: Project = { ...project };
+    if (parsed.data.clear === true) {
+      delete next.issueRepo;
+      delete next.issueUrlTemplate;
+    } else {
+      if (parsed.data.issueRepo !== undefined) next.issueRepo = parsed.data.issueRepo;
+      if (parsed.data.issueUrlTemplate !== undefined) {
+        next.issueUrlTemplate = parsed.data.issueUrlTemplate;
+      }
+    }
+    const saved = store.upsertProject(next).project;
+    broadcast("projects", { project: saved, created: false });
+    return c.json({ project: saved });
   });
 
   /** 按路径解析当前项目（CLI / 看板进来时用）：路径可以是仓库内任意目录；不在任何项目里则 404。 */

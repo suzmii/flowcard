@@ -29,6 +29,7 @@ flowchart LR
 ```
 
 - **Issue 是外部实体**（仓库里的 issue），卡片只持弱引用 `{repo, number, url, title, state}`。
+- **绑 Issue 只填数字**：`repo` / `url` 由项目的 Issue 基址（`Project.issueRepo` / `issueUrlTemplate`，默认按 git remote 派生）补齐；项目没基址时展开「高级」手填 url，或去项目面板配模板。
 - **一个 Issue 可以对应 N 张卡片**：大需求分多个 PR，每张卡一片、一个会话、一个 PR。
 - **Card : Session : Worktree : PR 都是 1:1**。
 - **Issue 与 PR 两个槽位永远存在**：没绑定就是 `null`，但**必须渲染出来**（"未绑定" + 可执行的动作），不允许隐藏。
@@ -89,11 +90,15 @@ type Project = {
   defaultBranch?: string;  // origin/HEAD 指向的分支；拿不到就回退到存在的 main / master
   lastCommit?: { sha: string; subject: string; at: string };
   dirtyFiles?: number;     // git status --porcelain 的行数
+  issueRepo?: string;         // Issue 基址：绑 Issue 只填编号，repo/url 从这里补（按 remote 派生，可显式覆盖）
+  issueUrlTemplate?: string;  // 形如 https://host/owner/repo/issues/{number}；{number} 换成编号
   virtual?: boolean;       // 仅本地存在的合成项目（只有 id="local"、name="未归属"）
   addedAt: string; lastSeenAt: string;
 };
 ```
 
+- **Issue 基址由项目派生**（`server/projects.ts` 的 `deriveIssueBase`，纯函数）：登记项目时从 `remote` 算出 `issueRepo`（去掉 `.git` 的整段 path）与 `issueUrlTemplate`（`<scheme>://<host>[:port]/<path>/issues/{number}`）。认得的形态：`git@host:owner/repo(.git)`（scheme 取 `https`）、`ssh://git@host[:port]/owner/repo(.git)`、`https?://host[:port]/owner/repo(.git)`；Gitea 的多段路径（`/git/Owner/Repo`）整段保留。**认不出（`file://`、本地路径、只有一段 path、盘符）就两条都空 —— 不瞎猜**，此时绑 Issue 必须显式给 `--url`，或用 `flowcard project issue-base` 配一次。
+- 于是**绑 Issue 只填编号**：`bindIssue` / `open --issue` 缺 `repo`/`url` 时用卡片所属项目的基址补齐（引擎纯函数，项目由 store 注入），存的仍是完整的 `IssueRef`（六格必要项不变）。项目没基址又没显式给 → `USAGE_ERROR`，hint 指明两条出路（配基址 / 这次显式给）。基址是**项目元数据**（不进事件流），所以改基址不影响已绑的 Issue，也不会让 rebuild 结果漂。
 - **`local` 是必有的合成项目**（`virtual:true`、`path:""`）：所有没归属的卡片、以及**升级前的老卡片**都落在这里，看板上一样能看见。所以 `Card.projectId` 必填（缺省就是 `local`）。
 - `repoPath` 仍留在卡片上，但**由 `projectId` 解析出来**（引擎在建卡时把 `project.path` 写进事件），客户端不再传。运行时/探测继续读 `card.repoPath`，不用改。
 - **项目用单独的表，不进事件流**：它是"环境元数据"（仓库现在长这样），刷新它不该在看板历史里堆噪声，也没有"谁在什么时候做了什么"要重放。而**卡片归属（`Card.projectId`）走事件**——那是业务事实，必须能重放。投影版本因此 +1（v3），启动时自动 rebuild 一次，老卡片补成 `local`。
@@ -120,6 +125,8 @@ type Project = {
 | 4 | **推送记录** | 至少一条 push 事件（每天可见进度） | 远程写 → 需确认 |
 | 5 | **验收** | `acceptedAt != null`（人明确验收） | 人工门禁 |
 | 6 | **清理** | 合并后按报告清单拆掉现场 | 人工门禁（报告 → 同意 → 执行） |
+
+**绑 Issue 只填编号**：`repo`/`url` 由卡片所属项目的 **Issue 基址**（`issueRepo` / `issueUrlTemplate`，登记项目时按 remote 派生，§2.1）补齐；项目没基址就用 `flowcard project issue-base` 配一次，或这次显式给 `--repo` / `--url`。
 
 硬约束（引擎拦截，不是提醒）：
 
@@ -305,7 +312,8 @@ export default defineFlow({
 | POST | `/api/events` | 批量 append，幂等靠 `dedupeKey` |
 | GET | `/api/cards` `/api/cards/:id` | 投影读（卡片恒含 issue/pr/worktree 三槽位） |
 | GET | `/api/projects` | 看板 Metadata：全部项目（**恒含合成项目 `local`**） |
-| POST | `/api/projects` | `{path}` → 读 git 元数据登记；同 path 幂等（`created:false` 并刷新元数据） |
+| POST | `/api/projects` | `{path}`（可选 `issueRepo` / `issueUrlTemplate` 覆盖派生值）→ 读 git 元数据登记；同 path 幂等（`created:false` 并刷新元数据） |
+| POST | `/api/projects/:id/issue-base` | 改项目的 Issue 基址：`{issueRepo?, issueUrlTemplate?, clear?}` → `{project}`；不传的字段保持不动，`clear:true` 清空 |
 | GET | `/api/project/current?path=…` | 按路径解析所属项目（给 CLI/看板进来时用）；不在任何项目里 → 404 |
 | POST | `/api/attachments?name=…` | body = 图片原始字节（**不解析 JSON**）→ `{id,url,markdown,bytes,mime}` |
 | GET | `/api/attachments/:id` | 回原始字节 + 正确 `Content-Type` + 长缓存（内容寻址，可 immutable） |
@@ -324,9 +332,10 @@ export default defineFlow({
 flowcard project add <仓库路径>                             # 登记项目（可给仓库内任意子目录，git 自己找根）
 flowcard project list                                     # 全部项目（含「未归属」）
 flowcard project current [--path <路径>]                  # 当前目录属于哪个项目（默认 cwd；解析不到退出码 3）
-flowcard open   [--title "…"] [--body …] [--project <id>]  # 开卡（inbox）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local
+flowcard project issue-base <项目 id 或路径> [--repo <owner/repo>] [--template "…{number}"] [--clear]  # 改项目的 Issue 基址（绑 Issue 只填编号）
+flowcard open   [--title "…"] [--body …] [--project <id>] [--issue 742 | --issue <owner/repo>#742] [--url <链接>]  # 开卡（inbox）；标题可选（服务端按正文派生），项目不给就按 cwd 解析、解析不到用 local
 flowcard attach <图片> [--name <文件名>]                    # 传图（png/jpg/jpeg/gif/webp ≤10MB），打印 markdown 直接贴进正文/评论
-flowcard issue  <card> --create | --bind <repo>#<n>      # 建或绑定 Issue（→ issue 列）
+flowcard issue  <card> --number 742 [--repo …] [--url …]   # 绑 Issue（→ issue 列）：只填编号，repo/url 由项目基址补
 flowcard plan   <card> --body "方案…"                     # 写方案并申请 G1
 flowcard worktree <card> --add --branch feat/x [--at .worktrees/x]  # 建 worktree；随后要求会话 /wt 或 /move 进去
 flowcard claim  [<card>] --harness omp --session <id> --cwd <路径>  # 领卡；不给 card 时服务端按 cwd 反查

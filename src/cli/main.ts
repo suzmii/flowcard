@@ -37,6 +37,8 @@ const { values, positionals } = parseArgs({
     url: { type: "string" },
     repo: { type: "string" },
     project: { type: "string" },
+    template: { type: "string" },
+    clear: { type: "boolean" },
     name: { type: "string" },
     state: { type: "string" },
     ci: { type: "string" },
@@ -115,8 +117,31 @@ function unreachable(error: unknown): never {
   process.exit(5);
 }
 
+/** 看着像路径（含 `/`、`.`、`..`、`~` 开头）就当路径，否则当项目 id。 */
+const looksLikePath = (ref: string): boolean =>
+  ref.includes("/") || ref === "." || ref === ".." || ref.startsWith("~");
+
+/** `<项目 id 或路径>` → 项目 id（路径走 `/api/project/current` 解析；解析不到按服务端错误退出）。 */
+async function resolveProjectId(ref: string): Promise<string> {
+  if (!looksLikePath(ref)) return ref;
+  let res: Response;
+  try {
+    res = await fetch(
+      `${DEFAULT_URL}/api/project/current?path=${encodeURIComponent(resolveUserPath(ref))}`,
+    );
+  } catch (error) {
+    unreachable(error);
+  }
+  const data = (await res.json().catch(() => null)) as { project?: { id?: string } } | null;
+  if (!res.ok || !data?.project?.id) {
+    process.stdout.write(`${JSON.stringify(data ?? { ok: false })}\n`);
+    process.exit(res.status === 404 ? 3 : 2);
+  }
+  return data.project.id;
+}
+
 /**
- * `flowcard project add <路径> | list | current [--path <路径>]`
+ * `flowcard project add <路径> | list | current [--path <路径>] | issue-base <项目 id 或路径> …`
  * 项目 = 看板的 Metadata：登记一次，之后开卡只给 `--project <id>`（不给就按 cwd 解析）。
  */
 async function runProject(args: string[]): Promise<never> {
@@ -140,10 +165,33 @@ async function runProject(args: string[]): Promise<never> {
         }),
       );
     }
+    if (sub === "issue-base") {
+      // 项目可以给 id，也可以给仓库内任意路径（CLI 先解析成 id，省得人手抄 id）。
+      const ref = args[1] ?? opt("project") ?? opt("path");
+      if (!ref) die(2, "project issue-base 需要 <项目 id 或仓库路径>");
+      const repo = opt("repo");
+      const template = opt("template");
+      const clear = values.clear === true;
+      if (!clear && repo === undefined && template === undefined) {
+        die(2, 'project issue-base 需要 --repo <owner/repo> / --template "…{number}" 至少一个（或 --clear 清空）');
+      }
+      const id = await resolveProjectId(ref);
+      return await report(
+        await fetch(`${DEFAULT_URL}/api/projects/${encodeURIComponent(id)}/issue-base`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ...(repo !== undefined ? { issueRepo: repo } : {}),
+            ...(template !== undefined ? { issueUrlTemplate: template } : {}),
+            ...(clear ? { clear: true } : {}),
+          }),
+        }),
+      );
+    }
   } catch (error) {
     unreachable(error);
   }
-  die(2, `未知的 project 子命令 "${sub}"：可用 add <路径> / list / current [--path <路径>]`);
+  die(2, `未知的 project 子命令 "${sub}"：可用 add <路径> / list / current [--path <路径>] / issue-base <项目 id 或路径> [--repo …] [--template "…{number}"] [--clear]`);
 }
 
 /** `flowcard attach <图片>`：上传后打印 markdown，直接贴进正文或评论。 */
@@ -177,14 +225,40 @@ async function runAttach(file: string | undefined): Promise<never> {
   }
 }
 
-/** 解析 `--issue repo#123`。 */
-function parseIssueSpec(spec: string, url: string | undefined): { repo: string; number: number; url: string } {
-  const [repo, numRaw] = spec.split("#");
-  const number = Number(numRaw);
-  if (!repo || !Number.isInteger(number) || number <= 0) {
-    die(2, `--issue 需要形如 <repo>#<数字>，收到 "${spec}"`);
+/** 正整数参数（`--number`）：不是就当场用法错退出。 */
+function parsePositive(raw: string, flag: string): number {
+  const number = Number(raw);
+  if (!Number.isInteger(number) || number <= 0) {
+    die(2, `${flag} 需要正整数，收到 "${raw}"`);
   }
-  return { repo, number, url: url ?? `issue://${repo}#${number}` };
+  return number;
+}
+
+/** 解析 `--issue` 的两种写法：裸数字（`742`）或 `<owner/repo>#742`（repo 可带斜杠，如 Gitea 的多段路径）。 */
+function parseIssueSpec(spec: string): { number: number; repo?: string } {
+  const trimmed = spec.trim();
+  if (/^\d+$/.test(trimmed)) return { number: Number(trimmed) };
+  const hash = trimmed.lastIndexOf("#");
+  if (hash > 0) {
+    const repo = trimmed.slice(0, hash);
+    const number = Number(trimmed.slice(hash + 1));
+    if (repo !== "" && Number.isInteger(number) && number > 0) return { repo, number };
+  }
+  die(2, `--issue 需要裸数字（--issue 742）或 <owner/repo>#<数字>，收到 "${spec}"`);
+}
+
+/**
+ * 从 `--issue` / `--number`（+ `--repo` / `--url` 覆盖）读一个 Issue：**只给编号就行**，
+ * 缺的 `repo`/`url` 由服务端按卡片所属项目的 Issue 基址补齐。都没给 → undefined。
+ */
+function readIssueFlags(): { number: number; repo?: string; url?: string } | undefined {
+  const spec = opt("issue");
+  const numberFlag = opt("number");
+  if (spec === undefined && numberFlag === undefined) return undefined;
+  const base = spec !== undefined ? parseIssueSpec(spec) : { number: parsePositive(numberFlag!, "--number") };
+  const repo = opt("repo") ?? base.repo;
+  const url = opt("url");
+  return { number: base.number, ...(repo !== undefined ? { repo } : {}), ...(url !== undefined ? { url } : {}) };
 }
 
 /**
@@ -211,25 +285,24 @@ async function build(): Promise<Command> {
       // 标题可选：不给（或给空白）由服务端从正文派生。项目不给就按 cwd 解析，解析不到用 local。
       const title = opt("title");
       const projectId = opt("project") ?? (await currentProjectId(process.cwd()));
+      // 开卡就带 Issue：只给编号也行（`--issue 742`），repo/url 由项目的 Issue 基址补。
+      const issue = readIssueFlags();
       return {
         cmd: "open",
         actor: actor(),
         ...(title !== undefined && title.trim() !== "" ? { title } : {}),
         body: opt("body") ?? "",
         ...(projectId ? { projectId } : {}),
-        ...(opt("issue") ? { issue: { ...parseIssueSpec(opt("issue")!, opt("url")), state: "open" as const } } : {}),
+        ...(issue ? { issue: { ...issue, state: "open" as const } } : {}),
         ...(opt("part-of") ? { partOf: opt("part-of")! } : {}),
       };
     }
     case "issue": {
       const card = requireCard();
-      const spec = opt("issue") ?? die(2, "issue 需要 --issue <repo>#<n>");
-      return {
-        cmd: "bindIssue",
-        actor: actor(),
-        card,
-        issue: { ...parseIssueSpec(spec, opt("url")), state: "open" },
-      };
+      const issue =
+        readIssueFlags() ??
+        die(2, "issue 需要 --number <数字>（或 --issue <owner/repo>#<n>）；repo/url 不给就用项目基址补");
+      return { cmd: "bindIssue", actor: actor(), card, ...issue };
     }
     case "plan":
       return {

@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { Hono } from "hono";
 import { personalFlow } from "../src/flow/personal.ts";
 import { createApp } from "../src/server/app.ts";
-import { createStore } from "../src/server/store.ts";
+import { createStore, type Store } from "../src/server/store.ts";
 import type { Command } from "../src/shared/types.ts";
 
 const HUMAN = { kind: "human" as const, name: "tester" };
@@ -69,7 +70,9 @@ describe("HTTP 接口", () => {
       cmd: "bindIssue",
       actor: HUMAN,
       card: id,
-      issue: { repo: "r", number: 1, url: "http://i/1", state: "open" },
+      number: 1,
+      repo: "r",
+      url: "http://i/1",
     });
     expect(bound.status).toBe(200);
 
@@ -174,5 +177,114 @@ describe("HTTP 接口", () => {
     const res = await app.request("/api/rebuild", { method: "POST" });
     expect(res.status).toBe(200);
     expect(store.getCard(id)).toEqual(before);
+  });
+});
+
+/** POST /api/projects/:id/issue-base 的响应体（只取要断言的字段）。 */
+const issueBaseResponse = z.object({
+  project: z.object({
+    id: z.string(),
+    issueRepo: z.string().optional(),
+    issueUrlTemplate: z.string().optional(),
+  }),
+});
+
+describe("Issue 基址（项目层）", () => {
+  /** 造一个项目（不碰 git：这里只关心基址字段的读写）。 */
+  function seedProject(store: Store, path: string) {
+    return store.upsertProject({
+      id: "repo-0001",
+      name: "repo",
+      path,
+      addedAt: "2026-10-10T00:00:00.000Z",
+      lastSeenAt: "2026-10-10T00:00:00.000Z",
+    }).project;
+  }
+
+  async function postIssueBase(app: Hono, id: string, body: unknown) {
+    const res = await app.request(`/api/projects/${id}/issue-base`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return res;
+  }
+
+  it("设置 / 只更新给的那条 / clear 清空", async () => {
+    const { app, store } = harness();
+    const project = seedProject(store, "/tmp/fc-issue-base-a");
+
+    const set = await postIssueBase(app, project.id, {
+      issueRepo: "o/r",
+      issueUrlTemplate: "https://h/o/r/issues/{number}",
+    });
+    expect(set.status).toBe(200);
+    const setData = issueBaseResponse.parse(await set.json());
+    expect(setData.project.issueRepo).toBe("o/r");
+    expect(setData.project.issueUrlTemplate).toBe("https://h/o/r/issues/{number}");
+    expect(store.getProject(project.id)?.issueUrlTemplate).toBe("https://h/o/r/issues/{number}");
+
+    // 只给 issueRepo：模板保持不动
+    const patch = await postIssueBase(app, project.id, { issueRepo: "x/y" });
+    expect(patch.status).toBe(200);
+    const patched = issueBaseResponse.parse(await patch.json());
+    expect(patched.project.issueRepo).toBe("x/y");
+    expect(patched.project.issueUrlTemplate).toBe("https://h/o/r/issues/{number}");
+
+    const cleared = await postIssueBase(app, project.id, { clear: true });
+    expect(cleared.status).toBe(200);
+    const clearedData = issueBaseResponse.parse(await cleared.json());
+    expect(clearedData.project.issueRepo).toBeUndefined();
+    expect(clearedData.project.issueUrlTemplate).toBeUndefined();
+    expect(store.getProject(project.id)?.issueRepo).toBeUndefined();
+  });
+
+  it("项目不存在 → 404；body 非法 → 400", async () => {
+    const { app, store } = harness();
+    const missing = await postIssueBase(app, "nope-0000", { issueRepo: "o/r" });
+    expect(missing.status).toBe(404);
+
+    const project = seedProject(store, "/tmp/fc-issue-base-b");
+    const bad = await postIssueBase(app, project.id, { issueRepo: 42 });
+    expect(bad.status).toBe(400);
+    const body = (await bad.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("USAGE_ERROR");
+    expect(body.error.message).toContain("issueRepo");
+    expect(store.getProject(project.id)?.issueRepo).toBeUndefined();
+  });
+
+  it("配好基址后，bindIssue 只给 number 就补齐（HTTP 端到端）", async () => {
+    const { app, store } = harness();
+    const project = seedProject(store, "/tmp/fc-issue-base-c");
+    await postIssueBase(app, project.id, {
+      issueRepo: "git/owner/repo",
+      issueUrlTemplate: "https://gitea.example.com/git/owner/repo/issues/{number}",
+    });
+
+    const opened = await post(app, {
+      cmd: "open",
+      actor: HUMAN,
+      title: "带项目开卡",
+      body: "",
+      projectId: project.id,
+    });
+    const id = opened.data.card?.id ?? "";
+
+    const bound = await post(app, { cmd: "bindIssue", actor: HUMAN, card: id, number: 742 });
+    expect(bound.status).toBe(200);
+    expect(store.getCard(id)?.issue).toEqual({
+      repo: "git/owner/repo",
+      number: 742,
+      url: "https://gitea.example.com/git/owner/repo/issues/742",
+      state: "open",
+    });
+
+    // 没有基址的项目（合成项目 local）：只给编号 → 400 + USAGE_ERROR
+    const localCard = await post(app, { cmd: "open", actor: HUMAN, title: "没归属", body: "" });
+    const localId = localCard.data.card?.id ?? "";
+    const rejected = await post(app, { cmd: "bindIssue", actor: HUMAN, card: localId, number: 1 });
+    expect(rejected.status).toBe(400);
+    expect(rejected.data.rejection?.code).toBe("USAGE_ERROR");
+    expect(store.getCard(localId)?.issue).toBeNull();
   });
 });

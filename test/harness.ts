@@ -5,12 +5,14 @@
 import { personalFlow } from "../src/flow/personal.ts";
 import { runCommand, type CommandOutcome } from "../src/server/engine.ts";
 import { applyEvent, emptyCard, type NewEvent } from "../src/server/project.ts";
-import type { Card, Command, CwdClaimResolution } from "../src/shared/types.ts";
+import type { Card, Command, CwdClaimResolution, Project } from "../src/shared/types.ts";
 
 const HUMAN = { kind: "human" as const, name: "you" };
 const AGENT = { kind: "agent" as const, harness: "omp", sessionId: "sess-1" };
 
-export function createHarness(opts: { resolveCardByCwd?: (cwd: string) => CwdClaimResolution } = {}) {
+export function createHarness(
+  opts: { resolveCardByCwd?: (cwd: string) => CwdClaimResolution; projects?: Project[] } = {},
+) {
   const cards = new Map<string, Card>();
   const allEvents: NewEvent[] = [];
   let counter = 0;
@@ -21,10 +23,11 @@ export function createHarness(opts: { resolveCardByCwd?: (cwd: string) => CwdCla
     const outcome = runCommand({
       flow: personalFlow,
       getCard: (id) => cards.get(id),
+      getProject: (id) => opts.projects?.find((p) => p.id === id),
       cmd,
       now: new Date(clock).toISOString(),
       newCardId: () => `c${++counter}`,
-      ...opts,
+      ...(opts.resolveCardByCwd ? { resolveCardByCwd: opts.resolveCardByCwd } : {}),
     });
     for (const [id, card] of Object.entries(outcome.cards)) cards.set(id, card);
     allEvents.push(...outcome.events);
