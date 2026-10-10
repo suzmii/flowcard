@@ -223,6 +223,7 @@ export function SessionChat({
   const ompSessionId = session.ompSessionId ?? "";
   const shortId = ompSessionId.length > 12 ? `${ompSessionId.slice(0, 8)}…${ompSessionId.slice(-4)}` : ompSessionId;
   const costValue = session.cost?.total ?? session.cost?.cost;
+  const modelText = session.model ?? "";
   const costText =
     typeof costValue === "number" && Number.isFinite(costValue) ? `$${costValue.toFixed(4)}` : "";
 
@@ -471,6 +472,11 @@ export function SessionChat({
         <Badge variant={SESSION_STATUS_TONE[status]} data-testid="session-status" data-status={status}>
           {SESSION_STATUS_LABELS[status]}
         </Badge>
+        {modelText !== "" ? (
+          <span className="text-[11px] text-muted-foreground" data-testid="session-model" title="本次会话正在用的模型">
+            模型：{modelText}
+          </span>
+        ) : null}
         {session.busy ? (
           <span className="flex items-center gap-1 text-[11px] text-muted-foreground" data-testid="session-busy">
             <Loader2 className="size-3 animate-spin" />

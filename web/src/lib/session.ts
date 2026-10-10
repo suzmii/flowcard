@@ -96,6 +96,7 @@ export const hostedSessionSchema = z.looseObject({
   lastActivityAt: optString,
   busy: z.boolean().catch(false),
   cost: costSchema.optional().catch(undefined),
+  model: z.string().optional().catch(undefined),
   messages: z.array(messageSchema).catch([]),
 });
 
@@ -369,7 +370,7 @@ export type SessionEvent =
       output: string;
       isError?: boolean;
     }
-  | { type: "state"; busy: boolean; status?: HostedSessionStatus; cost?: SessionCost }
+  | { type: "state"; busy: boolean; status?: HostedSessionStatus; cost?: SessionCost; model?: string }
   | { type: "notice"; level: SessionNoticeLevel; message: string }
   | { type: "error"; message: string };
 
@@ -393,6 +394,7 @@ const eventSchema = z.looseObject({
   busy: optBool,
   status: statusSchema.optional().catch(undefined),
   cost: costSchema.optional().catch(undefined),
+  model: optString,
   message: optString,
   level: z.enum(["info", "warn", "warning", "error"]).optional().catch(undefined),
   ompSessionId: optString,
@@ -443,6 +445,7 @@ export function parseSessionEvent(name: string, data: string): SessionEvent | nu
         busy: frame.busy ?? false,
         ...(frame.status === undefined ? {} : { status: frame.status }),
         ...(frame.cost === undefined ? {} : { cost: frame.cost }),
+        ...(frame.model === undefined ? {} : { model: frame.model }),
       };
     case "notice":
       return {
@@ -566,6 +569,7 @@ export function applySessionEvent(view: SessionView, event: SessionEvent, now = 
           busy: event.busy,
           ...(event.status === undefined ? {} : { status: event.status }),
           ...(event.cost === undefined ? {} : { cost: event.cost }),
+          ...(event.model === undefined ? {} : { model: event.model }),
         },
       };
     case "notice":

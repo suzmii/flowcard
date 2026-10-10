@@ -53,6 +53,8 @@ export type SessionSnapshot = {
   lastActivityAt?: string;
   busy: boolean;
   cost?: SessionCost;
+  /** 当前模型（`provider/id`），来自 omp 的 `config_update` 帧。 */
+  model?: string;
   messages: SessionMessage[];
 };
 
@@ -70,7 +72,7 @@ export type SessionEvent =
       output?: string;
       isError?: boolean;
     }
-  | { type: "state"; busy: boolean; status: HostedSessionStatus; cost?: SessionCost }
+  | { type: "state"; busy: boolean; status: HostedSessionStatus; cost?: SessionCost; model?: string }
   | { type: "notice"; level: string; message: string }
   | { type: "error"; message: string };
 
@@ -437,7 +439,18 @@ async function resolveResumeFile(
 }
 
 /** omp 的会话状态快照（只取我们用的字段）。 */
-type OmpState = { sessionId?: unknown; sessionFile?: unknown };
+type OmpState = { sessionId?: unknown; sessionFile?: unknown; model?: unknown };
+
+/** omp 给的模型形状可能是字符串，也可能是 `{provider, id}`；统一成可显示的 `provider/id`。 */
+function modelLabel(model: unknown): string | null {
+  if (typeof model === "string") return model.trim() === "" ? null : model;
+  if (typeof model !== "object" || model === null) return null;
+  const m = model as { provider?: unknown; id?: unknown; name?: unknown };
+  if (typeof m.provider === "string" && typeof m.id === "string") return `${m.provider}/${m.id}`;
+  if (typeof m.name === "string") return m.name;
+  if (typeof m.id === "string") return m.id;
+  return null;
+}
 
 type Live = {
   cardId: string;
@@ -452,6 +465,8 @@ type Live = {
   /** omp 落盘的会话文件（`get_session_stats.sessionFile`）；`changeCwd` 用它做 `-r` 续接。 */
   sessionFile: string | null;
   cost: SessionCost | null;
+  /** 当前模型（omp 的 `config_update` 帧：`{provider, id}` → `provider/id`）。 */
+  model: string | null;
   busy: boolean;
   claimed: boolean;
   exited: boolean;
@@ -502,6 +517,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       busy: live.busy,
       status: live.status,
       ...(live.cost === null ? {} : { cost: live.cost }),
+      ...(live.model === null ? {} : { model: live.model }),
     });
   };
 
@@ -612,6 +628,10 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       return;
     }
     live.ompSessionId = sid;
+    // 模型也从 get_state 拿：`config_update` 那一帧往往在"记录登记之前"就到（被上面的 guard 丢掉），
+    // 而 get_state 是我们主动发的，顺序确定。
+    const model = state.ok ? modelLabel(state.data?.["model"]) : null;
+    if (model !== null) live.model = model;
     const file = stats.ok ? asString(stats.data?.["sessionFile"]) : null;
     live.sessionFile = file;
     const result = store.execute({
@@ -741,6 +761,17 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
           ...(output === undefined ? {} : { output }),
           ...(event.isError === null ? {} : { isError: event.isError }),
         });
+        break;
+      }
+      // omp 的 `config_update`（启动与每次切模型各一条）——"当前用哪个模型"的唯一权威来源
+      case "other": {
+        const type = String(event.type);
+        if (type !== "config_update" && type !== "model_changed") break;
+        const next = modelLabel(event.raw.model);
+        if (next !== null && next !== live.model) {
+          live.model = next;
+          emitState(live);
+        }
         break;
       }
       case "notice":
@@ -917,6 +948,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       ompSessionId: null,
       sessionFile: null,
       cost: null,
+    model: null,
       busy: false,
       claimed: false,
       exited: false,
@@ -1140,6 +1172,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       lastActivityAt: live.lastActivityAt,
       busy: live.busy,
       ...(live.cost === null ? {} : { cost: live.cost }),
+      ...(live.model === null ? {} : { model: live.model }),
       messages,
     };
   };
