@@ -80,7 +80,7 @@ export function CardDetail({
         data-testid="detail-backdrop"
       />
       <aside
-        className="flex h-full w-full max-w-[46rem] flex-col border-l bg-muted/20 shadow-xl"
+        className="flex h-full w-full max-w-[46rem] flex-col border-l bg-background shadow-xl"
         role="dialog"
         aria-label={`卡片详情 ${card.title}`}
         data-testid="card-detail"
