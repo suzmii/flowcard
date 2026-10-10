@@ -55,7 +55,25 @@ export function emptyCard(id: string, at: string): Card {
     spawned: [],
     createdAt: at,
     updatedAt: at,
+    // 事件条数就是卡片版本：从 0 起，每 `applyEvent` 一条 +1（见 `Card.eventCount`）。
+    eventCount: 0,
   };
+}
+
+/**
+ * 会话失联阈值：心跳按 30s 分桶上报，丢两拍（90s）就算失联 —— 与设计里的 TTL 一致。
+ * 投影里**不存** `lost`：它是「相对读取时刻」的判断，写进库里会随时间失真（重启后更没法重算）。
+ * 所以只在读接口出口推导一次（HTTP / CLI 共用同一条路径，两边结论必然一致）。
+ */
+export const SESSION_LOST_AFTER_MS = 90_000;
+
+/** 把 `running` / `idle` 的会话按 `lastSeenAt` 改判成 `lost`（`ended` 是事实，永远不动）。 */
+export function deriveSessionState(card: Card, now: number = Date.now()): Card {
+  const session = card.session;
+  if (!session || session.state === "ended") return card;
+  const seen = Date.parse(session.lastSeenAt);
+  if (!Number.isFinite(seen) || now - seen <= SESSION_LOST_AFTER_MS) return card;
+  return { ...card, session: { ...session, state: "lost" } };
 }
 
 /** 卡片内确认 id 自增（"cf1"…）：按已有确认的最大编号推导，不额外维护计数器表。 */
@@ -70,7 +88,9 @@ export function nextConfirmationId(confirmations: Confirmation[]): string {
 
 export function applyEvent(card: Card, event: NewEvent | Event): Card {
   const at = event.at;
-  const next: Card = { ...card, updatedAt: at };
+  // `eventCount` = 卡片版本：每折一条事件 +1（见 `Card.eventCount`）。意图类命令的幂等键用它，
+  // 而 rebuild 是从零重放，所以这里必须是纯自增、不带任何条件。
+  const next: Card = { ...card, updatedAt: at, eventCount: card.eventCount + 1 };
   const p = event.payload;
 
   switch (event.type) {

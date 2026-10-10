@@ -174,6 +174,20 @@ export function remoteHost(remote: string): string | null {
   return m ? (m[1] ?? "").toLowerCase() : null;
 }
 
+/**
+ * 任意 URL（含**只到站点根**的形式，如 `https://gitea.com`）的主机名（小写，不含端口）；
+ * 解析不出来返回 null。用来和 `remoteHost()` 比"是不是同一台主机"。
+ */
+function urlHost(value: string): string | null {
+  const raw = value.trim();
+  if (raw === "") return null;
+  try {
+    return new URL(raw.includes("://") ? raw : `https://${raw}`).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
 function forgeOfHost(host: string): SyncForge {
   return host === "github.com" || host.endsWith(".github.com") ? "github" : "gitea";
 }
@@ -219,10 +233,12 @@ export function resolveSyncTarget(input: {
 
   const root = (env["FLOWCARD_GITEA_ROOT"] ?? "").trim().replace(/\/+$/, "");
   const giteaToken = env["FLOWCARD_GITEA_TOKEN"] ?? "";
-  if (root !== "" && giteaToken !== "" && remoteHost(root) === host) {
-    const rel = canonicalRemote(input.remote);
+  // 主机比较用**只到站点根的 URL** 也认：`FLOWCARD_GITEA_ROOT=https://gitea.com` 是合法写法，
+  // 而 `remoteHost()` 走 canonicalRemote（要求 host 后至少有一段路径），对站点根恒返回 null
+  // → 以前这种写法永远匹配不上，直接掉进 no-credentials。owner/repo 仍从 remote 自己切，与 root 的路径无关。
+  if (root !== "" && giteaToken !== "" && urlHost(root) === host) {
     const parsed = parseRemoteUrl(input.remote);
-    if (!rel || !parsed) return { ok: false, reason: "no-remote" };
+    if (!parsed) return { ok: false, reason: "no-remote" };
     return {
       ok: true,
       forge: "gitea",

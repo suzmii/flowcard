@@ -278,6 +278,18 @@ export type Card = {
   deletedAt?: string;
   deletedReason?: string;
   createdAt: string;
+  /**
+   * 这张卡片**已经应用过的事件条数**（每折一条事件 +1，`emptyCard` 从 0 起）。
+   *
+   * 单调递增，所以它就是「卡片版本」：意图类命令的幂等键拿它当后缀
+   * （规则见 `server/engine.ts` 头部），于是
+   * - 同一次请求重试（版本没变）→ 键相同 → 被存储层去重；
+   * - 版本变了之后的**同内容**操作（第二次 unblock、删除→恢复→再删除…）→ 新键 → 不会被吞。
+   * 重复语义仍由引擎自己的状态守卫负责（setter「值没变就跳过」、unblock 查 state…）。
+   *
+   * 它由事件重放推出来，所以 `rebuild` 之后的值必然与增量投影一致。
+   */
+  eventCount: number;
   updatedAt: string;
 };
 
@@ -361,6 +373,22 @@ export const sessionInSchema = z.object({
   agentKind: z.enum(["main", "sub"]).default("main"),
   cwd: z.string().min(1),
   resumeHint: z.string().min(1).optional(),
+});
+
+/**
+ * 托管会话的 HTTP 入参（`server/hosted-session.ts` 实现）：
+ * `start` 可显式给 cwd（不给就取卡片 worktree，再退项目根）；
+ * `prompt` 至少要有 text 或 images 之一（空消息没意义，服务端会拒）。
+ */
+export const sessionStartSchema = z.object({
+  cwd: z.string().min(1).optional(),
+});
+
+export const sessionPromptSchema = z.object({
+  text: z.string(),
+  images: z
+    .array(z.object({ name: z.string().min(1), dataBase64: z.string().min(1) }))
+    .optional(),
 });
 
 /**

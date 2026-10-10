@@ -12,6 +12,7 @@
 import { parseArgs } from "node:util";
 import type { Card, Command } from "../shared/types.ts";
 import { probe, probeCommands, type ProbeCommand } from "../server/probe.ts";
+import { abort, finish, runCli } from "./exit.ts";
 
 const OPTIONS = {
   port: { type: "string" },
@@ -35,15 +36,13 @@ export async function runDetect(argv: string[]): Promise<never> {
     process.env.FLOWCARD_URL ??
     `http://127.0.0.1:${str(values.port) ?? process.env.FLOWCARD_PORT ?? "47825"}`;
 
-  const say = (payload: unknown): void => {
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-  };
+  /** 打完这一行再退：`applied`/`notes` 加起来能过管道缓冲，裸 `process.exit` 会截断。 */
+  const say = (payload: unknown, code: number): Promise<never> => finish(`${JSON.stringify(payload)}\n`, code);
 
   /** stdout 一行 JSON + 退出码，与 main.ts 的错误形状保持一致（`ok:false` + `rejection.code`）。
    *  用函数声明而不是 const 箭头：只有前者能让 TS 在调用后把类型收窄（never 返回）。 */
   function die(code: number, message: string, extra: Record<string, unknown> = {}): never {
-    say({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra });
-    process.exit(code);
+    return abort(`${JSON.stringify({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra })}\n`, code);
   }
 
   const post = async (
@@ -54,11 +53,19 @@ export async function runDetect(argv: string[]): Promise<never> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(command),
     });
-    return (await res.json()) as {
+    // 服务端回非 JSON（默认的 500 是纯文本）时别抛出去炸栈：当成一条被拒的回写，如实报出来。
+    const data = (await res.json().catch(() => null)) as {
       ok: boolean;
       rejection?: { code: string; message: string };
       blocked?: { missing: string[] };
-    };
+    } | null;
+    if (data === null || typeof data.ok !== "boolean") {
+      return {
+        ok: false,
+        rejection: { code: "SERVER_ERROR", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` },
+      };
+    }
+    return data;
   };
 
   /** 探测计划 → `Command`（actor 用 system：这是机器探测，不是人的命令）。 */
@@ -70,11 +77,13 @@ export async function runDetect(argv: string[]): Promise<never> {
   };
 
   if (values.help === true || positionals.length === 0) {
-    say({
-      usage: "flowcard detect <card> [--port 47825] [--url <base>] [--cwd <路径>]",
-      note: "从会话 cwd 反查 worktree/分支并探测 PR/CI，回写卡片；拿不到的信号会明确报告「未探测」。",
-    });
-    process.exit(values.help === true ? 0 : 2);
+    return say(
+      {
+        usage: "flowcard detect <card> [--port 47825] [--url <base>] [--cwd <路径>]",
+        note: "从会话 cwd 反查 worktree/分支并探测 PR/CI，回写卡片；拿不到的信号会明确报告「未探测」。",
+      },
+      values.help === true ? 0 : 2,
+    );
   }
 
   const cardId = positionals[0]!;
@@ -83,23 +92,27 @@ export async function runDetect(argv: string[]): Promise<never> {
   let card: Card;
   try {
     const res = await fetch(`${baseUrl}/api/cards/${encodeURIComponent(cardId)}`);
-    if (!res.ok) {
-      say({
-        ok: false,
-        card: cardId,
-        rejection: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在（${baseUrl}）` },
-      });
-      process.exit(3);
+    const data = (await res.json().catch(() => null)) as { card?: Card } | null;
+    if (!res.ok || !data?.card) {
+      return say(
+        {
+          ok: false,
+          card: cardId,
+          rejection: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在（${baseUrl}）` },
+        },
+        3,
+      );
     }
-    const data = (await res.json()) as { card: Card };
     card = data.card;
   } catch (error) {
-    say({
-      ok: false,
-      card: cardId,
-      rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` },
-    });
-    process.exit(5);
+    return say(
+      {
+        ok: false,
+        card: cardId,
+        rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` },
+      },
+      5,
+    );
   }
 
   // 2) 定 cwd：会话 cwd 优先，退到已绑的 worktree 路径
@@ -152,7 +165,11 @@ export async function runDetect(argv: string[]): Promise<never> {
   }
 
   const appliedOk = applied.every((a) => a.ok);
-  say({
+  // 退出码沿用约定：非法 2 / 状态不允许 3 / 缺必要条件（被拦或有信号没探测到）4 / 全绿 0。
+  const rejected = applied.find((a) => !a.ok)?.rejection;
+  const blocked = applied.some((a) => a.blocked && a.blocked.missing.length > 0);
+  const code = rejected ? (rejected.code === "USAGE_ERROR" ? 2 : 3) : blocked || !result.ok ? 4 : 0;
+  return say({
     ok: result.ok && appliedOk,
     card: cardId,
     baseUrl,
@@ -168,16 +185,12 @@ export async function runDetect(argv: string[]): Promise<never> {
     applied,
     notes: result.notes,
     hints,
-  });
-
-  const rejection = applied.find((a) => !a.ok)?.rejection;
-  if (rejection) process.exit(rejection.code === "USAGE_ERROR" ? 2 : 3);
-  if (applied.some((a) => a.blocked && a.blocked.missing.length > 0)) process.exit(4);
-  if (!result.ok) process.exit(4);
-  process.exit(0);
+  }, code);
 }
 
 // 直接执行（`node src/cli/detect.ts …`）时才跑；被 main.ts import 时由那边调 runDetect。
 if (process.argv[1]?.endsWith("detect.ts") === true) {
-  await runDetect(process.argv.slice(2));
+  await runCli(async () => {
+    await runDetect(process.argv.slice(2));
+  });
 }

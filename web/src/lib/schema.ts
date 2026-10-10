@@ -165,6 +165,8 @@ export const cardViewSchema = z.looseObject({
   cleanedAt: z.string().optional(),
   blockedReason: z.string().optional(),
   createdAt: z.string(),
+  /** 卡片版本（每折一条事件 +1）；意图类命令的幂等键用它（见 `src/server/engine.ts`）。 */
+  eventCount: z.number(),
   updatedAt: z.string(),
 });
 
@@ -192,7 +194,6 @@ export const commandsResponseSchema = z.looseObject({
       status: z.string(),
       cwd: z.string().optional(),
       summary: z.string(),
-      terminal: z.looseObject({ terminal: z.string().optional(), command: z.string().optional() }).optional(),
     })
     .optional(),
 });

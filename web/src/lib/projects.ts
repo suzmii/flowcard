@@ -154,6 +154,11 @@ export async function fetchProjects(signal?: AbortSignal): Promise<ProjectsResul
   if (res.status === 404) {
     return { ok: false, message: "服务端还没有 /api/projects（项目接口未实现）", unavailable: true };
   }
+  // 非 2xx **先**按错误读（服务端会回 { error: { code, message } }）：拿去跑 schema 只会得到
+  // "不符合契约"，把 500 / 502 这类的真实原因盖掉。
+  if (!res.ok) {
+    return { ok: false, message: `项目列表读不到：${await readErrorBody(res)}`, unavailable: true };
+  }
   const parsed = projectsResponseSchema.safeParse(await res.json().catch(() => null));
   if (!parsed.success) {
     return {

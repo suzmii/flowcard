@@ -6,6 +6,31 @@
  *   B 显式转换请求（如 unblock/cleanup）→ 过 requires 才放行
  *   C 自动节点：对每个事实事件跑 flow.automations，动作同样过 requires
  * requires 不满足时**不是报错**，而是把缺项回报给调用方（写事件已经落库，状态不动）。
+ *
+ * ## 幂等键的分层规则（`dedupeKey` 是存储层的全局唯一索引，重复写入会**静默**丢掉）
+ *
+ * 用「命令内容」当键会让**同内容的第二次合法操作**被当成重复请求吞掉（第二次 unblock、
+ * 同理由的第二次 block、G4 被驳回后重新提清单、删除→恢复→再删除、A→B→A→B 改回旧值…
+ * 症状全是「命令返回 ok，但状态没动」）。所以按下面两类分开：
+ *
+ * 1. **带外部身份的事实** → 保持「内容/身份寻址」的键，重复就是同一件事，天生重试安全：
+ *    - `push:{card}:{sha}`、`sync:*`（`factKey`：issue/PR 的编号 + 远端 updatedAt、评论 id）、
+ *      `open:{title/body/projectId 的指纹}`（同内容 = 同一张卡）、`spawn` / `comment` 的内容键。
+ *    - 会话身份：`claim:{card}:{sessionId}:{hash(cwd)}:{这一轮的起点}` / `end:{card}:{sessionId}:{起点}`
+ *      —— 起点是当前会话的 `startedAt`，所以「会话结束后用同一个 id 在同一目录恢复（omp -r）」
+ *      是新的一轮、能刷新；同一轮的重复上报仍然是同一个键。
+ * 2. **意图类命令**（block / unblock / delete / restore / drop / accept / worktree / bindIssue /
+ *    bindPr / decideGate / proposeCleanup / cleanup / probePr / reviewVerdict）→ 键是
+ *    **`{cmd}:{card}:{card.eventCount}`**（见 `intentKey`）：`eventCount` 是卡片版本，
+ *    版本没变的重试会被去重，版本变了之后的同内容操作是新键。
+ *    **重复语义由引擎自己的状态守卫保证**（setter「值没变就跳过」、unblock 查 state、
+ *    delete 查 deletedAt、proposeCleanup 查 G4 是否未决…），所以重试不会写出第二条事实。
+ *    （`probePr` 也是这一类：观察到的值没变就跳过。放在这里是因为 PR 会 open→closed→open，
+ *    内容寻址的键会把"重新打开"和第一次的 open 撞成同一条。）
+ * 3. **心跳**：30s 分桶 + `shortHash(cwd)`。同一桶里 cwd 从主仓库变到 worktree 是两件不同的事，
+ *    不带 cwd 的话第二拍会被去重吞掉，而引擎的本地投影已经应用过它 → 落库的投影与事件对不上。
+ *
+ * 调用方显式给了 `--dedupe-key`（`cmd.dedupeKey`）时以上键都只是后缀：前缀仍然由它说了算。
  */
 import { describeMissing, missingRequirements, type Flow } from "../shared/flow.ts";
 import { isAbsolute, join } from "node:path";
@@ -65,6 +90,18 @@ export function deriveTitle(body: string): string {
 
 /** 带 card 的命令的卡片 id；claim 允许不写（由 cwd 解析），所以是 string | undefined。 */
 const cardIdOf = (cmd: Command): string | undefined => ("card" in cmd ? cmd.card : undefined);
+
+/**
+ * 意图类命令的幂等键：`{cmd}:{card}:{card.eventCount}`。
+ *
+ * `eventCount` 是**命令开始前**的卡片版本（每折一条事件 +1），所以：
+ * - 同一次请求重试（什么都没写成，版本没变）→ 同一个键 → 被存储层去重；
+ * - 上一次已经写成了（版本变了）→ 新键 → 同内容的第二次合法操作不会被历史键吞掉。
+ *
+ * 注意 `card` 必须是命令开始时读到的投影（不能用 `applyPending` 之后的），
+ * 否则一条命令里多次取键会各拿一个版本，重试时对不上。
+ */
+const intentKey = (name: string, card: Card): string => `${name}:${card.id}:${card.eventCount}`;
 
 /**
  * 绑 Issue 的补齐：**编号是命令给的，`repo`/`url` 缺省时用卡片所属项目的 Issue 基址补**。
@@ -154,6 +191,8 @@ export function runCommand(input: {
   const notes: string[] = [];
   let applied = 0;
   let blocked: CommandOutcome["blocked"];
+  /** `cleanup` 的两条事件（completed + done 转换）共用同一版本次，见 B' 段。 */
+  let cleanupKey: string | undefined;
 
   const get = (id: string): Card | undefined => local.get(id) ?? input.getCard(id);
 
@@ -276,12 +315,7 @@ export function runCommand(input: {
         notes.push("Issue 已经是该值，跳过");
         break;
       }
-      emit(
-        cmd.card,
-        "issue.bound",
-        { issue },
-        `issue:${cmd.card}:${issue.repo}#${issue.number}:from:${card.issue ? `${card.issue.repo}#${card.issue.number}` : "-"}`,
-      );
+      emit(cmd.card, "issue.bound", { issue }, intentKey("issue", card));
       break;
     }
 
@@ -297,7 +331,7 @@ export function runCommand(input: {
         cmd.card,
         "gate.decided",
         { gate: cmd.gate, decision: cmd.decision, ...(cmd.reason ? { reason: cmd.reason } : {}) },
-        `gate:${cmd.card}:${cmd.gate}:${cmd.decision}`,
+        intentKey("gate-decision", card),
       );
       break;
     }
@@ -424,13 +458,10 @@ export function runCommand(input: {
         notes.push("worktree 已经是该值，跳过");
         break;
       }
-      // 幂等键带上"前值"：否则把 A→B 之后再改回 A 时，会被历史上那条 A 的键吞掉
-      emit(
-        cmd.card,
-        "worktree.bound",
-        { worktree },
-        `worktree:${cmd.card}:${shortHash(worktree.path)}:${worktree.branch}:from:${card.worktree?.branch ?? "-"}`,
-      );
+      // 声明式 setter：值没变就是 no-op（重试天然幂等）。
+      // 键用卡片版本（不带前值）：A→B→A→B 每一次都是新版本，
+      // 改回旧值、或同分支换路径（正是重登记 worktree 的场景）都不会被历史键吞掉。
+      emit(cmd.card, "worktree.bound", { worktree }, intentKey("worktree", card));
       break;
     }
 
@@ -469,12 +500,23 @@ export function runCommand(input: {
           hint: "一张卡片同一时刻只能有一个活跃会话；先结束它，或改绑同一会话",
         });
       }
-      // 幂等键带上 cwd：同一会话从新目录再 claim（omp 的 /wt、/move 之后）要能刷新记录
+      // 同 id 同 cwd 且还在跑 = 同一次 claim 的重发：直接跳过（不依赖幂等键也不写事件）。
+      if (current && current.id === cmd.session.id && current.cwd === cmd.session.cwd && current.state === "running") {
+        notes.push("会话已经绑在这张卡上（同 id 同 cwd），跳过");
+        break;
+      }
+      /**
+       * 幂等键 = 身份（卡片 + 会话 id + cwd）+ **这一轮的起点**（当前会话的 `startedAt`）。
+       * 于是「会话结束后用同一个 id 在**同一目录**恢复（适配器的 resumeHint）再 claim」是新的一轮
+       * → 新键 → 能把投影从 ended 刷回 running；而同一轮里的重复上报仍然是同一个键。
+       * （键里带 cwd：omp 的 `/wt`、`/move` 之后从新目录 claim 必须能刷新记录。）
+       */
+      const runMarker = current && current.id === cmd.session.id ? current.startedAt : "-";
       emit(
         cardId,
         "session.started",
         { session: cmd.session },
-        `claim:${cardId}:${cmd.session.id}:${shortHash(cmd.session.cwd)}`,
+        `claim:${cardId}:${cmd.session.id}:${shortHash(cmd.session.cwd)}:${runMarker}`,
       );
       break;
     }
@@ -496,12 +538,15 @@ export function runCommand(input: {
       }
       // 心跳按 30s 分桶去重：分桶粒度就是 lastSeenAt 的分辨率，
       // 所以存活判定的 TTL 必须 ≥ 3 个桶（设计里取 90s）。
+      // 键里还要带 cwd：同一个桶里 cwd 从主仓库变到 worktree 是**两件不同的事**，
+      // 只按分桶去重会把第二拍吞掉，而引擎的本地投影已经应用过它 → 落库的投影与事件对不上。
       const bucket = Math.floor(Date.parse(now) / 30_000);
+      const cwdTag = shortHash(cmd.session.cwd);
       emit(
         cmd.card,
         "session.heartbeat",
         { cwd: cmd.session.cwd },
-        `beat:${cmd.card}:${cmd.session.id}:${bucket}`,
+        `beat:${cmd.card}:${cmd.session.id}:${bucket}:${cwdTag}`,
       );
       applyPending();
       const after = get(cmd.card)!;
@@ -512,7 +557,7 @@ export function runCommand(input: {
             cmd.card,
             "session.cwd.mismatch",
             { cwd: cmd.session.cwd, worktree: after.worktree.path },
-            `mismatch:${cmd.card}:${cmd.session.id}:${bucket}`,
+            `mismatch:${cmd.card}:${cmd.session.id}:${bucket}:${cwdTag}`,
           );
         }
       }
@@ -530,12 +575,7 @@ export function runCommand(input: {
         notes.push("PR 已经是该值，跳过");
         break;
       }
-      emit(
-        cmd.card,
-        "pr.bound",
-        { pr: cmd.pr },
-        `pr:${cmd.card}:${cmd.pr.number}:${cmd.pr.state}:from:${card.pr ? `${card.pr.number}:${card.pr.state}` : "-"}`,
-      );
+      emit(cmd.card, "pr.bound", { pr: cmd.pr }, intentKey("pr", card));
       break;
     }
 
@@ -552,11 +592,13 @@ export function runCommand(input: {
       if (card.session && cmd.sessionId && card.session.id !== cmd.sessionId) {
         return fail({ code: "SESSION_CONFLICT", message: `会话 ${cmd.sessionId} 不是卡片当前会话` });
       }
+      // 键 = 身份（卡片 + 会话 id）+ 这一轮的起点（`startedAt`）：同一次 end 重发被去重，
+      // 而「会话结束后用同一 id 恢复、跑完再 end」是新的一轮 → 新键 → 不会被第一次的键吞掉。
       emit(
         cmd.card,
         "session.ended",
         { ...(cmd.summary ? { summary: cmd.summary } : {}) },
-        `end:${cmd.card}:${card.session?.id ?? "-"}`,
+        `end:${cmd.card}:${card.session?.id ?? "-"}:${card.session?.startedAt ?? "-"}`,
       );
       break;
     }
@@ -564,14 +606,20 @@ export function runCommand(input: {
     case "accept": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      emit(cmd.card, "gate.requested", { gate: "G3", kind: "review", title: "验收" }, `gate:${cmd.card}:G3`);
+      // 验收是一次性的事实（`acceptedAt` 永不重置）：重发同一条不写第二条、也不重置 G3。
+      if (card.acceptedAt) {
+        notes.push("卡片已经验收过，跳过");
+        break;
+      }
+      const key = intentKey("accept", card);
+      emit(cmd.card, "gate.requested", { gate: "G3", kind: "review", title: "验收" }, `${key}:gate`);
       emit(
         cmd.card,
         "gate.decided",
         { gate: "G3", decision: "approved", ...(cmd.reason ? { reason: cmd.reason } : {}) },
-        `gate:${cmd.card}:G3:approved`,
+        `${key}:gate:approved`,
       );
-      emit(cmd.card, "card.accepted", {}, `accept:${cmd.card}`);
+      emit(cmd.card, "card.accepted", {}, key);
       break;
     }
 
@@ -585,15 +633,16 @@ export function runCommand(input: {
       if (card.state === "done") {
         return fail({ code: "STATE_NOT_ALLOWED", message: "已完成的卡片不能放弃" });
       }
-      // 放弃是决定，得留痕：理由进评论，状态另记
-      emit(cmd.card, "card.comment.added", { body: `放弃：${cmd.reason}` }, `drop:${cmd.card}:${shortHash(cmd.reason)}`);
+      // 放弃是决定，得留痕：理由进评论，状态另记。两条事件共用同一版本次（都是命令卡片的版本）。
+      const key = intentKey("drop", card);
+      emit(cmd.card, "card.comment.added", { body: `放弃：${cmd.reason}` }, `${key}:reason`);
       applyPending();
       const now2 = get(cmd.card)!;
       emit(
         cmd.card,
         "card.state.changed",
         { from: now2.state, to: "dropped" },
-        `drop:${cmd.card}:${now2.state}:state`,
+        `${key}:state`,
       );
       break;
     }
@@ -605,11 +654,12 @@ export function runCommand(input: {
         notes.push("卡片已经是删除状态，跳过");
         break;
       }
+      // 键用卡片版本（不是理由的指纹）：删除→恢复→再删除（同理由或都不填理由）必须还能删掉。
       emit(
         cmd.card,
         "card.deleted",
         { ...(cmd.reason ? { reason: cmd.reason } : {}) },
-        `delete:${cmd.card}:${shortHash(cmd.reason ?? "")}`,
+        intentKey("delete", card),
       );
       break;
     }
@@ -621,14 +671,41 @@ export function runCommand(input: {
         notes.push("卡片本来就没被删除，跳过");
         break;
       }
-      emit(cmd.card, "card.restored", {}, `restore:${cmd.card}:${card.deletedAt}`);
+      emit(cmd.card, "card.restored", {}, intentKey("restore", card));
       break;
     }
 
     case "block": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
-      emit(cmd.card, "card.blocked", { reason: cmd.reason }, `block:${cmd.card}:${shortHash(cmd.reason)}`);
+      /**
+       * 阻塞是「停下来补前置」，只能落在还能干的卡上：
+       * `card.blocked` 是无条件置 blocked 的投影事件，放行 done/dropped/merged（或已删除）的卡
+       * 等于把它们拉回实施中（done 卡再 unblock 就进 working，merged 卡还能绕过 G4）。
+       */
+      if (card.deletedAt) {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: "卡片已删除，不能标记阻塞",
+          hint: `先恢复：flowcard restore ${cmd.card}`,
+        });
+      }
+      if (card.state === "done" || card.state === "dropped" || card.state === "merged") {
+        return fail({
+          code: "STATE_NOT_ALLOWED",
+          message: `卡片当前是 ${card.state}，不能再标记阻塞`,
+          hint:
+            card.state === "merged"
+              ? "已合并的卡片只在清理阶段（G4）：要拦清理就在评审里说清楚，而不是阻塞这张卡"
+              : "阻塞只用于实施中的卡；这张卡已经结束了（要重开就另开一张卡）",
+        });
+      }
+      // 同一条阻塞理由重发是重试：不写第二条（换了理由则要更新，所以按 reason 比）。
+      if (card.state === "blocked" && card.blockedReason === cmd.reason) {
+        notes.push("卡片已经是这个阻塞原因，跳过");
+        break;
+      }
+      emit(cmd.card, "card.blocked", { reason: cmd.reason }, intentKey("block", card));
       break;
     }
 
@@ -638,16 +715,34 @@ export function runCommand(input: {
       if (card.state !== "blocked") {
         return fail({ code: "STATE_NOT_ALLOWED", message: `卡片当前是 ${card.state}，不是 blocked` });
       }
-      requestTransition(cmd.card, "working", `unblock:${cmd.card}`);
+      requestTransition(cmd.card, "working", intentKey("unblock", card));
       break;
     }
 
     case "probePr": {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
+      /**
+       * 观察到的值没变 = 同一次上报的重发 → no-op（重复语义由守卫保证，不靠键）。
+       *
+       * 键用卡片版本而不是「编号 + 状态」：PR 会 open→closed→**open**，内容寻址的键会把
+       * 重新打开的那次和第一次的 `open` 撞成同一条（静默吞掉）；而带 `from:前值` 也只能防住
+       * 一次往返（open→closed→open→closed 的第 4 次又撞第 2 次）。版本键 + 值没变守卫两头都保。
+       */
+      // 与 `probeCommands` 的"该不该发"用同一套比较（含 CI：只 CI 变了的探测也要落库）。
+      const same =
+        card.pr?.number === cmd.pr.number &&
+        card.pr?.state === cmd.pr.state &&
+        card.pr?.url === cmd.pr.url &&
+        card.pr?.branch === cmd.pr.branch &&
+        (card.pr?.ci ?? null) === (cmd.pr.ci ?? null);
+      if (same) {
+        notes.push("PR 状态没有变化，跳过");
+        break;
+      }
       const merged = cmd.pr.state === "merged";
       const type: EventType = merged && card.pr?.state !== "merged" ? "pr.merged" : "pr.updated";
-      emit(cmd.card, type, { pr: cmd.pr }, `probe:${cmd.card}:${cmd.pr.number}:${cmd.pr.state}`);
+      emit(cmd.card, type, { pr: cmd.pr }, intentKey("probe", card));
       break;
     }
 
@@ -663,7 +758,23 @@ export function runCommand(input: {
       }
       const open = gateOpen(card, "G4");
       if (open) return fail({ code: "GATE_PENDING", message: `门禁 ${open} 还没决策` });
-      emit(cmd.card, "cleanup.proposed", { items: cmd.items }, `cleanup-plan:${cmd.card}`);
+      /**
+       * **G4 被驳回之后**重新提清单必须能提上去（旧键恒定，第二次提会被自己的幂等键吞掉，
+       * 卡就永久停在 merged：decideGate 报 STATE_NOT_ALLOWED、cleanup 报 GATE_PENDING，无路可走）。
+       * 但「清单已提交、还在等决策」与「G4 已批准」时重发是同一次请求的重试 → 跳过，
+       * 免得把 `requestedAt` 与已有决策抹掉。（G4 刚由自动化打开、还没提清单时不算重发：payload 里没 items。）
+       */
+      const g4 = card.gates.G4;
+      const alreadyProposed = Array.isArray(g4?.payload?.items) && g4.payload.items.length > 0;
+      if (g4 && (g4.status === "approved" || (g4.status === "open" && alreadyProposed))) {
+        notes.push(
+          g4.status === "approved"
+            ? "G4 已经批准：清单不用再提，直接 cleanup"
+            : "清理清单已经提交，等 G4 决策，跳过",
+        );
+        break;
+      }
+      emit(cmd.card, "cleanup.proposed", { items: cmd.items }, intentKey("cleanup-plan", card));
       break;
     }
 
@@ -677,7 +788,13 @@ export function runCommand(input: {
           hint: `flowcard cleanup ${cmd.card} --propose-item … → flowcard gate ${cmd.card} --gate G4 --approve`,
         });
       }
-      emit(cmd.card, "cleanup.completed", {}, `cleanup:${cmd.card}`);
+      // 清理是一次性事实（`cleanedAt` 不复位）：重发不写第二条、也不再跑一次 done 转换。
+      if (card.cleanedAt) {
+        notes.push("清理已经完成，跳过");
+        break;
+      }
+      cleanupKey = intentKey("cleanup", card);
+      emit(cmd.card, "cleanup.completed", {}, cleanupKey);
       break;
     }
 
@@ -715,16 +832,19 @@ export function runCommand(input: {
       const card = get(cmd.card);
       if (!card) return fail({ code: "NOT_FOUND", message: `卡片 ${cmd.card} 不存在` });
       /**
-       * 幂等键：同一条判定（同 verdict + 同正文）重发不产生第二条；
-       * 但**改主意再改回来要能记上** —— 所以键里只在"前一次判定与这次不同"时带上前值。
+       * 幂等键用卡片版本：A→B→A→B 每次都记得上（旧键带"前值"只能防住 A→B→A）。
+       * 同一条判定（同 verdict + 同正文）重发则由下面的守卫拦成 no-op —— 重复语义不靠键。
        */
-      const previous = card.review.verdict?.decision;
-      const from = previous === undefined || previous === cmd.verdict ? "-" : previous;
+      const previous = card.review.verdict;
+      if (previous && previous.decision === cmd.verdict && (previous.body ?? "") === (cmd.body ?? "")) {
+        notes.push(`判定没有变化（${cmd.verdict}），跳过`);
+        break;
+      }
       emit(
         cmd.card,
         "review.verdict.recorded",
         { verdict: cmd.verdict, ...(cmd.body ? { body: cmd.body } : {}) },
-        `review-verdict:${cmd.card}:${cmd.verdict}:${shortHash(cmd.body ?? "")}:from:${from}`,
+        intentKey("review-verdict", card),
       );
       notes.push(`评审判定已记录：${cmd.verdict}（不改流程状态：验收仍由人在看板上点 G3）`);
       break;
@@ -873,7 +993,7 @@ export function runCommand(input: {
 
   // ------------------------------------------------------------ B' 段：命令自带的转换意图
 
-  if (cmd.cmd === "cleanup") requestTransition(cmd.card, "done", `cleanup:${cmd.card}`);
+  if (cmd.cmd === "cleanup" && cleanupKey) requestTransition(cmd.card, "done", cleanupKey);
 
   // ------------------------------------------------------------ C 段：自动节点
 

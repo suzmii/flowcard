@@ -253,6 +253,33 @@ describe("同步目标解析（纯）", () => {
     ).toEqual({ ok: false, reason: "no-credentials" });
   });
 
+  it("FLOWCARD_GITEA_ROOT 只到站点根（https://gitea.com）也匹配；主机不一致仍然拒绝", () => {
+    // 修前：root 没有路径段 → remoteHost(root) 恒 null → 这里的每个用例都掉进 no-credentials
+    for (const root of ["https://gitea.com", "https://gitea.com/"]) {
+      expect(
+        resolveSyncTarget({
+          remote: "https://gitea.com/gitea/tea",
+          teaConfig: "",
+          env: { FLOWCARD_GITEA_ROOT: root, FLOWCARD_GITEA_TOKEN: "env-t0ken" },
+        }),
+      ).toMatchObject({
+        ok: true,
+        source: "env-gitea",
+        apiBase: "https://gitea.com/api/v1",
+        owner: "gitea",
+        repo: "tea",
+      });
+    }
+    // 主机不同 = 会把 token 发给别的主机：仍然不用
+    expect(
+      resolveSyncTarget({
+        remote: "https://gitea.com/gitea/tea",
+        teaConfig: "",
+        env: { FLOWCARD_GITEA_ROOT: "https://evil.example", FLOWCARD_GITEA_TOKEN: "env-t0ken" },
+      }),
+    ).toEqual({ ok: false, reason: "no-credentials" });
+  });
+
   it("GitHub token 只对 github.com 生效；都没有 → no-credentials（不抛）", () => {
     expect(
       resolveSyncTarget({ remote: "https://github.com/acme/demo", teaConfig: "", env: { FLOWCARD_GITHUB_TOKEN: "gh-t0ken" } }),

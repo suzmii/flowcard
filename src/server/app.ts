@@ -6,7 +6,15 @@ import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
-import { commandSchema, issueBaseInSchema, projectInSchema, runtimeActionSchema, syncRequestSchema } from "../shared/types.ts";
+import {
+  commandSchema,
+  issueBaseInSchema,
+  projectInSchema,
+  runtimeActionSchema,
+  sessionPromptSchema,
+  sessionStartSchema,
+  syncRequestSchema,
+} from "../shared/types.ts";
 import type { Project } from "../shared/types.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
@@ -14,9 +22,11 @@ import { runSyncRound, startSyncScheduler, trackedNumbers } from "./syncer.ts";
 import type { HttpGet } from "./sync.ts";
 import type { Run } from "./probe.ts";
 import { readProject } from "./projects.ts";
+import { deriveSessionState } from "./project.ts";
 import { autostartCard } from "./autostart.ts";
 import { writeBriefFile } from "./brief.ts";
-import { defaultAdapterPath, launchSession, resolveOmpPath } from "./launch.ts";
+import { defaultAdapterPath } from "./launch.ts";
+import { createHostedSessions, type HostedSessions } from "./hosted-session.ts";
 import { clampGraphLimit, readGraph } from "./graph.ts";
 import { readCardDiff } from "./diff.ts";
 import type { RuntimeSupervisor } from "./runtime.ts";
@@ -42,24 +52,29 @@ export type AppOptions = {
     teaConfig?: string | null;
   };
   /**
-   * 开卡即开工：`open` 成功后自动**在桌面上起一次会话**并把开工提示注入进去
+   * 开卡即开工：`open` 成功后自动**托管一次 omp RPC 会话**并把开工提示注入进去
    * （worktree 由会话自己按提示创建、自己登记）。`enabled: false` 或未传则只开卡不起会话。
    */
   autostart?: {
     enabled: boolean;
     dataDir: string;
-    adapterPath?: string;
     cli?: string;
-    /** 测试注入：替换真正的"起会话"实现。 */
-    launch?: typeof launchSession;
-    resolveOmpPath?: typeof resolveOmpPath;
+    /** 测试注入：替换写开工提示的实现。 */
     writeBrief?: typeof writeBriefFile;
   };
+  /**
+   * 托管会话（每卡一条 `omp --mode rpc --no-ui` 子进程）。不传就自己建一个（端点照样可用）；
+   * `main.ts` 自己建是为了进程退出时能 `stopAll()`，测试自己建是为了塞假 omp。
+   */
+  sessions?: HostedSessions;
 };
 
 export function createApp(store: Store, opts: AppOptions = {}) {
   const app = new Hono();
   const subscribers = new Set<(event: string, data: unknown) => void>();
+
+  // 托管会话：每卡一个 omp RPC 子进程；上报扩展默认就挂（心跳/结束上报的兜底）。
+  const sessions = opts.sessions ?? createHostedSessions({ store, adapterPath: defaultAdapterPath() });
 
   /**
    * 调用方鉴别：**只监听回环不等于可信**——任意网页都能从浏览器打 127.0.0.1，
@@ -116,6 +131,12 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     for (const send of subscribers) send(event, data);
   };
 
+  // 托管会话里的 claim/end 也是卡片事实（走的就是引擎那条命令通道）→ 和命令一样广播 "changed"。
+  sessions.onCard((change) => {
+    if (change.types.length === 0) return;
+    broadcast("changed", { cardIds: [change.cardId], types: change.types });
+  });
+
   // 后台同步也是卡片事实的来源 → 和命令一样广播 "changed"，看板据此重拉。
   if (opts.sync) {
     startSyncScheduler({
@@ -149,14 +170,19 @@ export function createApp(store: Store, opts: AppOptions = {}) {
   app.get("/api/cards", (c) => {
     // 软删除的卡默认不进看板；`?includeDeleted=1` 才带出来（配合 CLI 的 restore 用）
     const includeDeleted = c.req.query("includeDeleted") === "1";
-    const cards = store.listCards().filter((card) => includeDeleted || !card.deletedAt);
+    const now = Date.now();
+    const cards = store
+      .listCards()
+      .filter((card) => includeDeleted || !card.deletedAt)
+      // 会话失联是「读取时刻」的判断：库里的投影只有 running/ended，出口统一改判，CLI 与看板一致
+      .map((card) => deriveSessionState(card, now));
     return c.json({ cards });
   });
 
   app.get("/api/cards/:id", (c) => {
     const card = store.getCard(c.req.param("id"));
     if (!card) return c.json({ error: { code: "NOT_FOUND", message: "卡片不存在" } }, 404);
-    return c.json({ card });
+    return c.json({ card: deriveSessionState(card) });
   });
 
   app.get("/api/events", (c) => {
@@ -213,12 +239,10 @@ export function createApp(store: Store, opts: AppOptions = {}) {
           });
         },
         dataDir: opts.autostart.dataDir,
-        ...(opts.autostart.adapterPath ? { adapterPath: opts.autostart.adapterPath } : {}),
+        sessions,
         ...(opts.autostart.cli ? { cli: opts.autostart.cli } : {}),
         io: {
-          launchSession: opts.autostart.launch ?? launchSession,
-          resolveOmpPath: opts.autostart.resolveOmpPath ?? resolveOmpPath,
-          writeBrief: opts.autostart.writeBrief ?? writeBriefFile,
+          ...(opts.autostart.writeBrief ? { writeBrief: opts.autostart.writeBrief } : {}),
         },
       });
     }
@@ -611,6 +635,103 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     const result =
       parsed.data.action === "up" ? await runtime.up(cardId) : await runtime.down(cardId);
     return c.json(result, result.ok ? 200 : result.error?.code === "NOT_FOUND" ? 404 : 409);
+  });
+
+  /**
+   * 托管会话（每卡一个 `omp --mode rpc --no-ui` 子进程）—— 网页上直接对话、直接看工具输出。
+   *
+   * | 方法 | 路径 | 说明 |
+   * |---|---|---|
+   * | GET  | `/api/cards/:id/session` | 现况（status/busy/cost）+ 转录（落库的，重启后仍在） |
+   * | POST | `/api/cards/:id/session/start` | `{cwd?}` → `{ok,status,ompSessionId?}`；**立刻回 `starting`** |
+   * | POST | `/api/cards/:id/session/prompt` | `{text,images?}` → `{ok,messageId?}` |
+   * | POST | `/api/cards/:id/session/abort` | 中断当前一轮 |
+   * | POST | `/api/cards/:id/session/stop` | 收尾（关 stdin → omp 自己退 → 上报 `end`） |
+   * | GET  | `/api/cards/:id/session/stream` | 这张卡一条 SSE：ready/message/message_end/tool/state/notice/error |
+   */
+  app.get("/api/cards/:id/session", (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    return c.json(sessions.snapshot(cardId));
+  });
+
+  app.post("/api/cards/:id/session/start", async (c) => {
+    const cardId = c.req.param("id");
+    const body = await c.req.json().catch(() => null);
+    const parsed = sessionStartSchema.safeParse(body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+        .join("; ");
+      return c.json({ ok: false, status: "stopped", error: { code: "USAGE_ERROR", message } }, 400);
+    }
+    const result = await sessions.start(cardId, {
+      ...(parsed.data.cwd === undefined ? {} : { cwd: parsed.data.cwd }),
+    });
+    // 起不来也不是 5xx：状态就是 `failed`，原因在 `error` 里（前端照着显示）。
+    return c.json(result, result.error?.code === "NOT_FOUND" ? 404 : 200);
+  });
+
+  app.post("/api/cards/:id/session/prompt", async (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    const body = await c.req.json().catch(() => null);
+    const parsed = sessionPromptSchema.safeParse(body);
+    if (!parsed.success) {
+      const message = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+        .join("; ");
+      return c.json({ ok: false, error: { code: "USAGE_ERROR", message } }, 400);
+    }
+    const images = parsed.data.images ?? [];
+    if (parsed.data.text.trim() === "" && images.length === 0) {
+      return c.json({ ok: false, error: { code: "USAGE_ERROR", message: "text 与 images 不能都空" } }, 400);
+    }
+    const result = await sessions.prompt(cardId, parsed.data.text, images);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  app.post("/api/cards/:id/session/abort", async (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    const result = await sessions.abort(cardId);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  app.post("/api/cards/:id/session/stop", async (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    const result = await sessions.stop(cardId);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  // 每卡一条 SSE（**不把增量灌进全局 `/api/stream`**）：连上先收到 `ready` + `state` 的现况，
+  // 历史转录走 `GET .../session`。
+  app.get("/api/cards/:id/session/stream", (c) => {
+    const cardId = c.req.param("id");
+    if (!store.getCard(cardId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } }, 404);
+    }
+    return streamSSE(c, async (stream) => {
+      const off = sessions.subscribe(cardId, (event) => {
+        const { type, ...body } = event;
+        // 客户端断了就别让这条事件把服务搞出未处理的 rejection（`onAbort` 随后会退订）。
+        stream.writeSSE({ event: type, data: JSON.stringify(body) }).catch(() => undefined);
+      });
+      stream.onAbort(off);
+      while (!stream.aborted) {
+        await stream.sleep(15_000);
+        stream.writeSSE({ event: "ping", data: JSON.stringify({ at: new Date().toISOString() }) }).catch(() => undefined);
+      }
+    });
   });
 
   app.get("/api/stream", (c) =>

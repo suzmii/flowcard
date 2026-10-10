@@ -2,7 +2,8 @@
  * 评审面板：三个判定动作（approve / request-changes / comment）+ 当前判定 + 评审记录（历史）。
  *
  * **语义（文案必须说清）**：评审只是本地记录的意见 —— approve **不会**把卡片推到下一列，
- * 验收仍然由人在「门禁」区点 G3。判定与评论都走 `POST /api/commands`，不碰远程、不动 worktree。
+ * 验收仍然由人在「状态动作」区点「验收（G3）」（accept，服务端一次合成 G3 的 requested+decided）。
+ * 判定与评论都走 `POST /api/commands`，不碰远程、不动 worktree。
  * 契约只给最新一条 `card.review.verdict`，所以这里显示“当前判定” + 评论时间线当历史。
  */
 import { useState, type ReactNode } from "react";
@@ -71,8 +72,8 @@ export function ReviewPanel({
       </div>
 
       <p className="rounded border border-sky-600/30 bg-sky-50/60 p-1.5 text-[11px] text-sky-900" data-testid="review-semantics">
-        这里<strong>只记录意见</strong>：approve 不会自动改卡片状态，也不会合并 PR。验收仍要在「门禁」区由人点 G3
-        批准，合并由人自己做（本页不写远程）。
+        这里<strong>只记录意见</strong>：approve 不会自动改卡片状态，也不会合并 PR。验收是人拍板的动作，在
+        「状态动作」区点<strong>「验收（G3）」</strong>；合并由人自己做（本页不写远程）。
       </p>
 
       {verdict?.body ? (

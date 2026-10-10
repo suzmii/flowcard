@@ -23,6 +23,21 @@ export type {
   Session,
 } from "../../../src/shared/types.ts";
 
+/**
+ * 托管会话（`/api/cards/:id/session*`，见 `lib/session.ts`）的对外类型：
+ * 组件一律从 `@/lib/contract` 取类型，真实实现留在 session.ts。
+ */
+export type {
+  HostedSessionStatus,
+  SessionEvent,
+  SessionMessage,
+  SessionNotice,
+  SessionRole,
+  SessionState,
+  SessionTool,
+  SessionView,
+} from "@/lib/session";
+
 /** 与 CARD_STATES 同序，看板列顺序即此顺序。 */
 export const CARD_STATES = [
   "ready",

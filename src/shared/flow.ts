@@ -113,9 +113,15 @@ export function describeMissing(flow: Flow, ids: string[]): string[] {
   });
 }
 
-/** 会话是否真的在这个 worktree 里干活（1:1 模型下的硬校验）。 */
+/**
+ * 会话是否**真的**在这个 worktree 里干活（1:1 模型下的硬校验）。
+ *
+ * 「还在干活」包含会话本身还活着：`ended` / `lost` 的会话不算 —— 否则一张卡上留下的历史 cwd
+ * 会让 `blocked -> working`（以及任何依赖本项的转换）在会话早就不在的时候照样放行。
+ */
 export function sessionInsideWorktree(card: Card): boolean {
   if (!card.worktree || !card.session) return false;
   if (card.session.agentKind !== "main") return false;
+  if (card.session.state !== "running" && card.session.state !== "idle") return false;
   return isInside(card.session.cwd, card.worktree.path);
 }

@@ -1,9 +1,10 @@
 /**
- * 卡片上的"人工推进"动作：**放弃**（drop，理由进评论）与**删除**（软删除：从看板消失、可恢复）。
- * 其余推进都由事实自动完成（绑 worktree / 起会话自动开工、推送、PR 合并、验收、清理）。
+ * 卡片上的"人工推进"动作：**验收**（accept，人拍板 G3）、**放弃**（drop，理由进评论）与
+ * **删除**（软删除：从看板消失、可恢复）。
+ * 其余推进都由事实自动完成（绑 worktree / 起会话自动开工、推送、PR 合并、清理）。
  */
 import { useState } from "react";
-import { CircleSlash, Trash2, Undo2 } from "lucide-react";
+import { CircleSlash, ShieldCheck, Trash2, Undo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { CardView } from "@/lib/schema";
@@ -50,8 +51,28 @@ export function StateActions({
   const finished = card.state === "done" || card.state === "dropped";
   if (finished) return null;
 
+  /**
+   * 验收（G3）：**只有人能拍板**，而且服务端只有 `accept` 会一次性合成 G3 的 requested + decided
+   * （投影里不存在「未决的 G3」），所以入口必须放在这里，门禁区里等不到它。
+   * 验收满足 `review → merged` 的 accepted 要件；PR 已合并时这一步就把卡片推进「已合并待清理」。
+   */
+  const canAccept = card.state === "review" && !card.acceptedAt;
+
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="state-actions">
+      {canAccept ? (
+        <Button
+          size="xs"
+          data-testid="state-accept"
+          disabled={busy !== null}
+          title="人工验收（G3）：记录 G3 通过；PR 已合并时卡片随之进入「已合并待清理」"
+          onClick={() => void onRun("验收（G3）", { cmd: "accept", actor: human, card: card.id })}
+        >
+          <ShieldCheck />
+          验收（G3）
+        </Button>
+      ) : null}
+
       {confirmDrop ? (
         <span className="flex flex-wrap items-center gap-2" data-testid="state-drop-form">
           <Input

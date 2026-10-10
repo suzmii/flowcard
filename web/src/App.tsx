@@ -235,6 +235,8 @@ export function App() {
         onCreated={board.refresh}
         projectId={currentProject?.id ?? null}
         projectName={currentProject?.name ?? null}
+        projectsUnavailable={projects.unavailable}
+        projectsError={projects.error}
       />
     </div>
   );

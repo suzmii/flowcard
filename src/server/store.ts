@@ -58,7 +58,11 @@ const clip = (s: string, max: number): string => (s.length <= max ? s : `${s.sli
  */
 export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResolution {
   const cands = cards.flatMap((c) =>
-    c.worktree ? [{ id: c.id, raw: c.worktree.path, path: normalizePath(c.worktree.path) }] : [],
+    // 软删除的卡片不再是认领目标：删掉的老卡（worktree 还在历史里）不该抢走新卡片的位置，
+    // 否则「建错了 → 删除 → 重建同 worktree」之后按 cwd 认领会撞上并列而永远解不出唯一解。
+    c.worktree && !c.deletedAt
+      ? [{ id: c.id, raw: c.worktree.path, path: normalizePath(c.worktree.path) }]
+      : [],
   );
   // 参照物里的路径太长就只留尾巴：hint 是给人定位用的，不是让人读全路径。
   const listed = cands
@@ -107,8 +111,10 @@ export function resolveClaimCardByCwd(cwd: string, cards: Card[]): CwdClaimResol
  * v5：状态从 9 个缩到 7 个（删 `inbox` / `issue` 两层中转）→ 老事件里的这两个状态投影成 `ready`，
  *     建卡直接落 `ready`，所以形态变了、必须重放。
  * v6：卡片新增 `remoteComments`（同步进来的远端评论），老投影里没有 → 重放补上空数组。
+ * v8：卡片新增 `eventCount`（已应用的事件条数）——意图类命令的幂等键用它当卡片版本，
+ *     老投影里没有这个字段 → 必须重放一遍才能继续拿它当幂等键。
  */
-export const PROJECTION_VERSION = "7";
+export const PROJECTION_VERSION = "8";
 
 /**
  * 一个项目上一轮同步的结果（按项目存在 `meta` 表里，**不进事件流**）：
@@ -126,6 +132,31 @@ export type ProjectSyncState = {
   /** 上一轮整体没跑成的原因（没凭据等）；成功一轮后清掉。 */
   lastError?: string;
 };
+
+/**
+ * 托管会话里的一次工具调用（转录里 `role: "tool"` 的那一行）。
+ * `status` 跟着 omp 的 `tool_execution_start/update/end` 走；`output` 是从结果里抠出来的可读文本。
+ */
+export type SessionToolEvent = {
+  callId: string;
+  name: string;
+  status: "start" | "update" | "end";
+  args?: unknown;
+  output?: string;
+  isError?: boolean;
+};
+
+export type SessionMessageInput = {
+  cardId: string;
+  messageId: string;
+  role: "user" | "assistant" | "tool";
+  at: string;
+  text?: string;
+  tool?: SessionToolEvent;
+};
+
+/** 落库的转录行（`seq` 是卡片内自增序号，用来定顺序）。 */
+export type SessionMessageRow = SessionMessageInput & { seq: number };
 
 export type Store = {
   /** 执行一条命令；被拒时什么也不写。 */
@@ -155,6 +186,16 @@ export type Store = {
   /** 存一张图片附件（内容寻址，幂等）；校验不过返回 error。 */
   appendAttachment(input: { name: string; mime: string | undefined; bytes: Uint8Array }, now?: string): AppendAttachmentResult;
   getAttachment(id: string): { attachment: Attachment; bytes: Uint8Array } | undefined;
+  /**
+   * 追加/更新一条托管会话的转录行：同 `messageId` 复写（工具调用会随 start/update/end 刷三遍），
+   * 新行按卡片内 `seq` 递增。返回这一行的 `seq`。
+   *
+   * **不进事件流**（取舍见 `docs/design.md` §14）：转录是"会话说了什么"，不是流程事实；
+   * 每个文本增量都写事件会把事件日志淹掉，而重放投影并不需要它。
+   */
+  appendSessionMessage(input: SessionMessageInput): { seq: number };
+  /** 某张卡片的转录（按 `seq` 升序；默认最近 500 条，上限 2000）。 */
+  listSessionMessages(cardId: string, limit?: number): SessionMessageRow[];
   close(): void;
 };
 
@@ -186,6 +227,39 @@ const toAttachment = (row: AttachmentRow): Attachment => ({
   bytes: row.bytes,
   at: row.at,
 });
+
+type SessionMessageDbRow = {
+  card_id: string;
+  seq: number;
+  message_id: string;
+  role: string;
+  at: string;
+  text: string | null;
+  tool_json: string | null;
+};
+
+/** 每张卡片最多留这么多条转录（工具输出很占地方）；再老的真删掉，别让它无限长。 */
+export const SESSION_TRANSCRIPT_MAX = 2_000;
+
+const toSessionMessage = (row: SessionMessageDbRow): SessionMessageRow => {
+  let tool: SessionToolEvent | undefined;
+  if (row.tool_json !== null) {
+    try {
+      tool = JSON.parse(row.tool_json) as SessionToolEvent;
+    } catch {
+      tool = undefined; // 写坏的 JSON 不该让整段转录读不出来
+    }
+  }
+  return {
+    cardId: row.card_id,
+    seq: row.seq,
+    messageId: row.message_id,
+    role: row.role === "user" || row.role === "tool" ? row.role : "assistant",
+    at: row.at,
+    ...(row.text === null ? {} : { text: row.text }),
+    ...(tool === undefined ? {} : { tool }),
+  };
+};
 
 export function createStore(opts: { dataDir: string; flow: Flow }): Store {
   // 数据目录里有卡片正文、远端评论正文、附件：只给自己读写（不依赖 umask）
@@ -237,6 +311,20 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       name  TEXT NOT NULL,
       bytes INTEGER NOT NULL,
       at    TEXT NOT NULL
+    );
+    -- 托管会话的转录（每卡一条 omp RPC 会话的对话与工具输出）。
+    -- **不进事件流**：转录是「会话说了什么」，不是流程事实（流程只认 claim/beat/end）；
+    -- 每个文本增量都写事件会把事件日志淹掉，而重放投影并不需要它。取舍见 docs/design.md §14。
+    -- 主键是 (card_id, message_id)：工具调用会随 start/update/end 复写同一行。
+    CREATE TABLE IF NOT EXISTS session_messages (
+      card_id    TEXT NOT NULL,
+      seq        INTEGER NOT NULL,
+      message_id TEXT NOT NULL,
+      role       TEXT NOT NULL,
+      at         TEXT NOT NULL,
+      text       TEXT,
+      tool_json  TEXT,
+      PRIMARY KEY (card_id, message_id)
     );
   `);
 
@@ -294,17 +382,6 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       inserted.push({ ...ev, id, seq: Number(res.lastInsertRowid) });
     }
     return { inserted, duplicates };
-  };
-
-  const nextCardId = (): string => {
-    const row = db.prepare("SELECT value FROM meta WHERE key = 'next_card'").get() as
-      | { value: string }
-      | undefined;
-    const next = row ? Number(row.value) + 1 : 1;
-    db.prepare(
-      "INSERT INTO meta (key, value) VALUES ('next_card', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ).run(String(next));
-    return `c${next}`;
   };
 
   const metaGet = (key: string): string | undefined => {
@@ -462,14 +539,62 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     return bytes ? { attachment, bytes } : undefined;
   };
 
+  // ---------------------------------------------------------------- 托管会话的转录（不进事件流）
+
+  const appendSessionMessage = (input: SessionMessageInput): { seq: number } => {
+    const toolJson = input.tool === undefined ? null : JSON.stringify(input.tool);
+    const existing = db
+      .prepare("SELECT seq FROM session_messages WHERE card_id = ? AND message_id = ?")
+      .get(input.cardId, input.messageId) as { seq: number } | undefined;
+    if (existing) {
+      // 同一条消息的后续刷新（工具调用 start→update→end、助手文本 text_end→message_end）就地改。
+      db.prepare(
+        "UPDATE session_messages SET role = ?, at = ?, text = ?, tool_json = ? WHERE card_id = ? AND message_id = ?",
+      ).run(input.role, input.at, input.text ?? null, toolJson, input.cardId, input.messageId);
+      return { seq: existing.seq };
+    }
+    const head = db
+      .prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM session_messages WHERE card_id = ?")
+      .get(input.cardId) as { m: number };
+    const seq = head.m + 1;
+    db.prepare(
+      "INSERT INTO session_messages (card_id, seq, message_id, role, at, text, tool_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(input.cardId, seq, input.messageId, input.role, input.at, input.text ?? null, toolJson);
+    db.prepare("DELETE FROM session_messages WHERE card_id = ? AND seq <= ?").run(
+      input.cardId,
+      seq - SESSION_TRANSCRIPT_MAX,
+    );
+    return { seq };
+  };
+
+  const listSessionMessages = (cardId: string, limit = 500): SessionMessageRow[] => {
+    const cap = Math.min(Math.max(Math.floor(limit), 1), SESSION_TRANSCRIPT_MAX);
+    const rows = db
+      .prepare("SELECT * FROM session_messages WHERE card_id = ? ORDER BY seq DESC LIMIT ?")
+      .all(cardId, cap) as SessionMessageDbRow[];
+    return rows.map(toSessionMessage).reverse();
+  };
+
   const execute = (cmd: Command, now = new Date().toISOString()): ExecuteResult => {
+    /**
+     * 卡号只在**这一轮 execute 里**预付（`peeked`），真正落库推迟到事务内。
+     * 被拒的命令（项目不存在 / Issue 补不齐）与全被幂等吞掉的重复 open 都不会烧号，
+     * 所以卡号不会出现 c1、c3 这样的空洞；崩溃/回滚时预付也跟着作废（同一个闭包变量）。
+     */
+    let peeked = 0;
     const outcome = runCommand({
       flow: opts.flow,
       getCard,
       getProject,
       cmd,
       now,
-      newCardId: nextCardId,
+      newCardId: () => {
+        const row = db.prepare("SELECT value FROM meta WHERE key = 'next_card'").get() as
+          | { value: string }
+          | undefined;
+        peeked = (peeked > 0 ? peeked : row ? Number(row.value) : 0) + 1;
+        return `c${peeked}`;
+      },
       resolveCardByCwd: (cwd) => resolveClaimCardByCwd(cwd, listCards()),
     });
     if (outcome.rejection) {
@@ -484,6 +609,12 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
       // 若照样重投影就会给"新分配但没事件"的 id 落一张空壳卡（重复 open 会凭空多一张空卡）。
       const touched = new Set(written.inserted.map((e) => e.cardId));
       for (const cardId of touched) putCard(project(cardId));
+      // 有事件落库才推进卡号计数器（分配过才动；重复 open 一条没写就原样留着这个号）。
+      if (peeked > 0 && written.inserted.length > 0) {
+        db.prepare(
+          "INSERT INTO meta (key, value) VALUES ('next_card', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ).run(String(peeked));
+      }
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
@@ -572,6 +703,8 @@ export function createStore(opts: { dataDir: string; flow: Flow }): Store {
     setSyncState,
     appendAttachment,
     getAttachment,
+    appendSessionMessage,
+    listSessionMessages,
     close() {
       db.close();
     },

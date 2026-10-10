@@ -1,8 +1,9 @@
-/** 开工这条链路的单测：提示词内容、argv 拼装与引号、编排的降级路径。全部不碰真终端/git。 */
+/** 开工这条链路的单测：提示词内容、托管会话的编排与降级路径。全部不碰真 omp/git。 */
 import { describe, expect, it } from "vitest";
 import { cardBrief, writeBriefFile } from "../src/server/brief.ts";
 import { autostartCard, hasLiveSession } from "../src/server/autostart.ts";
-import { defaultAdapterPath, sessionCommand, shq } from "../src/server/launch.ts";
+import type { HostedSessions, StartSessionOptions, StartSessionResult } from "../src/server/hosted-session.ts";
+import { defaultAdapterPath } from "../src/server/launch.ts";
 import { emptyCard } from "../src/server/project.ts";
 import type { Card, Project } from "../src/shared/types.ts";
 
@@ -23,6 +24,44 @@ function card(overrides: Partial<Card> = {}): Card {
     body: "现象：点开会卡住",
     ...overrides,
   };
+}
+
+/** 假的托管会话注册表：只记下 start 拿到了什么。 */
+function fakeSessions(outcome: Partial<StartSessionResult> = {}): {
+  sessions: HostedSessions;
+  started: StartSessionOptions[];
+} {
+  const started: StartSessionOptions[] = [];
+  const sessions: HostedSessions = {
+    async start(_cardId, opts = {}) {
+      started.push(opts);
+      return {
+        ok: true,
+        status: "starting",
+        ...(opts.cwd === undefined ? {} : { cwd: opts.cwd }),
+        ...outcome,
+      };
+    },
+    async prompt() {
+      return { ok: true, messageId: "u:1" };
+    },
+    async abort() {
+      return { ok: true };
+    },
+    async stop() {
+      return { ok: true };
+    },
+    async stopAll() {
+      return undefined;
+    },
+    snapshot: () => ({ status: "stopped", cwd: "", busy: false, messages: [] }),
+    subscribe: () => () => undefined,
+    onCard: () => () => undefined,
+    isLive: () => false,
+    liveCardIds: () => [],
+    resolveCwd: () => "/repo",
+  };
+  return { sessions, started };
 }
 
 describe("开工提示（brief）", () => {
@@ -77,38 +116,9 @@ describe("开工提示（brief）", () => {
   });
 });
 
-describe("启动命令拼装", () => {
-  it("POSIX 单引号转义挡得住引号与空格", () => {
-    expect(shq("/a b/c")).toBe("'/a b/c'");
-    expect(shq("it's")).toBe("'it'\\''s'");
-  });
-
-  it("终端 argv：cwd 一律作为独立参数或已转义（xterm 兜底路径也不拼未转义字符串）", async () => {
-    const { TERMINALS } = await import("../src/server/launch.ts");
-    const evil = "/tmp/有 空格; rm -rf ~";
-    for (const terminal of TERMINALS) {
-      const argv = terminal.argv({ cwd: evil, command: "echo hi" });
-      const joined = argv.join("\u0000");
-      if (terminal.binary === "xterm") {
-        // xterm 只有一个字符串参数，必须已经 shq 转义：不能出现裸的分号
-        const inner = argv[argv.length - 1] ?? "";
-        expect(inner).toContain("'/tmp/有 空格; rm -rf ~'");
-      } else {
-        expect(joined).toContain(evil);
-      }
-    }
-  });
-
-  it("会话命令：带扩展与提示文件，且提示用 $(cat) 传，退出后留住终端", () => {
-    const cmd = sessionCommand({
-      ompPath: "/home/u/.bun/bin/omp",
-      adapterPath: "/repo/src/adapters/omp/adapter.ts",
-      briefPath: "/data/briefs/c7.md",
-    });
-    expect(cmd).toContain("'/home/u/.bun/bin/omp'");
-    expect(cmd).toContain("-e '/repo/src/adapters/omp/adapter.ts'");
-    expect(cmd).toContain('--append-system-prompt "$(cat \'/data/briefs/c7.md\')"');
-    expect(cmd).toContain("exec bash -i");
+describe("omp 辅助", () => {
+  it("扩展路径由服务端自己算出来（不靠环境变量）", () => {
+    expect(defaultAdapterPath().endsWith("src/adapters/omp/flowcard-omp-adapter.ts")).toBe(true);
   });
 });
 
@@ -116,37 +126,65 @@ describe("自动开工编排", () => {
   const deps = (over: Record<string, unknown> = {}) => {
     const calls: string[] = [];
     const cards = new Map<string, Card>([["c7", card()]]);
+    const fake = fakeSessions();
     const base = {
       getCard: (id: string) => cards.get(id),
       getProject: () => project,
       comment: async (id: string, body: string) => void calls.push(`comment:${id}:${body}`),
       dataDir: "/data",
-      adapterPath: "/repo/src/adapters/omp/adapter.ts",
-      io: {
-        launchSession: async () => ({ ok: true, terminal: "konsole", command: "omp …" }),
-        resolveOmpPath: async () => "/home/u/.bun/bin/omp",
-        writeBrief: async () => ({ written: true }),
-      },
+      sessions: fake.sessions,
+      started: fake.started,
+      io: { writeBrief: async () => ({ written: true }) },
       calls,
       ...over,
     };
     return base;
   };
 
-  it("正常路径：写提示 → 在项目根起会话（worktree 交给 AI），结论写进评论", async () => {
+  it("正常路径：写提示 → 起托管会话（brief 走系统提示、开工话走第一条 prompt），结论写进评论", async () => {
     const d = deps();
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("started");
     expect(outcome.cwd).toBe("/repo");
-    expect(outcome.terminal).toEqual({ ok: true, terminal: "konsole", command: "omp …" });
-    expect(d.calls.some((c) => c.startsWith("comment:c7:已在桌面上启动会话"))).toBe(true);
+    expect(outcome.session).toEqual({ ok: true, status: "starting" });
+    expect(d.started).toHaveLength(1);
+    expect(d.started[0]?.cwd).toBe("/repo");
+    expect(d.started[0]?.brief).toContain("你是 flowcard 卡片 c7 的会话");
+    expect(d.started[0]?.kickoff).toContain("开工：你是卡片 c7 的会话");
+    expect(d.calls.some((c) => c.startsWith("comment:c7:已托管会话"))).toBe(true);
   });
 
-  it("已有会话在跑 → 跳过，不重复开终端", async () => {
-    const running = card({ session: { harness: "omp", id: "s1", agentKind: "main", cwd: "/repo/.worktrees/c7", state: "running", startedAt: "x", lastSeenAt: "x" } });
+  it("绑的 worktree 目录没了 → 先起在项目根，并留一条评论说明", async () => {
+    const gone = card({ worktree: { path: "/repo/.worktrees/gone", branch: "feat/x", source: "flowcard" } });
+    const d = deps({ getCard: () => gone });
+    const outcome = await autostartCard("c7", d as never);
+    expect(outcome.status).toBe("started");
+    expect(outcome.cwd).toBe("/repo");
+    expect(d.started[0]?.cwd).toBe("/repo");
+    expect(d.calls.some((c) => c.includes("但那个目录不存在了"))).toBe(true);
+  });
+
+  it("已有会话在跑（卡片投影或注册表）→ 跳过，不重复起", async () => {
+    const running = card({
+      session: {
+        harness: "omp",
+        id: "s1",
+        agentKind: "main",
+        cwd: "/repo/.worktrees/c7",
+        state: "running",
+        startedAt: "x",
+        lastSeenAt: "x",
+      },
+    });
     expect(hasLiveSession(running)).toBe(true);
-    const outcome = await autostartCard("c7", deps({ getCard: () => running }) as never);
-    expect(outcome.status).toBe("skipped");
+    const skippedCard = await autostartCard("c7", deps({ getCard: () => running }) as never);
+    expect(skippedCard.status).toBe("skipped");
+
+    const fake = fakeSessions();
+    const liveSessions: HostedSessions = { ...fake.sessions, isLive: () => true };
+    const liveRegistry = await autostartCard("c7", deps({ sessions: liveSessions }) as never);
+    expect(liveRegistry.status).toBe("skipped");
+    expect(fake.started).toHaveLength(0);
   });
 
   it("提示里把「建 worktree」交回给会话：名字自定 + 要登记 + 要切进去", async () => {
@@ -161,18 +199,21 @@ describe("自动开工编排", () => {
     expect(text).toMatch(/在主仓库里改文件不算开工/);
   });
 
-  it("没终端 → 评论里给手动启动命令，卡片状态不动", async () => {
+  it("会话没起来 → 评论里给重试/手动办法，卡片状态不动", async () => {
     const d = deps({
-      io: {
-        launchSession: async () => ({ ok: false, reason: "no-terminal", message: "没找到可用的终端" }),
-        resolveOmpPath: async () => undefined,
-        writeBrief: async () => ({ written: true }),
-      },
+      sessions: fakeSessions({
+        ok: false,
+        status: "failed",
+        error: { code: "NO_CWD", message: "工作目录不存在：/repo" },
+      }).sessions,
     });
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("failed");
     expect(outcome.cwd).toBe("/repo");
+    expect(outcome.session).toEqual({ ok: false, status: "failed" });
+    expect(outcome.summary).toContain("工作目录不存在");
     expect(d.calls.some((c) => c.includes("没起来会话"))).toBe(true);
+    expect(d.calls.some((c) => c.includes("flowcard claim c7"))).toBe(true);
   });
 
   it("未归属项目的卡不自动开工", async () => {
@@ -181,29 +222,7 @@ describe("自动开工编排", () => {
     expect(outcome.summary).toContain("未归属");
   });
 
-  it("起会话时把卡片 id 塞进环境，适配器第一秒就能绑卡", async () => {
-    const seen: { cardId?: string }[] = [];
-    const d = deps({
-      io: {
-        launchSession: async (opts: { cardId?: string }) => {
-          seen.push({ ...(opts.cardId ? { cardId: opts.cardId } : {}) });
-          return { ok: true, terminal: "konsole", command: "omp …" };
-        },
-        resolveOmpPath: async () => undefined,
-        writeBrief: async () => ({ written: true }),
-      },
-    });
-    await autostartCard("c7", d as never);
-    expect(seen).toEqual([{ cardId: "c7" }]);
-  });
-
-  it("扩展路径由服务端自己算出来（不靠环境变量）", () => {
-    const path = defaultAdapterPath();
-    expect(path.endsWith("src/adapters/omp/flowcard-omp-adapter.ts")).toBe(true);
-  });
-
   it("提示文件目录不存在时自己建（第一次开卡的老 bug：ENOENT 把请求打成 500）", async () => {
-    const { writeBriefFile } = await import("../src/server/brief.ts");
     const files = new Map<string, string>();
     const made: string[] = [];
     const io = {
@@ -221,18 +240,18 @@ describe("自动开工编排", () => {
   });
 
   it("编排里任何意外都不抛：变成卡片评论 + failed（开卡不能因此 500）", async () => {
+    const crashing = fakeSessions();
     const d = deps({
-      io: {
-        launchSession: async () => {
-          throw new Error("终端炸了");
+      sessions: {
+        ...crashing.sessions,
+        start: async () => {
+          throw new Error("会话炸了");
         },
-        resolveOmpPath: async () => undefined,
-        writeBrief: async () => ({ written: true }),
       },
     });
     const outcome = await autostartCard("c7", d as never);
     expect(outcome.status).toBe("failed");
-    expect(outcome.summary).toContain("终端炸了");
+    expect(outcome.summary).toContain("会话炸了");
     expect(d.calls.some((c) => c.includes("自动开工时出了意外"))).toBe(true);
   });
 });

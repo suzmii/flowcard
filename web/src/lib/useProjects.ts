@@ -1,8 +1,12 @@
 /**
  * 项目选择状态：`GET /api/projects` 拉列表，选中的 id 存 localStorage（刷新后保持）。
  * 服务端的项目列表一定含 `local`（未归属的卡），所以选不上已存 id 时兜回 `local`。
+ *
+ * 硬规矩：**拉取失败不动选择** —— 失败时列表是空的，拿空列表去"修正"选择会把 localStorage 里
+ * 存的 id 一起冲掉，后端恢复后用户的选择也回不来。只有成功拿到列表且列表里确实没有该 id 才换。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { streamUrl } from "@/lib/api";
 import {
   LOCAL_PROJECT_ID,
   addProject,
@@ -70,6 +74,8 @@ export function useProjects(): ProjectsData {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  /** true = 最近一次刷新**成功拿到列表**；失败时用它挡住"拿空列表去清选择"。 */
+  const [listed, setListed] = useState(false);
   const inFlight = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -80,8 +86,10 @@ export function useProjects(): ProjectsData {
       if (result.ok) {
         setProjects(result.projects);
         setUnavailable(false);
+        setListed(true);
         setError(result.projects.length === 0 ? "服务端没有返回任何项目（连 local 都没有）" : null);
       } else {
+        // 失败**只**报错：列表与选择都保持原样（清掉就再也回不来，恢复后也认不出原来选的是谁）
         setUnavailable(result.unavailable);
         setError(result.message);
       }
@@ -95,10 +103,23 @@ export function useProjects(): ProjectsData {
     void refresh();
   }, [refresh]);
 
-  // 选中的 id 必须落在列表里；不在（首次、项目被删、id 变了）就兜回 local，没有 local 再退到第一个。
-  // 注意：列表还没回来时（loading）**不能**拿空列表去清选择，否则 localStorage 里存的会被冲掉。
+  /**
+   * 项目列表也要跟着 SSE 走：`hello`（连上/重连成功）与 `projects`（别处加了项目 / 改了基址）都重拉一次。
+   * 否则服务端重启后项目列表不会自己回来，选择也就一直是空的。
+   */
   useEffect(() => {
-    if (loading) return;
+    const source = new EventSource(streamUrl());
+    const reload = () => void refresh();
+    source.addEventListener("hello", reload);
+    source.addEventListener("projects", reload);
+    return () => source.close();
+  }, [refresh]);
+
+  // 选中的 id 必须落在列表里；不在才换（首次、项目被删、id 变了）→ 兜回 local，没有 local 再退到第一个。
+  // 关键：**只有成功拿到列表且列表里确实没有该 id** 才动选择与 localStorage。
+  // 拉取失败时列表是空的，那时候清选择 = 把用户存的选择永久冲掉（后端恢复也回不来）。
+  useEffect(() => {
+    if (!listed) return;
     if (projects.length === 0) {
       if (selectedId !== null) {
         setSelectedId(null);
@@ -111,7 +132,7 @@ export function useProjects(): ProjectsData {
     if (!fallback) return;
     setSelectedId(fallback.id);
     writeStoredId(fallback.id);
-  }, [loading, projects, selectedId]);
+  }, [listed, projects, selectedId]);
 
   const select = useCallback((id: string) => {
     setSelectedId(id);

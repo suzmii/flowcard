@@ -268,6 +268,32 @@ git.probed
 session.cwd.mismatch
 ```
 
+### 6.1 幂等键的分层规则
+
+`dedupeKey` 是全局唯一索引，重复写入**静默**丢弃（不报错）。所以「用什么当键」就是在决定
+「什么算重复」。用**命令内容**当键会让同内容的第二次合法操作被当成重复请求吞掉
+（第二次 unblock、同理由的第二次 block、G4 被驳回后重新提清单、删除→恢复→再删除、A→B→A→B
+把值改回去…症状全是「命令返回 ok，但状态没动」）。按键的**性质**分三层：
+
+1. **带外部身份的事实** → 内容/身份寻址（重复就是同一件事，天生重试安全）：
+   `open` 的内容指纹（同内容 = 同一张卡）、`push:{card}:{sha}`、`sync:*`（`factKey`：编号 + 远端
+   `updatedAt` / 评论 id）、会话的 `claim:{card}:{sessionId}:{hash(cwd)}:{startedAt}` 与
+   `end:{card}:{sessionId}:{startedAt}`（会话 id 是身份，`startedAt` 把"恢复后再跑一轮"区分开）、
+   `applySync` 的每条事实。
+2. **意图类命令**（block / unblock / delete / restore / drop / accept / worktree / bindIssue /
+   bindPr / decideGate / proposeCleanup / cleanup / probePr / reviewVerdict）→
+   **`{cmd}:{card}:{card.eventCount}`**：`Card.eventCount` 是**卡片版本**（每折一条事件 +1，
+   `emptyCard` 从 0 起，由 `applyEvent` 纯自增；`rebuild` 重放得到同一个值，所以投影升级时
+   `PROJECTION_VERSION` +1 就会自动补上）。版本没变的重发被去重；版本变了之后的同内容操作是新键。
+   **重复语义由引擎自己的状态守卫保证**：setter（worktree / bindIssue / bindPr / reviewVerdict /
+   probePr）「值没变就跳过」、unblock 查 `state`、delete 查 `deletedAt`、accept 查 `acceptedAt`、
+   proposeCleanup 查 G4 是否未决、cleanup 查 `cleanedAt`、block 查终态。
+3. **心跳**：30s 分桶 + `shortHash(cwd)`。同一桶里 cwd 从主仓库变到 worktree 是两件事；
+   不带 cwd 会把第二拍去重掉，而引擎**先在含重复事件的本地投影上决策、后去重** →
+   落库的投影会与事件对不上（`state=working` 而 `session.cwd` 还在主干）。
+
+显式给 `--dedupe-key` 时以上键都只是后缀：前缀仍然由调用方说了算。
+
 ## 7. 流程 DSL（TS 代码）
 
 流程是有类型的代码：条件随便写，"必要项"以 `requires` 声明，引擎在转换时强制校验。
@@ -327,6 +353,8 @@ export default defineFlow({
 | GET | `/api/cards/:id/diff[?patch=1]` | **卡片 diff（只读）**：`git diff <base>...<head>`（三点）解析成文件/hunk/行号；超阈值置 `truncated`（§12） |
 | GET POST | `/api/projects` | 看板 Metadata：`GET` 列项目（恒含合成项目 `local`），`POST {path}` 读一个仓库的 git 元数据并登记 |
 | POST GET | `/api/attachments` | 卡片正文的图片输入：`POST /api/attachments?name=…`（body 是图片字节）回 `markdown`，`GET /api/attachments/:id` 发图 |
+| GET POST | `/api/cards/:id/session` | **托管会话（§14）**：`GET` = 现况 + 转录；`POST .../start` `{cwd?}` / `.../prompt` `{text,images?}` / `.../abort` / `.../stop` |
+| GET | `/api/cards/:id/session/stream` | **每卡一条 SSE**：`ready` / `message` / `message_end` / `tool` / `state` / `notice` / `error`（增量**不**灌进全局 `/api/stream`） |
 
 **CLI**（agent 的唯一写入口，`--json` + `schemaVersion` + 语义化退出码）：
 
@@ -393,6 +421,8 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 ## 10. 数据与运行
 
 - 数据目录 `~/.local/share/flowcard/`（`FLOWCARD_DATA_DIR` 可覆盖），`db.sqlite` + WAL、以及 `attachments/`（图片附件，按内容 sha 命名）；备份即拷目录。**不塞进项目目录**。
+- 库里除了事件流与投影，还有几张**非事实**表：`projects`（环境元数据）、`meta`（投影版本/同步游标）、`session_messages`（托管会话的转录，取舍见 §14.4）——它们都不参与 `rebuild`。
+- 托管会话每卡一个 `omp --mode rpc --no-ui` 子进程（§14）；服务退出（`SIGINT/SIGTERM`）时逐个 `stop()` 收干净。
 - 远程写一律经门禁 G2，**看板本身不静默执行远程操作**；执行者只能是"你看板上点了确认之后的 CLI/agent"。
 - 运行：`systemd --user` 常驻 + 回环监听；Node 22 原生跑 TS，无构建步骤；前端另用 Vite。
 
@@ -410,8 +440,9 @@ flowcard list / show <card> / issue <repo>#<n>            # 读
 | **M7 项目与附件** | 项目 = 看板 Metadata（先选项目再建卡，`repoPath` 由项目解析）；建卡只填正文（标题服务端派生）；图片附件（内容寻址 + 白名单） | `project add` 读真 git 元数据；`open` 不填标题/项目也能落到正确项目与标题；传图后 `GET` 回的字节与 `Content-Type` 与上传一致；老卡片投影成 `local` |
 | **M8 提交图与评审** | 文本提交图（`--graph` 原样 + 多 worktree/卡片叠加）、只读 diff（三点）、行级评论、评审判定（**本地事实，不改状态**）（§12） | 真仓库里 `GET /api/projects/:id/graph` 出提交/分支/worktree 实况；带 worktree 的卡片 diff 出 added/modified/deleted/renamed/binary 与行号；approve 不改 `state`；rebuild 与投影一致 |
 | **M9 同步** | 只读轮询 forge，把 issue/PR 状态与新评论搬进事件流（§13；规格与实测在 `docs/sync.md`） | 真项目跑一轮 → 卡片上出现 `issue.state.changed` / `pr.merged` / 新评论；再跑一轮零差异；磁贴显示「N 条新评论」、详情有「远端动态」 |
+| **M10 托管会话** ✅ | 每卡一个 `omp --mode rpc --no-ui` 子进程：网页直接对话 + 看工具输出，不再弹终端（§14；协议在 `docs/omp-rpc.md`） | 假 omp 端到端 + 真机一次（见 §14.5） |
 
-顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9（M0、M1–M9 已完成）。
+顺序：M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10（M0、M1–M9 已完成；M10 已完成，P2 的步骤协议未做）。
 
 ## 12. 提交图与代码评审（第一期：只读 + 本地记录）
 
@@ -525,3 +556,71 @@ Review = {
 降级**不是失败**：没有可用凭据 → `reason:"no-credentials"` + notes（先退到 `tea` CLI）；某个端点 401/404/超时 → 该端点进 `degraded[]`、其余照常，UI 提示「本轮数据可能不全」。整体没跑成时不推进游标，只记 `lastError`。
 
 **明确不做**：远程写（同步全程只有 `GET`）、自动发现新编号（要发现就手动 `--list`）、评论编辑跟踪、删除条目的「消失」事实（见 `docs/sync.md` §10）。
+
+## 14. 托管会话（M10）：在网页上对话，不再弹终端
+
+**目标**：一张卡 = 一个 agent 会话，而这个会话**由 flowcard 自己托管** —— 网页上直接发消息、直接看助手文本与工具输出（"看到终端"），不用在用户桌面上再开一个 konsole 窗口。协议与帧形状见 `docs/omp-rpc.md`（抄自 omp 18.8.7 源码，带行号）；实现是 `src/server/hosted-session.ts`（协议层 `src/server/omp-rpc.ts`，**已交付，别重写**）。
+
+### 14.1 为什么是子进程 + stdio，而不是终端窗口
+
+| 方案 | 结论 |
+|---|---|
+| 弹终端（konsole/gnome-terminal/…）跑 omp | **已删**：网页看不到对话与输出，"在网页上对话"做不到；窗口还得用户自己关 |
+| `node-pty` + WebSocket 终端仿真 | 需要终端仿真/尺寸协商/ANSI 解析，且 omp 的**无头协议本身**就够用 —— 不引依赖 |
+| `omp --mode rpc --no-ui`（stdin/stdout JSONL） | **选了它**：每卡一个直接子进程，命令走 stdin、事件走 stdout；文本增量、工具调用与输出都能结构化地拿到 |
+
+代价与边界：`--no-ui` 是「扩展 headless」，扩展的 `select/confirm/input/editor` 不会走协议（真收到 `extension_ui_request` 一律回 `cancelled:true` 兜底，不让会话挂住）；协议停在 v1（不会出现分块帧，超大帧会降级成 `rpc_frame_error` → 一条 `error` 事件）。
+
+### 14.2 HTTP 契约（前端并行开发，签名冻结）
+
+```
+GET  /api/cards/:id/session
+ → { status: "stopped"|"starting"|"running"|"ended"|"failed",
+     ompSessionId?, cwd, startedAt?, lastActivityAt?, busy, cost?: {total?, cost?},
+     messages: [{ id, role: "user"|"assistant"|"tool", at, text?,
+                  tool?: { callId, name, status: "start"|"update"|"end", args?, output?, isError? } }] }
+POST /api/cards/:id/session/start   { cwd? }                    → { ok, status, ompSessionId?, cwd?, error? }
+POST /api/cards/:id/session/prompt  { text, images?: [{name,dataBase64}] } → { ok, messageId? }
+POST /api/cards/:id/session/abort   {}                          → { ok }
+POST /api/cards/:id/session/stop    {}                          → { ok }
+GET  /api/cards/:id/session/stream  （每卡一条 SSE）
+ → event "ready"       { ompSessionId?, cwd }          // 就绪（连上会先补一条现况）
+   event "message"     { id, role, textDelta?, contentIndex? }   // 流式增量，前端按 id 累加
+   event "message_end" { id, role, text, at }          // 最终文本（权威，用它对齐）
+   event "tool"        { callId, name, phase, args?, output?, isError? }
+   event "state"       { busy, status, cost? }
+   event "notice"      { level, message }
+   event "error"       { message }
+```
+
+**不许抛**：帧解析失败、子进程早退、落库失败，一律变成 SSE 上的 `error`/`notice` 或状态 `failed`/`ended`，**绝不把 HTTP 打成 5xx**（`start` 起不来也是 200 + `status:"failed"` + `error.code`；只有"卡片不存在"才 404，"会话没在跑却要 prompt/abort"才 409）。
+
+### 14.3 行为约定
+
+1. **会话身份由 flowcard 代表会话上报**：拿到 `get_state.sessionId` 后自己发一条 `claim`（`harness=omp`、`cwd=会话 cwd`、`resumeHint=omp -r <sessionFile|id>`）；子进程退出 → 发 `end`。**卡片投影与三张表一个都不用改**（走的还是 `/api/commands` 那条通道，`session.started` 让 `ready → working`）。
+2. **cwd**：卡片已绑 worktree 且目录存在 → 用它；否则用项目根（worktree 由会话自己按提示创建并登记）。目录不存在 → `start` 直接 `failed`（`NO_CWD`），不起一个注定起不来的进程。
+3. **文本归并**照 `omp-rpc.ts` 的 `FrameNormalizer`：按 `messageId` 归并、`text_delta` 按 `contentIndex` 累加、`text_end.content` 与 `message_end.message.content` 覆盖为权威；`agent_end.messages` 会被编码器裁空，**不**当文本来源。
+4. **用户消息由 flowcard 自己 echo**（id = 我们发出去的 prompt id），omp 回显的 role=user 帧不重复入账；助手与工具走 omp 的 `msg-*`/`toolCallId`。外部消息 id 带**每次启动的前缀**（`<tag>:msg-2`）——omp 重启后 `msg-1` 会重用，不带前缀会在转录里撞车。
+5. **成本**：每轮结束拉一次 `get_session_stats`，`tokens.total` / `cost` 进 `GET .../session` 的 `cost`（用户会关心花了多少）。
+6. **自动开工**：`autostart.ts` 调 `sessions.start(cardId)`（**不再 spawn konsole**）；开工提示作为 `--append-system-prompt` 进 argv（走 argv 不过 shell，不需要引号转义），"开工"那句话作为第一条 prompt。`FLOWCARD_AUTOSTART=0` 语义不变。
+7. **收尾**：`stop()` 关 stdin → omp 走 EOF 收尾自己退出（退之前上报 `end`）；服务 `SIGINT/SIGTERM` 时逐个 `stopAll()`。**孤儿 omp 不收**：它是我们的直接子进程，我们的 stdin 管道一断它就 EOF 自退（连崩溃都不留孤儿）。
+8. **上报扩展照旧挂**（`-e src/adapters/omp/flowcard-omp-adapter.ts` + `FLOWCARD_CARD`/`FLOWCARD_URL`/`FLOWCARD_OMP_LOG`）：心跳还是适配器报的（claim/end 与 flowcard 自己发的那两条同幂等键，重复会被 `dedupeKey` 吸收），cwd 被 `/move`、`/wt` 改过之后卡片也能跟上。
+
+> **注意既有语义**：`end` 事件在流程里挂的是「`working → review`」，所以**停会话当前一轮等于交回**（和以前关掉终端时适配器上报 `end` 一样）。这是流程定死的规则，不是托管会话引入的。
+
+### 14.4 转录为什么不进事件流（取舍）
+
+对话与工具输出落 **`session_messages` 表**（`card_id, seq, message_id, role, at, text, tool_json`，主键 `(card_id, message_id)`，工具调用随 start/update/end 复写同一行，每卡最多留 2000 条）：
+
+- **它不是流程事实**：流程只认 `claim`/`beat`/`end` 这类"谁在什么时候干了什么"，而转录是"会话说了什么"。事件流的用途是**重放出卡片投影**，转录对投影零贡献。
+- **量级不一样**：一个工具调用会吐 start/update/end 三条，一条助手回复有几十个文本增量。都写进 `events` 会：把事件日志淹掉、让 `listEvents` 的滑窗（最新 1000 条）飞速滑走（运行时的停止按钮就是靠它找进程身份的）、让每次 `rebuild` 都要重放几万条无用事件。
+- **代价**：转录**不在** `/api/events`、不进 `rebuild`、也不能被流程规则引用。要在别处重建它就等于丢了——这是有意的（要做流程判断就该走命令，而不是读对话）。
+- 表在 `createStore` 里 `CREATE TABLE IF NOT EXISTS`，老库自动补上；**不动 `PROJECTION_VERSION`**（投影形态没变）。重启服务后 `GET .../session` 照样给得出历史（`status` 记不住：没起会话的卡就是 `stopped`，有转录的是 `ended`）。
+
+### 14.5 里程碑
+
+| 里程碑 | 内容 | 验收 |
+|---|---|---|
+| **M10** ✅ | 每卡一个托管 omp RPC 会话（stdio 管道）：5 个 HTTP 端点 + 每卡 SSE、转录落库、自动开工改走托管会话、旧终端路径删除 | 假 omp 端到端（起→ready→prompt→文本/工具/输出→result→转录落库；abort；stop；子进程早退→卡片会话 `ended`；重启后转录仍在）；真机一次：`/tmp/fc-hosted` 里发一句极短 prompt，SSE 出 `ready/message/tool/state`，`GET .../session` 给出转录与 tokens |
+
+**P2（未做）**：步骤协议 —— **不让 AI 同步状态，而是告诉 AI 当前要做什么，做完让它输出"是否通过 / 是否需要人工介入"的结构化回执**；回执要用的是**最后一条助手回复的完整文本**，所以本次先把转录持久化了。

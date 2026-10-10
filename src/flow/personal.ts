@@ -85,10 +85,15 @@ export const personalFlow = defineFlow({
       do: [{ setState: "working" }],
     },
     {
-      // 心跳也参与前进：会话挪进 worktree 后（/move、/wt），下一次心跳就该让卡片进「实施中」
+      /**
+       * 心跳也参与前进：会话挪进 worktree 后（/move、/wt），下一次心跳就该让卡片进「实施中」。
+       * **只认 `ready`**：`blocked` 的卡必须等人补齐前置后显式 `unblock` ——
+       * 否则心跳（≤30s）会把 blocked 拉回 working，`blockedReason` 被投影抹掉，
+       * 「必须写明缺什么」在一个还在 worktree 里跑的会话上等于无效。
+       */
       name: "beat-advances-to-working",
       on: "session.heartbeat",
-      when: (c) => c.state === "ready" || c.state === "blocked",
+      when: (c) => c.state === "ready",
       do: [{ setState: "working" }],
     },
     {

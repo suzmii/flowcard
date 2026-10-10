@@ -2,7 +2,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { Hono } from "hono";
 import { personalFlow } from "../src/flow/personal.ts";
@@ -365,5 +365,131 @@ describe("Issue 基址（项目层）", () => {
     expect(rejected.status).toBe(400);
     expect(rejected.data.rejection?.code).toBe("USAGE_ERROR");
     expect(store.getCard(localId)?.issue).toBeNull();
+  });
+});
+
+/**
+ * 验收（G3）：`accept` 是**唯一**能让人推进 `review → merged` 的动作。
+ * 投影里不存在「未决的 G3」——accept 一次合成 requested + decided，所以看板必须给它一个按钮
+ * （而不是在门禁区等一个永远不会出现的未决门禁）。
+ */
+describe("验收（accept）", () => {
+  const cardState = z.looseObject({
+    card: z.looseObject({
+      state: z.string(),
+      acceptedAt: z.string().optional(),
+      gates: z.record(z.string(), z.looseObject({ id: z.string(), status: z.string() })),
+    }),
+  });
+
+  /** 走到「待验收」：worktree → 会话进 worktree → WIP PR → 推送 → 结束会话。 */
+  async function toReview(app: Hono, prState: "open" | "merged") {
+    const opened = await post(app, { cmd: "open", actor: HUMAN, title: "待验收", body: "" });
+    const id = opened.data.card?.id ?? "";
+    await post(app, {
+      cmd: "worktree",
+      actor: HUMAN,
+      card: id,
+      worktree: { path: "/w/card", branch: "feat/x", source: "flowcard" },
+    });
+    await post(app, {
+      cmd: "claim",
+      actor: HUMAN,
+      card: id,
+      session: { harness: "omp", id: "s1", cwd: "/w/card/x", agentKind: "main" },
+    });
+    await post(app, {
+      cmd: "bindPr",
+      actor: HUMAN,
+      card: id,
+      pr: { repo: "r", number: 7, url: "http://p/7", branch: "feat/x", state: prState },
+    });
+    await post(app, { cmd: "push", actor: HUMAN, card: id, sha: "abc123" });
+    const ended = await post(app, { cmd: "end", actor: HUMAN, card: id, sessionId: "s1" });
+    expect(ended.data.card?.state).toBe("review");
+    return id;
+  }
+
+  async function readCard(app: Hono, id: string) {
+    const res = await app.request(`/api/cards/${id}`);
+    expect(res.status).toBe(200);
+    return cardState.parse(await res.json()).card;
+  }
+
+  it("PR 已合并时：accept 直接把卡片推到 merged，并打开 G4", async () => {
+    const { app } = harness();
+    const id = await toReview(app, "merged");
+
+    const accepted = await post(app, { cmd: "accept", actor: HUMAN, card: id });
+    expect(accepted.status).toBe(200);
+    expect(accepted.data.card?.state).toBe("merged");
+
+    const card = await readCard(app, id);
+    expect(card.acceptedAt).toBeTruthy();
+    expect(card.gates["G3"]?.status).toBe("approved");
+    expect(card.gates["G4"]?.status).toBe("open");
+  });
+
+  it("PR 还没合并时：accept 记下验收，但状态仍停在 review（缺 prMerged）", async () => {
+    const { app } = harness();
+    const id = await toReview(app, "open");
+
+    const accepted = await post(app, { cmd: "accept", actor: HUMAN, card: id });
+    expect(accepted.status).toBe(200);
+    // 事实照样落库：验收已记，卡不前进只是因为 review -> merged 还缺 prMerged
+    expect(accepted.data.card?.state).toBe("review");
+    expect(accepted.data.notes.join(" ")).toContain("prMerged");
+
+    const card = await readCard(app, id);
+    expect(card.acceptedAt).toBeTruthy();
+    expect(card.gates["G3"]?.status).toBe("approved");
+    // 既有行为（本次不动）：automation 的 do 是逐条跑的 —— setState 被 requires 拦下后，
+    // 后面的 openGate G4 照样执行了，所以卡片停在 review 但 G4 已经开着。清理确认提前可见无害。
+    expect(card.gates["G4"]?.status).toBe("open");
+  });
+});
+
+/** 会话失联：投影只写 running/ended，读接口按 `lastSeenAt` 与读取时刻推导 `lost`。 */
+describe("会话失联（读接口推导）", () => {
+  const cardsResponse = z.looseObject({
+    cards: z.array(
+      z.looseObject({
+        id: z.string(),
+        session: z.looseObject({ state: z.string(), lastSeenAt: z.string() }).nullable(),
+      }),
+    ),
+  });
+
+  it("心跳过期（>90s）→ 卡片接口把会话改判成 lost；没过期仍是 running", async () => {
+    const { app } = harness();
+    const opened = await post(app, { cmd: "open", actor: HUMAN, title: "心跳", body: "" });
+    const id = opened.data.card?.id ?? "";
+    await post(app, {
+      cmd: "claim",
+      actor: HUMAN,
+      card: id,
+      session: { harness: "omp", id: "s1", cwd: "/w/c", agentKind: "main" },
+    });
+
+    const fresh = await app.request("/api/cards");
+    const freshCard = cardsResponse.parse(await fresh.json()).cards.find((c) => c.id === id);
+    expect(freshCard?.session?.state).toBe("running");
+
+    // 不真等 90s：把「读取时刻」往后拨，正是推导所依赖的唯一输入
+    const spy = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 91_000);
+    try {
+      const stale = await app.request("/api/cards");
+      const staleCard = cardsResponse.parse(await stale.json()).cards.find((c) => c.id === id);
+      expect(staleCard?.session?.state).toBe("lost");
+      expect(staleCard?.session?.lastSeenAt).toBe(freshCard?.session?.lastSeenAt);
+
+      const one = await app.request(`/api/cards/${id}`);
+      const oneCard = z
+        .looseObject({ card: z.looseObject({ session: z.looseObject({ state: z.string() }).nullable() }) })
+        .parse(await one.json()).card;
+      expect(oneCard.session?.state).toBe("lost");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

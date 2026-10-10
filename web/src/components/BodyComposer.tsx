@@ -29,12 +29,15 @@ export function BodyComposer({
   placeholder,
   testId,
   autoFocus,
+  onUploadingChange,
 }: {
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
   testId: string;
   autoFocus?: boolean;
+  /** 上传队列进出时回调（true = 还有图片没传完）：调用方据此挡住"提交时丢图" */
+  onUploadingChange?: (uploading: boolean) => void;
 }) {
   const ref = useRef<HTMLTextAreaElement | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
@@ -46,6 +49,15 @@ export function BodyComposer({
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [dragging, setDragging] = useState(false);
   const [queueing, setQueueing] = useState(false);
+
+  /** 队列开关：本地状态 + 通知父组件（父组件用它禁用提交，避免「上传没完就开卡」把图丢掉）。 */
+  const setUploading = useCallback(
+    (next: boolean) => {
+      setQueueing(next);
+      onUploadingChange?.(next);
+    },
+    [onUploadingChange],
+  );
 
   useEffect(() => {
     alive.current = true;
@@ -87,7 +99,7 @@ export function BodyComposer({
   /** 一份输入里的文件按顺序传：成功的插 markdown，失败的留理由（正文不动）。 */
   const ingest = useCallback(
     async (files: File[]) => {
-      setQueueing(true);
+      setUploading(true);
       for (const file of files) {
         const key = `${file.name}:${file.size}:${file.lastModified}:${Math.random().toString(36).slice(2, 8)}`;
         const invalid = validateImage(file);
@@ -107,9 +119,9 @@ export function BodyComposer({
           );
         }
       }
-      if (alive.current) setQueueing(false);
+      if (alive.current) setUploading(false);
     },
-    [insertMarkdown],
+    [insertMarkdown, setUploading],
   );
 
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {

@@ -9,6 +9,8 @@ import { parseArgs } from "node:util";
 import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
 import { summarizeDiff } from "../server/diff.ts";
 import { defaultRun, firstLine } from "../server/probe.ts";
+import { runDetect } from "./detect.ts";
+import { abort, ExitSignal, finish, runCli } from "./exit.ts";
 import { runSync } from "./sync.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import {
@@ -78,9 +80,9 @@ const { values, positionals } = parseArgs({
   },
 });
 
+/** 用法错（退出码 2）：同步上下文，走 `abort`（写完抛哨兵，顶层收尾）。 */
 function die(code: number, message: string): never {
-  process.stdout.write(`${JSON.stringify({ ok: false, rejection: { code: "USAGE_ERROR", message } })}\n`);
-  process.exit(code);
+  return abort(`${JSON.stringify({ ok: false, rejection: { code: "USAGE_ERROR", message } })}\n`, code);
 }
 
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
@@ -106,17 +108,20 @@ async function report(res: Response): Promise<never> {
   const payload = (await res.json().catch(() => null)) as {
     error?: { code?: string; message?: string; hint?: string };
   } | null;
-  process.stdout.write(`${JSON.stringify(payload ?? { ok: false })}\n`);
-  if (res.ok) process.exit(0);
-  process.exit(res.status === 404 ? 3 : 2);
+  return finish(
+    `${JSON.stringify(payload ?? { ok: false })}\n`,
+    res.ok ? 0 : res.status === 404 ? 3 : 2,
+  );
 }
 
 /** 服务不可达（连不上就是连不上，别装成别的错）。 */
-function unreachable(error: unknown): never {
-  process.stdout.write(
+async function unreachable(error: unknown): Promise<never> {
+  // `die` 的退出哨兵别在这里被当成"连不上"：它只是正常的用法错退出。
+  if (error instanceof ExitSignal) throw error;
+  return finish(
     `${JSON.stringify({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${DEFAULT_URL}：${String(error)}` } })}\n`,
+    5,
   );
-  process.exit(5);
 }
 
 /** 看着像路径（含 `/`、`.`、`..`、`~` 开头）就当路径，否则当项目 id。 */
@@ -132,12 +137,11 @@ async function resolveProjectId(ref: string): Promise<string> {
       `${DEFAULT_URL}/api/project/current?path=${encodeURIComponent(resolveUserPath(ref))}`,
     );
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
   const data = (await res.json().catch(() => null)) as { project?: { id?: string } } | null;
   if (!res.ok || !data?.project?.id) {
-    process.stdout.write(`${JSON.stringify(data ?? { ok: false })}\n`);
-    process.exit(res.status === 404 ? 3 : 2);
+    return finish(`${JSON.stringify(data ?? { ok: false })}\n`, res.status === 404 ? 3 : 2);
   }
   return data.project.id;
 }
@@ -191,7 +195,7 @@ async function runProject(args: string[]): Promise<never> {
       );
     }
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
   die(2, `未知的 project 子命令 "${sub}"：可用 add <路径> / list / current [--path <路径>] / issue-base <项目 id 或路径> [--repo …] [--template "…{number}"] [--clear]`);
 }
@@ -223,7 +227,7 @@ async function runAttach(file: string | undefined): Promise<never> {
       }),
     );
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
 }
 
@@ -515,27 +519,16 @@ async function fetchCard(cardId: string): Promise<Card> {
   try {
     res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(cardId)}`);
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
   const data = (await res.json().catch(() => null)) as { card?: Card } | null;
   if (!res.ok || !data?.card) {
-    process.stdout.write(
+    return finish(
       `${JSON.stringify({ ok: false, rejection: { code: "NOT_FOUND", message: `卡片 ${cardId} 不存在` } })}\n`,
+      3,
     );
-    process.exit(3);
   }
   return data.card;
-}
-
-/**
- * 打完再退：大 JSON（diff 摘要能有几百 KB）经管道写出是异步的，
- * 直接 `process.exit()` 会在 64 KiB 管道缓冲没排空时就掐掉输出（stdout 静默截断）。
- */
-async function writeThenExit(text: string, code: number): Promise<never> {
-  await new Promise<void>((resolve) => {
-    process.stdout.write(text, () => resolve());
-  });
-  process.exit(code);
 }
 
 /**
@@ -551,18 +544,20 @@ async function runDiff(): Promise<never> {
       `${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}/diff${wantPatch ? "?patch=1" : ""}`,
     );
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
   const data = (await res.json().catch(() => null)) as (CardDiffResult & { patch?: string }) | null;
   if (!res.ok || !data || data.ok === false) {
-    process.stdout.write(`${JSON.stringify(data ?? { ok: false })}\n`);
-    process.exit(res.status === 404 || res.status === 409 ? 3 : 2);
+    return finish(
+      `${JSON.stringify(data ?? { ok: false })}\n`,
+      res.status === 404 || res.status === 409 ? 3 : 2,
+    );
   }
   if (wantPatch) {
     const patch = data.patch ?? "";
-    return writeThenExit(patch.endsWith("\n") || patch === "" ? patch : `${patch}\n`, 0);
+    return finish(patch.endsWith("\n") || patch === "" ? patch : `${patch}\n`, 0);
   }
-  return writeThenExit(`${JSON.stringify(summarizeDiff(data))}\n`, 0);
+  return finish(`${JSON.stringify(summarizeDiff(data))}\n`, 0);
 }
 
 /**
@@ -613,10 +608,7 @@ async function buildReviewCommand(): Promise<Command> {
 
   if (acting === 0) {
     const full = await fetchCard(card);
-    process.stdout.write(
-      `${JSON.stringify({ ok: true, cardId: card, review: full.review ?? { comments: [] } })}\n`,
-    );
-    process.exit(0);
+    return finish(`${JSON.stringify({ ok: true, cardId: card, review: full.review ?? { comments: [] } })}\n`, 0);
   }
 
   if (wantComment) {
@@ -658,6 +650,13 @@ async function buildReviewCommand(): Promise<Command> {
   };
 }
 
+/** `/api/commands` 的响应体：字段全可选 —— 非 JSON、缺字段都要能兜住。 */
+type CommandResponse = {
+  ok?: unknown;
+  rejection?: { code?: string };
+  blocked?: { missing?: string[] };
+};
+
 /** 把一条命令 POST 给服务端，按 `rejection.code` 定退出码（写入口只有这一条路）。 */
 async function submit(command: Command): Promise<never> {
   let res: Response;
@@ -668,31 +667,49 @@ async function submit(command: Command): Promise<never> {
       body: JSON.stringify(command),
     });
   } catch (error) {
-    unreachable(error);
+    return unreachable(error);
   }
 
-  const payload = (await res.json()) as {
-    ok: boolean;
-    rejection?: { code: string };
-    blocked?: { missing: string[] };
-  };
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  if (!payload.ok) process.exit(payload.rejection?.code === "USAGE_ERROR" ? 2 : 3);
-  if (payload.blocked && payload.blocked.missing.length > 0) process.exit(4);
-  process.exit(0);
+  const text = await res.text().catch(() => "");
+  // 响应体可能是 HTML 错误页（Hono 默认 500 是纯文本）：解析失败按"服务端没按契约回话"处理。
+  let payload: CommandResponse | null = null;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) payload = parsed as CommandResponse;
+  } catch {
+    payload = null;
+  }
+  if (payload === null) {
+    // 既不是"用法错"也不是"状态不允许"——按服务不可用这一档退出，别丢栈追踪、更别装作成功。
+    return finish(
+      `${JSON.stringify({
+        ok: false,
+        rejection: {
+          code: "SERVER_ERROR",
+          message: `服务端返回 HTTP ${res.status} 且响应不是 JSON：${firstLine(text) || "(空响应)"}`,
+        },
+      })}\n`,
+      5,
+    );
+  }
+  if (payload.ok !== true) {
+    return finish(`${JSON.stringify(payload)}\n`, payload.rejection?.code === "USAGE_ERROR" ? 2 : 3);
+  }
+  return finish(`${JSON.stringify(payload)}\n`, (payload.blocked?.missing?.length ?? 0) > 0 ? 4 : 0);
 }
 
 async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
-    process.stdout.write(`${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`);
-    process.exit(0);
+    return finish(
+      `${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`,
+      0,
+    );
   }
 
   if (name === "detect") {
     // 探测是只读 + 回写，与"用户命令"性质不同，实现在 detect.ts，这里只做转发。
-    const { runDetect } = await import("./detect.ts");
     await runDetect(process.argv.slice(3));
   }
 
@@ -702,15 +719,32 @@ async function main(): Promise<void> {
   }
 
   if (name === "list") {
-    const res = await fetch(`${DEFAULT_URL}/api/cards`);
-    const data = (await res.json()) as unknown;
-    process.stdout.write(`${JSON.stringify(data)}\n`);
-    process.exit(0);
+    let res: Response;
+    try {
+      res = await fetch(`${DEFAULT_URL}/api/cards`);
+    } catch (error) {
+      // 服务不可达 → 退出码 5 + 一行 JSON（与其它命令一致），别丢栈追踪、也别无条件报成功。
+      return unreachable(error);
+    }
+    const data = (await res.json().catch(() => null)) as unknown;
+    return finish(
+      `${JSON.stringify(data ?? { ok: false, error: { code: "BAD_RESPONSE", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` } })}\n`,
+      res.ok ? 0 : res.status === 404 ? 3 : 2,
+    );
   }
   if (name === "show") {
-    const res = await fetch(`${DEFAULT_URL}/api/cards/${requireCard()}`);
-    process.stdout.write(`${JSON.stringify(await res.json())}\n`);
-    process.exit(res.ok ? 0 : 3);
+    const card = requireCard();
+    let res: Response;
+    try {
+      res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}`);
+    } catch (error) {
+      return unreachable(error);
+    }
+    const data = (await res.json().catch(() => null)) as unknown;
+    return finish(
+      `${JSON.stringify(data ?? { ok: false, error: { code: "BAD_RESPONSE", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` } })}\n`,
+      res.ok ? 0 : res.status === 404 ? 3 : 2,
+    );
   }
 
   // 「列确认」是读（不改状态）：没给动作标志（或显式 --list）就列出这张卡的所有确认。
@@ -725,18 +759,8 @@ async function main(): Promise<void> {
     }
     if (!acting) {
       const card = requireCard();
-      const res = await fetch(`${DEFAULT_URL}/api/cards/${encodeURIComponent(card)}`);
-      const data = (await res.json().catch(() => null)) as { card?: { confirmations?: unknown } } | null;
-      if (!res.ok || !data?.card) {
-        process.stdout.write(
-          `${JSON.stringify({ ok: false, rejection: { code: "NOT_FOUND", message: `卡片 ${card} 不存在` } })}\n`,
-        );
-        process.exit(3);
-      }
-      process.stdout.write(
-        `${JSON.stringify({ ok: true, card, confirmations: data.card.confirmations ?? [] })}\n`,
-      );
-      process.exit(0);
+      const full = await fetchCard(card);
+      return finish(`${JSON.stringify({ ok: true, card, confirmations: full.confirmations ?? [] })}\n`, 0);
     }
   }
 
@@ -752,17 +776,19 @@ async function main(): Promise<void> {
         body: JSON.stringify({ action: name }),
       });
     } catch (error) {
-      process.stdout.write(
-        `${JSON.stringify({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${DEFAULT_URL}：${String(error)}` } })}\n`,
+      return unreachable(error);
+    }
+    const payload = (await res.json().catch(() => null)) as { ok?: boolean; error?: { code?: string } } | null;
+    if (payload === null) {
+      return finish(
+        `${JSON.stringify({ ok: false, rejection: { code: "SERVER_ERROR", message: `服务端返回 HTTP ${res.status} 且响应不是 JSON` } })}\n`,
+        5,
       );
-      process.exit(5);
     }
-    const payload = (await res.json()) as { ok?: boolean; error?: { code?: string } };
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
     if (!res.ok || payload.ok === false) {
-      process.exit(payload.error?.code === "USAGE_ERROR" ? 2 : 3);
+      return finish(`${JSON.stringify(payload)}\n`, payload.error?.code === "USAGE_ERROR" ? 2 : 3);
     }
-    process.exit(0);
+    return finish(`${JSON.stringify(payload)}\n`, 0);
   }
 
   // 提交图与评审的读动作（diff / review --list）：只读接口，直接打端点。
@@ -777,4 +803,5 @@ async function main(): Promise<void> {
   await submit(command);
 }
 
-await main();
+// 顶层包一层：`abort`（`die` 的同步出口）抛的哨兵在这里收成"flush 完再 exit"。
+await runCli(main);

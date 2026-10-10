@@ -15,8 +15,13 @@ const EMPTY_DRAFT: Draft = { title: "", body: "" };
 type Created = {
   id: string;
   title: string | null;
-  /** 开卡即开工的结果：起会话成不成、起在哪儿。 */
-  autostart: { status: string; cwd?: string; summary: string; terminal?: { terminal?: string } } | null;
+  /** 开卡即开工的结果：托管会话起没起来、起在哪儿（`status: started|skipped|failed`）。 */
+  autostart: {
+    status: string;
+    cwd?: string;
+    summary: string;
+    session?: { status: string; ompSessionId?: string };
+  } | null;
 };
 
 /**
@@ -30,17 +35,24 @@ export function NewCardDialog({
   onCreated,
   projectId,
   projectName,
+  projectsUnavailable,
+  projectsError,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: () => Promise<void> | void;
   projectId: string | null;
   projectName: string | null;
+  /** 项目列表读不到（服务不可达 / 接口未实现）：这时候开卡必定落成「未归属」，别让人白写。 */
+  projectsUnavailable?: boolean;
+  projectsError?: string | null;
 }) {
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<Created | null>(null);
+  /** 正文里的图片还在上传（BodyComposer 报上来的）：这会儿提交会把没插进正文的图丢掉。 */
+  const [uploading, setUploading] = useState(false);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -54,11 +66,30 @@ export function NewCardDialog({
     setDraft(EMPTY_DRAFT);
     setError(null);
     setCreated(null);
+    setUploading(false);
     onClose();
   }, [onClose]);
 
+  /**
+   * 点遮罩 = 最容易误触的关闭路径：**草稿非空时先确认再丢**（写了一半的正文可能是几分钟的活）。
+   * 草稿空的直接关；「取消 / 完成」按钮仍然直接关 —— 那是明确意图。
+   */
+  const closeByBackdrop = useCallback(() => {
+    const dirty = draft.title.trim() !== "" || draft.body.trim() !== "";
+    if (dirty && !window.confirm("草稿还没提交，关掉就没了。确定关闭？")) return;
+    close();
+  }, [draft.title, draft.body, close]);
+
   const submit = useCallback(async () => {
     setError(null);
+    if (projectsUnavailable) {
+      setError("项目列表现在读不到，开卡只会落成「未归属」。等列表恢复（或先跑起来服务端）再开。");
+      return;
+    }
+    if (uploading) {
+      setError("正文里的图片还在上传 —— 等它传完再开卡，否则图片会丢。");
+      return;
+    }
     if (draft.body.trim() === "") {
       setError("正文必填：写清要干什么（背景 / 验收标准 / 约束）。");
       return;
@@ -90,7 +121,7 @@ export function NewCardDialog({
     });
     setDraft(EMPTY_DRAFT);
     await onCreated();
-  }, [draft, onCreated, projectId]);
+  }, [draft, onCreated, projectId, projectsUnavailable, uploading]);
 
   if (!open) return null;
 
@@ -99,7 +130,7 @@ export function NewCardDialog({
       <div
         className="absolute inset-0 bg-black/30"
         role="presentation"
-        onClick={close}
+        onClick={closeByBackdrop}
         data-testid="new-card-backdrop"
       />
       <div
@@ -129,6 +160,18 @@ export function NewCardDialog({
             </span>
           </div>
 
+          {projectsUnavailable ? (
+            <div
+              className="rounded-md border border-amber-500/50 bg-amber-50 p-2 text-[11px] text-amber-900"
+              role="alert"
+              data-testid="new-card-projects-unavailable"
+            >
+              项目列表现在<strong>读不到</strong>
+              {projectsError ? `（${projectsError}）` : ""}——开卡只会落到「未归属」，所以先挡住「开卡」：
+              等列表恢复（服务端起来后看板会自己重拉）再开。
+            </div>
+          ) : null}
+
           {created ? (
             <div
               className="space-y-1 rounded-lg border border-emerald-600/30 bg-emerald-50 p-2.5 text-xs text-emerald-900"
@@ -149,8 +192,10 @@ export function NewCardDialog({
                   }
                 >
                   {created.autostart.status === "started"
-                    ? `已在你桌面上起会话（${created.autostart.terminal?.terminal ?? "终端"}，工作目录 ${created.autostart.cwd ?? "?"}）——worktree 由会话自己按提示创建并登记`
-                    : `会话没起来：${created.autostart.summary}（卡片上留了一条评论，附手动命令）`}
+                    ? `已启动会话（在网页里对话）${created.autostart.session?.ompSessionId ? `：${created.autostart.session.ompSessionId}` : ""}——工作目录 ${created.autostart.cwd ?? "?"}，worktree 由会话自己按提示创建并登记；打开卡片详情的「对话」区就能接着说`
+                    : created.autostart.status === "skipped"
+                      ? `没自动起会话：${created.autostart.summary}（到详情里点「启动会话」即可）`
+                      : `会话没起来：${created.autostart.summary}（卡片上留了一条评论，也可以到详情里重试「启动会话」）`}
                 </div>
               ) : null}
             </div>
@@ -167,6 +212,7 @@ export function NewCardDialog({
               value={draft.body}
               placeholder="背景、验收标准、约束…（图片可直接粘贴 / 拖放，会插入到光标处）"
               onChange={(next) => setDraft((prev) => ({ ...prev, body: next }))}
+              onUploadingChange={setUploading}
             />
           </label>
 
@@ -198,6 +244,11 @@ export function NewCardDialog({
         </div>
 
         <footer className="flex items-center justify-end gap-2 border-t px-4 py-3">
+          {uploading ? (
+            <span className="mr-auto text-[11px] text-amber-700" data-testid="new-card-uploading">
+              图片还在上传，等它完成再开卡（否则图会丢）
+            </span>
+          ) : null}
           {created ? (
             <>
               <Button variant="ghost" size="sm" data-testid="new-card-again" onClick={() => setCreated(null)}>
@@ -215,10 +266,17 @@ export function NewCardDialog({
               <Button
                 size="sm"
                 data-testid="new-card-submit"
-                disabled={busy}
+                disabled={busy || uploading || projectsUnavailable === true}
+                title={
+                  projectsUnavailable
+                    ? "项目列表读不到：现在开卡会落到「未归属」"
+                    : uploading
+                      ? "图片还在上传，等它完成再开卡"
+                      : undefined
+                }
                 onClick={() => void submit()}
               >
-                {busy ? "提交中…" : "开卡"}
+                {busy ? "提交中…" : uploading ? "等图片上传完…" : "开卡"}
               </Button>
             </>
           )}

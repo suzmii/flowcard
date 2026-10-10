@@ -26,6 +26,7 @@ function card(overrides: Record<string, unknown> = {}) {
     spawned: [],
     createdAt: "2026-10-10T00:00:00.000Z",
     updatedAt: "2026-10-10T00:00:00.000Z",
+    eventCount: 0,
     ...overrides,
   });
 }
@@ -55,6 +56,13 @@ describe("当前在干啥", () => {
     const cwd = signals.find((s) => s.key === "session-cwd");
     expect(cwd?.tone).toBe("danger");
     expect(cwd?.label).toContain("不在 worktree");
+  });
+
+  it("idle 单独说「会话空闲」，不算在干活", () => {
+    const signals = cardActivity(card({ session: session({ state: "idle" }), worktree }), NOW);
+    expect(signals.map((s) => s.key)).toEqual(["session-idle", "session-cwd"]);
+    expect(signals.find((s) => s.key === "session-idle")?.label).toBe("会话空闲");
+    expect(signals.some((s) => s.key === "session")).toBe(false);
   });
 
   it("心跳超 90s → 会话失联，并说清多久", () => {
@@ -100,40 +108,31 @@ describe("当前在干啥", () => {
     expect(cardNextStep(card())).toContain("建 worktree");
   });
 
-  it("下一步按缺失要件逐条给：Issue → PR → 推送 → 起会话 → 切进 worktree", () => {
-    const base = { worktree, session: session() };
-    expect(cardNextStep(card({ worktree, session: session() }))).toContain("绑 Issue");
-    expect(cardNextStep(card({ ...base, issue: { repo: "r", number: 1, url: "https://x/1", state: "open" } }))).toContain("开 WIP PR");
-    expect(
-      cardNextStep(
-        card({ ...base, issue: { repo: "r", number: 1, url: "https://x/1", state: "open" }, pr: { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" } }),
-      ),
-    ).toContain("推一次");
-    expect(
-      cardNextStep(
-        card({
-          worktree,
-          issue: { repo: "r", number: 1, url: "https://x/1", state: "open" },
-          pr: { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" },
-          pushes: [{ sha: "a", at: "2026-10-10T11:00:00.000Z", actor: { kind: "agent" } }],
-        }),
-      ),
-    ).toContain("起会话");
-    expect(
-      cardNextStep(
-        card({
-          worktree,
-          session: session({ cwd: "/repo" }),
-          issue: { repo: "r", number: 1, url: "https://x/1", state: "open" },
-          pr: { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" },
-          pushes: [{ sha: "a", at: "2026-10-10T11:00:00.000Z", actor: { kind: "agent" } }],
-        }),
-      ),
-    ).toContain("切进 worktree");
+  it("下一步按**真正挡路的顺序**给：worktree → 会话 → 切进 worktree → WIP PR → 推送", () => {
+    const issue = { repo: "r", number: 1, url: "https://x/1", state: "open" as const };
+    const pr = { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" as const };
+    const push = { sha: "a", at: "2026-10-10T11:00:00.000Z", actor: { kind: "agent" as const } };
+
+    // 没 worktree：别的要件再全也得先建 worktree
+    expect(cardNextStep(card({ session: session(), issue, pr, pushes: [push] }))).toContain("建 worktree");
+    // 有 worktree：先起会话（会话没起来，PR/推送都无从谈起）
+    expect(cardNextStep(card({ worktree, issue, pr, pushes: [push] }))).toContain("起会话");
+    // 会话没在 worktree 里：先切进去
+    expect(cardNextStep(card({ worktree, session: session({ cwd: "/repo" }), issue, pr, pushes: [push] }))).toContain(
+      "切进 worktree",
+    );
+    // 会话在里面：先开 WIP PR —— Issue 还没绑也不该抢先（它不挡任何转换）
+    expect(cardNextStep(card({ worktree, session: session(), issue }))).toContain("开 WIP PR");
+    expect(cardNextStep(card({ worktree, session: session(), pr }))).toContain("推一次");
+    // 挡路的都齐了，才轮到可选的 Issue
+    expect(cardNextStep(card({ worktree, session: session(), pr, pushes: [push] }))).toContain("绑 Issue");
+    expect(cardNextStep(card({ worktree, session: session(), pr, pushes: [push], issue }))).toContain("flowcard end");
   });
 
-  it("待验收/待清理各自的「下一步」不一样", () => {
-    expect(cardNextStep(card({ state: "review", session: session({ state: "ended" }) }))).toContain("等你验收");
+  it("待验收/待清理各自的「下一步」不一样，验收指向看板按钮", () => {
+    const review = cardNextStep(card({ state: "review", session: session({ state: "ended" }) }));
+    expect(review).toContain("等你验收");
+    expect(review).toContain("验收（G3）");
     expect(
       cardNextStep(card({ state: "review", acceptedAt: "2026-10-10T11:00:00.000Z", pr: { repo: "r", number: 2, url: "https://x/2", branch: "fix/c7", state: "open" } })),
     ).toContain("等合并");

@@ -6,6 +6,7 @@
 - 选型与明确否决项：`docs/adr/0001-stack.md`
 - omp 会话上报适配器实测与坑：`src/adapters/omp/README.md`
 - git/PR 探测：`docs/probe.md`
+- 托管 omp RPC 会话（协议契约 + 真机实测，取代弹终端）：`docs/omp-rpc.md`
 - 提交图与代码评审（只读 + 本地记录）：`docs/design.md` §12
 - 同步（只读轮询 issue/PR 状态与新评论，内置 5 分钟一轮）：`docs/sync.md`
 
@@ -62,7 +63,24 @@ node src/cli/main.ts review c1 --list                    # 看评论与判定（
 
 Issue → worktree+分支 → WIP PR → 推送记录 → 验收 → 清理。硬门禁：**建卡即 `ready`（Issue 不是开工前置）**、**会话没进 worktree 不算开工**、无 PR 或没推送不许进 `review`（PR 挡交付、不挡开工）、人未验收或 PR 未合并不许进 `merged`、未清理不许 `done`、**PR 合并前绝不清理**。人只做三件事：远程写授权、验收、清理确认。
 
-## 接 omp（会话自动上报）
+## 接 omp（会话由 flowcard 托管，网页上直接对话）
+
+**默认路线（M10）**：flowcard 自己托管会话 —— 每张卡一个 `omp --mode rpc --no-ui` 子进程（stdio 管道），
+网页通过 HTTP/SSE 跟它对话、看助手文本与工具输出，**不弹终端窗口**。卡建好（`open`）会自动起一次
+（提示词 = 卡片现状 + 待办，作为系统提示注入；`FLOWCARD_AUTOSTART=0` 关掉）。
+
+```
+GET  /api/cards/:id/session          # 现况（status/busy/cost）+ 转录（落库的，重启后仍在）
+POST /api/cards/:id/session/start    # {cwd?} → {ok,status,ompSessionId?}；立刻回 starting
+POST /api/cards/:id/session/prompt   # {text,images?} → {ok,messageId?}
+POST /api/cards/:id/session/abort    # 中断当前一轮
+POST /api/cards/:id/session/stop     # 收尾（关 stdin → omp 自己退 → 上报 end）
+GET  /api/cards/:id/session/stream   # 每卡一条 SSE：ready/message/message_end/tool/state/notice/error
+```
+
+契约与取舍（含"转录为什么不进事件流"）在 `docs/design.md` §14，协议与真机实测在 `docs/omp-rpc.md`。
+
+**另一条路（手起会话）**：想在自己的终端里跑 omp 也行，挂上上报扩展即可自动绑卡：
 
 ```bash
 # 在卡片的 worktree 里启动，卡片会自动 ready → working
@@ -70,13 +88,14 @@ FLOWCARD_CARD=c1 omp -e /path/to/workspace/flowcard/src/adapters/omp/flowcard-om
 ```
 
 适配器在 `session_start` 上报 `claim`、按间隔上报心跳、退出时上报 `end`；端不上服务只写日志，绝不影响会话。细节见 `src/adapters/omp/README.md`。
+托管会话里也挂着同一个扩展（心跳由它报，claim/end 与 flowcard 自己发的那两条幂等去重）。
 
 ## 结构
 
 ```
 src/shared/    契约（zod 命令/事件类型）、流程原语、路径工具
 src/flow/      流程定义（TS 代码：状态、门禁、requires、自动动作）
-src/server/    引擎（纯函数）、投影、存储（SQLite 事件日志 + 投影表）、HTTP/SSE、探测
+src/server/    引擎（纯函数）、投影、存储（SQLite 事件日志 + 投影表）、HTTP/SSE、托管 omp RPC 会话、探测
 src/cli/       命令行入口
 src/adapters/  harness 适配器（omp）
 web/           看板前端

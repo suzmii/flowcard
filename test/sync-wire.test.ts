@@ -16,7 +16,7 @@ import { createApp, type AppOptions } from "../src/server/app.ts";
 import { nextPrState } from "../src/server/engine.ts";
 import { createStore, type Store } from "../src/server/store.ts";
 import { runSyncRound, sinceFrom, startSyncScheduler, trackedNumbers } from "../src/server/syncer.ts";
-import type { HttpGet, SyncFact } from "../src/server/sync.ts";
+import { MAX_PAGES, PAGE_LIMIT, type HttpGet, type SyncFact } from "../src/server/sync.ts";
 import type { Run } from "../src/server/probe.ts";
 import { commandSchema, type Command, type Project } from "../src/shared/types.ts";
 import { createHarness, issueRef, prRef, worktreeRef, type Harness } from "./harness.ts";
@@ -479,7 +479,7 @@ describe("一轮同步的调用面", () => {
     store.close();
   });
 
-  it("没凭据时降级但不写状态（游标不动）", async () => {
+  it("没凭据时降级：游标不动，但留下可见的失败状态（从没成功过也要落 lastError）", async () => {
     const { store } = projectStore();
     const { http } = fakeHttp();
     const result = await runSyncRound({
@@ -492,7 +492,12 @@ describe("一轮同步的调用面", () => {
     });
     expect(result.ok && result.report.ok).toBe(false);
     expect(result.ok && result.report.reason).toBe("no-credentials");
-    expect(store.getSyncState(PROJECT.id)).toBeUndefined();
+    // 从没成功过的项目也要留痕：否则面板一直显示「还没同步过」，后台每 5 分钟失败一次谁也看不见。
+    // `at: ""` = 还没有游标（`sinceFrom` 解析不出时间就当没有），所以失败不会被当成"同步过"。
+    const state = store.getSyncState(PROJECT.id);
+    expect(state?.lastError).toBe("no-credentials");
+    expect(state?.at).toBe("");
+    expect(sinceFrom(state!.at)).toBeNull();
     store.close();
   });
 
@@ -612,7 +617,7 @@ describe("HTTP /api/projects/:id/sync", () => {
     store.close();
   });
 
-  it("没有凭据时降级（200 + reason），不写状态", async () => {
+  it("没有凭据时降级（200 + reason），且状态里有可见的 lastError", async () => {
     const { app, store } = appHarness({
       sync: { intervalMs: 0, teaConfig: null, env: {}, run: MISSING_TEA },
     });
@@ -626,8 +631,11 @@ describe("HTTP /api/projects/:id/sync", () => {
 
     const status = (await (await app.request(`/api/projects/${PROJECT.id}/sync`)).json()) as {
       lastSyncAt: string | null;
+      lastError: string | null;
     };
-    expect(status.lastSyncAt).toBeNull();
+    // 面板据此显示「同步失败：no-credentials」，而不是「还没同步过」；`at: ""` = 还没有游标
+    expect(status.lastError).toBe("no-credentials");
+    expect(status.lastSyncAt).toBe("");
     store.close();
   });
 
@@ -682,6 +690,198 @@ describe("命令校验", () => {
     expect(body.inserted).toBe(2);
     expect(store.getCard(cardId)!.issue?.state).toBe("closed");
     expect(store.getCard(cardId)!.remoteComments).toHaveLength(1);
+    store.close();
+  });
+});
+
+// ---------------------------------------------------------------- 评论增量分页 / 软删除卡 / 首轮降级
+
+/**
+ * 假 Gitea 的评论端点：**按时间升序**返回（真服务就是这样，`limit=50` 拿到的是窗口里最早的 50 条），
+ * 支持 `since` 过滤 + `page`/`limit` 分页。issue/PR 的精确读复用 `fakeHttp()` 的口径。
+ */
+function ascendingComments(count: number): {
+  all: { id: number; at: string }[];
+  http: HttpGet;
+  commentUrls: string[];
+} {
+  const base = Date.parse("2026-10-09T00:00:00.000Z");
+  const all = Array.from({ length: count }, (_, i) => ({
+    id: 9000 + i,
+    at: new Date(base + i * 60_000).toISOString(),
+  }));
+  const commentUrls: string[] = [];
+  const inner = fakeHttp();
+  const http: HttpGet = async (url, headers) => {
+    if (url.startsWith(`${API}/issues/comments`)) {
+      commentUrls.push(url);
+      const query = new URL(url).searchParams;
+      const since = query.get("since");
+      const page = Number(query.get("page") ?? "1");
+      const limit = Number(query.get("limit") ?? String(PAGE_LIMIT));
+      const window = since === null ? all : all.filter((comment) => comment.at >= since);
+      const slice = window.slice((page - 1) * limit, page * limit);
+      return {
+        ok: true,
+        status: 200,
+        text: JSON.stringify(
+          slice.map((comment) => ({
+            id: comment.id,
+            issue_url: `${REMOTE}/issues/${issueRef.number}`,
+            user: { login: "rev" },
+            body: `评论 ${comment.id}`,
+            created_at: comment.at,
+            html_url: `${REMOTE}/issues/${issueRef.number}#issuecomment-${comment.id}`,
+          })),
+        ),
+      };
+    }
+    return inner.http(url, headers);
+  };
+  return { all, http, commentUrls };
+}
+
+describe("评论增量：窗口内要翻页读完", () => {
+  it("窗口里 60 条评论一条不丢（修前只读一页 = 最早的 50 条，游标照样前进）", async () => {
+    const { store, cardId } = projectStore();
+    const { http, commentUrls } = ascendingComments(60);
+
+    const round = await runSyncRound({
+      store,
+      projectId: PROJECT.id,
+      http,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      since: "2026-10-08T00:00:00.000Z",
+      now: () => "2026-10-10T12:00:00.000Z",
+    });
+
+    expect(round.ok && round.report.counts.comments).toBe(60);
+    expect(store.getCard(cardId)!.remoteComments).toHaveLength(60);
+    // 翻页读完了：两页请求（50 + 10），且**读完后**游标才推到本轮时刻
+    expect(commentUrls).toHaveLength(2);
+    expect(store.getSyncState(PROJECT.id)?.at).toBe("2026-10-10T12:00:00.000Z");
+    expect(round.ok && round.report.notes.join()).not.toContain("还没");
+    store.close();
+  });
+
+  it("超过翻页上限（>5 页）：游标停在已读到的那条，下一轮接着读完（不永久丢）", async () => {
+    const { store, cardId } = projectStore();
+    const { http } = ascendingComments(300);
+
+    const first = await runSyncRound({
+      store,
+      projectId: PROJECT.id,
+      http,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      since: "2026-10-08T00:00:00.000Z",
+      now: () => "2026-10-10T12:00:00.000Z",
+    });
+    if (!first.ok) throw new Error("第一轮不该失败");
+    expect(first.report.counts.comments).toBe(MAX_PAGES * PAGE_LIMIT);
+    // 提示方向不能写反：没读到的是**更新**的那批
+    expect(first.report.notes.join()).toContain("更新的评论这轮没读到");
+    const cursor = store.getSyncState(PROJECT.id)?.at ?? "";
+    expect(cursor).toBe("2026-10-09T04:09:00.000Z"); // = 本批最后一条（第 250 条，i=249）的时间
+    expect(cursor).not.toBe("2026-10-10T12:00:00.000Z");
+
+    // 第二轮从游标继续：剩下的 50 条一条不少
+    const second = await runSyncRound({
+      store,
+      projectId: PROJECT.id,
+      http,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      now: () => "2026-10-10T12:05:00.000Z",
+    });
+    expect(second.ok && second.report.notes.join()).not.toContain("更新的评论这轮没读到");
+    expect(store.getCard(cardId)!.remoteComments).toHaveLength(300);
+    expect(store.getSyncState(PROJECT.id)?.at).toBe("2026-10-10T12:05:00.000Z");
+    store.close();
+  });
+
+  it("首轮给了 --since 且评论端点降级：游标停在 since（那个窗口不会被永久跳过）", async () => {
+    const { store } = projectStore();
+    const { http } = fakeHttp();
+    const failing: HttpGet = async (url, headers) =>
+      url.includes("/issues/comments")
+        ? { ok: false, reason: "timeout", status: null, detail: "评论端点超时" }
+        : http(url, headers);
+
+    const round = await runSyncRound({
+      store,
+      projectId: PROJECT.id,
+      http: failing,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      since: "2026-10-06T00:00:00.000Z",
+      now: () => "2026-10-10T12:00:00.000Z",
+    });
+
+    expect(round.ok && round.report.degraded.map((d) => d.endpoint)).toContain("comments");
+    // 修前：没有 previous 时 holdCursor=false → 游标推到 fetchedAt → 10-06..now 的窗口再也不会被读到
+    expect(store.getSyncState(PROJECT.id)?.at).toBe("2026-10-06T00:00:00.000Z");
+    store.close();
+  });
+});
+
+describe("软删除的卡不参与同步", () => {
+  it("删掉 c1 后用同一编号重开 c2：事实落到 c2，已删的 c1 不再被写、也不被轮询", async () => {
+    const { store, cardId: c1 } = projectStore();
+    store.execute({ cmd: "delete", actor: HUMAN, card: c1, reason: "重开一张" }, "2026-10-10T03:00:00.000Z");
+    const c2 = store.execute(
+      { cmd: "open", actor: HUMAN, title: "重开后的卡", body: "", projectId: PROJECT.id, issue: issueRef },
+      "2026-10-10T03:00:01.000Z",
+    ).outcome.primaryCardId;
+
+    const closedIssue = JSON.stringify({
+      number: issueRef.number,
+      title: "已关闭",
+      state: "closed",
+      updated_at: "2026-10-10T04:00:00.000Z",
+    });
+    const inner = fakeHttp();
+    const http: HttpGet = async (url, headers) =>
+      url === `${API}/issues/${issueRef.number}` ? { ok: true, status: 200, text: closedIssue } : inner.http(url, headers);
+
+    const round = await runSyncRound({
+      store,
+      projectId: PROJECT.id,
+      http,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      now: () => "2026-10-10T12:00:00.000Z",
+    });
+
+    if (!round.ok) throw new Error("这一轮不该失败");
+    // 已删的 c1 上的 PR 不再被精确读：只读 c2 绑的 issue
+    expect(round.report.numbers).toEqual({ issues: 1, pulls: 0 });
+    expect(round.report.cardIds).toEqual([c2]);
+    expect(store.getCard(c2)!.issue?.state).toBe("closed");
+    expect(store.getCard(c1)!.issue?.state).toBe("open");
+    expect(store.listEvents().filter((e) => e.cardId === c1 && e.type === "issue.state.changed")).toHaveLength(0);
+    store.close();
+  });
+
+  it("只有已删卡绑编号的项目：调度器不再为它轮询远程", async () => {
+    const { store, cardId } = projectStore();
+    store.execute({ cmd: "delete", actor: HUMAN, card: cardId }, "2026-10-10T03:00:00.000Z");
+    const { http, urls } = fakeHttp();
+
+    const scheduler = startSyncScheduler({
+      store,
+      intervalMs: 600_000,
+      http,
+      teaConfig: TEA_CONFIG,
+      env: {},
+      now: () => "2026-10-10T12:00:00.000Z",
+    });
+    const reports = await scheduler!.runOnce();
+    scheduler!.stop();
+
+    expect(reports).toEqual([]);
+    expect(urls).toEqual([]);
     store.close();
   });
 });

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { CircleSlash, ExternalLink, X } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { CheckCheck, CircleSlash, ExternalLink, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
 import { StateActions } from "@/components/detail/StateActions";
@@ -8,6 +8,7 @@ import { ConfirmPanel } from "@/components/detail/ConfirmPanel";
 import { GatePanel, type CommandRunner } from "@/components/detail/GatePanel";
 import { RuntimePanel } from "@/components/detail/RuntimePanel";
 import { SessionPanel } from "@/components/detail/SessionPanel";
+import { SessionChat } from "@/components/detail/SessionChat";
 import { SlotGrid } from "@/components/detail/SlotGrid";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -51,25 +52,10 @@ export function CardDetail({
   const [notice, setNotice] = useState<Notice>(null);
 
   /**
-   * 打开详情 = 人看到这些评论了 → 自动标已读（`markRemoteCommentsRead`），卡片磁贴上的未读数随之清零。
-   * 用 ref 记住「已经为这批 id 发过命令」，免得刷新回来之前重复发。
+   * 远端评论**不自动标已读**：打开详情就清零的话，未读高亮（磁贴上的「N 条新评论」）永远看不到。
+   * 标已读是人的动作 —— 这里发一枪 `markRemoteCommentsRead`，卡片上的未读随之清零。
    */
   const unreadIds = card.remoteComments.filter((comment) => !comment.read).map((comment) => comment.id);
-  const unreadKey = `${card.id}:${unreadIds.join(",")}`;
-  const markedRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (unreadIds.length === 0 || markedRef.current === unreadKey) return;
-    markedRef.current = unreadKey;
-    void (async () => {
-      await postCommand({
-        cmd: "markRemoteCommentsRead",
-        actor: { kind: "human", name: "看板" },
-        card: card.id,
-        ids: unreadIds,
-      });
-      await onRefresh();
-    })();
-  }, [unreadKey, unreadIds.length, card.id, onRefresh]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -183,7 +169,7 @@ export function CardDetail({
             </div>
           ) : null}
 
-          <Section title="状态动作" hint="纯人工的只有「放弃这条」（其余推进都由事实自动完成）">
+          <Section title="状态动作" hint="人工的只有「验收（G3）」与「放弃这条」；其余推进都由事实自动完成">
             <StateActions card={card} busy={busy} onRun={run} />
           </Section>
 
@@ -198,6 +184,10 @@ export function CardDetail({
 
           <Section title="会话" hint="cwd 必须落在 worktree 内">
             <SessionPanel card={card} />
+          </Section>
+
+          <Section title="对话" hint="托管会话：在网页里直接跟这张卡说话，工具/终端输出同页可见">
+            <SessionChat card={card} />
           </Section>
 
           <CodeChanges card={card} onRefresh={onRefresh} />
@@ -247,6 +237,28 @@ export function CardDetail({
               title="远端动态"
               hint={`${card.remoteComments.length} 条远端评论 · 只读（同步进来的，点标题回远端看）`}
             >
+              {unreadIds.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-sky-600/40 bg-sky-50/60 p-2 text-[11px] text-sky-900">
+                  <span>未读的会一直高亮（这里不自动标已读：看过再动手，磁贴上的未读数才有意义）。</span>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    data-testid="remote-mark-read"
+                    disabled={busy !== null}
+                    onClick={() =>
+                      void run("标记远端评论已读", {
+                        cmd: "markRemoteCommentsRead",
+                        actor: { kind: "human", name: "看板" },
+                        card: card.id,
+                        ids: unreadIds,
+                      })
+                    }
+                  >
+                    <CheckCheck />
+                    标为已读（{unreadIds.length} 条）
+                  </Button>
+                </div>
+              ) : null}
               <ul className="space-y-2" data-testid="card-remote-comments">
                 {card.remoteComments.map((comment) => (
                   <li
@@ -263,7 +275,8 @@ export function CardDetail({
                       {comment.read ? <Badge variant="muted">已读</Badge> : <Badge variant="warning">未读</Badge>}
                       <span className="ml-auto">{timeAgo(comment.at)}</span>
                     </div>
-                    <Markdown text={comment.body} />
+                    {/* 远端是别人写的 markdown：外链图片不自动加载（隐私），只给可点的链接 */}
+                    <Markdown text={comment.body} blockRemoteImages />
                     {comment.url ? (
                       <a
                         className="mt-1 inline-flex items-center gap-1 text-[11px] text-sky-700 underline"

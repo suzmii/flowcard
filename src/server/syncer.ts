@@ -18,6 +18,7 @@ import {
   endpointUrl,
   fetchIssue,
   fetchPull,
+  MAX_PAGES,
   PAGE_LIMIT,
   parseCommentList,
   pollRemote,
@@ -177,48 +178,97 @@ async function readTracked(
   return { issues, pulls, degraded, notes };
 }
 
-/** 每仓库一次的评论增量：`since` 窗口 + 按已绑编号过滤（没绑编号的评论无法路由到卡片）。 */
+/**
+ * 每仓库一次的评论增量：`since` 窗口 + 按已绑编号过滤（没绑编号的评论无法路由到卡片）。
+ *
+ * **窗口内要翻页读完**：Gitea 的评论端点按时间**升序**返回，`limit=50` 拿到的是窗口里**最早**的
+ * 50 条 —— 只读一页就把游标推到 now，等于把第 51 条之后（更新的）评论永久丢掉。
+ * 所以满页继续翻（上限复用 `MAX_PAGES`）：读完了才算 `complete`；没读完时调用方把游标停在
+ * `latestAt`（本批最新一条的时间），下一轮从那里接着读。
+ */
 async function readComments(
   auth: SyncAuth,
   since: string | null,
   bound: ReadonlySet<number>,
   http: HttpGet,
-): Promise<{ comments: RawComment[]; degraded: Degradation[]; notes: string[] }> {
-  const outcome = await http(endpointUrl(auth, "comments", { since }), authHeaders(auth));
-  if (!outcome.ok) {
-    return {
-      comments: [],
-      degraded: [
-        { endpoint: "comments", reason: outcome.reason, status: outcome.status, detail: outcome.detail },
-      ],
-      notes: [],
-    };
+): Promise<{
+  comments: RawComment[];
+  degraded: Degradation[];
+  notes: string[];
+  /** true = 窗口里的评论都读到了（游标可以推到 fetchedAt）。 */
+  complete: boolean;
+  /** 本批评论里**最新**一条的时间（不依赖服务端排序方向，取 max）；一条都没有 = null。 */
+  latestAt: string | null;
+}> {
+  const headers = authHeaders(auth);
+  const all: RawComment[] = [];
+  let latestAt: string | null = null;
+  const keep = (): RawComment[] => all.filter((comment) => bound.has(comment.issueNumber));
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const outcome = await http(endpointUrl(auth, "comments", { since, page }), headers);
+    if (!outcome.ok) {
+      if (page === 1) {
+        return {
+          comments: [],
+          degraded: [
+            { endpoint: "comments", reason: outcome.reason, status: outcome.status, detail: outcome.detail },
+          ],
+          notes: [],
+          complete: false,
+          latestAt: null,
+        };
+      }
+      // 第 2 页起失败：已拿到的是窗口里**最早**的一批，更新的还在后面 → 不算读完。
+      return {
+        comments: keep(),
+        degraded: [],
+        notes: [`评论第 ${page} 页没拿到（${outcome.reason}）：已收 ${all.length} 条，下一轮接着读`],
+        complete: false,
+        latestAt,
+      };
+    }
+    const raw = parseJson(outcome.text);
+    if (!Array.isArray(raw)) {
+      const detail = `响应不是 JSON 数组（HTTP ${outcome.status}）`;
+      if (page === 1) {
+        return {
+          comments: [],
+          degraded: [{ endpoint: "comments", reason: "parse-error", status: outcome.status, detail }],
+          notes: [],
+          complete: false,
+          latestAt: null,
+        };
+      }
+      return {
+        comments: keep(),
+        degraded: [],
+        notes: [`评论第 ${page} 页解析失败（${detail}）：已收 ${all.length} 条，下一轮接着读`],
+        complete: false,
+        latestAt,
+      };
+    }
+    const parsed = parseCommentList(raw);
+    all.push(...parsed);
+    for (const comment of parsed) if (latestAt === null || comment.at > latestAt) latestAt = comment.at;
+    // 不满一页 = 窗口读到尾了（判满页按**原始条数**，不是过滤后的：没绑编号的评论也占一页的名额）
+    if (raw.length < PAGE_LIMIT) {
+      return { comments: keep(), degraded: [], notes: [], complete: true, latestAt };
+    }
+    if (page === MAX_PAGES) {
+      return {
+        comments: keep(),
+        degraded: [],
+        notes: [
+          `评论读满 ${MAX_PAGES} 页（${all.length} 条）还没到窗口末尾：更新的评论这轮没读到，` +
+            `游标停在本批最后一条，下一轮继续`,
+        ],
+        complete: false,
+        latestAt,
+      };
+    }
   }
-  const raw = parseJson(outcome.text);
-  if (!Array.isArray(raw)) {
-    return {
-      comments: [],
-      degraded: [
-        {
-          endpoint: "comments",
-          reason: "parse-error",
-          status: outcome.status,
-          detail: `响应不是 JSON 数组（HTTP ${outcome.status}）`,
-        },
-      ],
-      notes: [],
-    };
-  }
-  const notes: string[] = [];
-  // 满一页 = 这个窗口里可能还有更早的评论没拿到；如实说，别装作窗口是完整的。
-  if (raw.length >= PAGE_LIMIT) {
-    notes.push(`评论增量命中一页上限（${PAGE_LIMIT} 条）：更早的评论这轮看不到`);
-  }
-  return {
-    comments: parseCommentList(raw).filter((comment) => bound.has(comment.issueNumber)),
-    degraded: [],
-    notes,
-  };
+  return { comments: keep(), degraded: [], notes: [], complete: false, latestAt };
 }
 
 /**
@@ -253,7 +303,8 @@ export async function runSyncRound(opts: {
     };
   }
 
-  const cards = store.listCards().filter((card) => card.projectId === project.id);
+  // 软删除的卡不参与同步：事实只能落给活卡（同号重开的新卡才是现在这张），也别为它轮询远程。
+  const cards = store.listCards().filter((card) => card.projectId === project.id && card.deletedAt === undefined);
   const tracked = trackedNumbers(cards);
   const numbers = [...tracked.issues, ...tracked.pulls];
   const previous = store.getSyncState(project.id);
@@ -277,6 +328,9 @@ export async function runSyncRound(opts: {
   let reason: SyncRoundReport["reason"] = null;
   let source: SyncRoundReport["source"] = null;
   let snapshot: SyncSnapshotData = { issues: [], pulls: [], comments: [] };
+  /** 评论增量读完了没有：没读完（满页/中途失败）游标就不能推到 now —— 更新的评论会永久丢。 */
+  let commentsComplete = true;
+  let commentsLatestAt: string | null = null;
 
   const target = resolveSyncTarget({
     remote,
@@ -291,6 +345,8 @@ export async function runSyncRound(opts: {
     snapshot = { issues: pulled.issues, pulls: pulled.pulls, comments: comments.comments };
     degraded.push(...pulled.degraded, ...comments.degraded);
     notes.push(...pulled.notes, ...comments.notes);
+    commentsComplete = comments.complete;
+    commentsLatestAt = comments.latestAt;
   } else if (numbers.length === 0 && opts.list !== true) {
     // 一张卡都没绑编号：不值得为一个仓库拉全量（事件也无处可挂）。
     notes.push("这个项目还没有卡片绑定 issue/PR 编号：本轮不读远程（先绑编号再来同步）");
@@ -344,17 +400,26 @@ export async function runSyncRound(opts: {
   }
 
   /**
-   * 游标：评论端点降级时**不推进** —— 那一段窗口里的评论还没读到，推进就等于永久丢掉。
-   * （issues/pulls 每轮都按号重读，没有窗口问题，所以只有评论降级才需要卡住。）
+   * 游标 = "已经读到哪儿了"。**只有窗口真正读完才推到 fetchedAt**：
+   *   · 评论端点降级（整页没拿到）：停在能表达的最早起点（上轮游标，或显式 `--since`），下轮重读同一窗口；
+   *   · 读满页数上限 / 半路失败：窗口里**更新**的那批还没读到 —— 推进到 now 就等于把它们永久丢掉，
+   *     所以停在 `commentsLatestAt`（本批最新一条），下一轮从那儿接着读。
+   * （issues/pulls 每轮都按号精确重读，没有窗口问题，不用管。）
    */
   const commentsDegraded = degraded.some((item) => item.endpoint === "comments");
-  const holdCursor = commentsDegraded && previous !== undefined;
-  if (holdCursor) notes.push(`评论端点降级：since 游标停在 ${previous!.at}（下轮重读同一窗口）`);
+  let cursorAt = fetchedAt;
+  if (commentsDegraded) {
+    cursorAt = previous?.at ?? since ?? fetchedAt;
+    notes.push(`评论端点降级：since 游标停在 ${cursorAt}（下轮重读同一窗口）`);
+  } else if (!commentsComplete) {
+    cursorAt = commentsLatestAt ?? previous?.at ?? since ?? fetchedAt;
+    notes.push(`评论还没读完：since 游标推进到 ${cursorAt}（本批最新一条），下一轮从那里接着读`);
+  }
 
   if (opts.dryRun !== true) {
     if (reason === null) {
       const state: ProjectSyncState = {
-        at: holdCursor ? previous!.at : fetchedAt,
+        at: cursorAt,
         degraded,
         notes,
         counts: {
@@ -368,6 +433,17 @@ export async function runSyncRound(opts: {
     } else if (previous) {
       // 整体没跑成（没凭据等）：游标不能动，只记下这次为什么没跑成。
       store.setSyncState(project.id, { ...previous, lastError: reason });
+    } else {
+      // 从来没成功过：也得落一条可见状态，否则面板一直显示「还没同步过」，
+      // 后台每 5 分钟失败一次谁都看不见。`at: ""` = 没有游标（`sinceFrom` 解析不出时间就当没有，
+      // 与完全没有这条记录等价），所以失败不会被误当成"同步过"。
+      store.setSyncState(project.id, {
+        at: "",
+        degraded,
+        notes,
+        counts: { issues: 0, pulls: 0, comments: 0 },
+        lastError: reason,
+      });
     }
   }
 
@@ -432,7 +508,9 @@ export function startSyncScheduler(opts: {
     try {
       for (const project of opts.store.listProjects()) {
         if (project.virtual === true || project.path === "" || (project.remote ?? "") === "") continue;
-        const cards = opts.store.listCards().filter((card) => card.projectId === project.id);
+        const cards = opts.store
+          .listCards()
+          .filter((card) => card.projectId === project.id && card.deletedAt === undefined);
         const tracked = trackedNumbers(cards);
         if (tracked.issues.length + tracked.pulls.length === 0) continue;
         const result = await runSyncRound({

@@ -1,11 +1,13 @@
 /** 入口：起服务（默认只监听回环）。 */
 import { serve } from "@hono/node-server";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { personalFlow } from "../flow/personal.ts";
 import { createApp } from "./app.ts";
+import { createHostedSessions } from "./hosted-session.ts";
+import { defaultAdapterPath } from "./launch.ts";
 import { createRuntimeSupervisor } from "./runtime.ts";
 import { createStore } from "./store.ts";
-import { defaultAdapterPath } from "./launch.ts";
 import { DEFAULT_SYNC_INTERVAL_MS } from "./syncer.ts";
 
 const dataDir =
@@ -26,17 +28,25 @@ const port = Number(process.env.FLOWCARD_PORT ?? "47825");
 const store = createStore({ dataDir, flow: personalFlow });
 const runtime = createRuntimeSupervisor({ store, dataDir });
 
+// 托管会话：每卡一个 `omp --mode rpc --no-ui` 子进程（网页上直接对话，不弹终端）。
+// 上报扩展照旧挂上（心跳/结束上报的兜底），日志按卡片分文件写在数据目录里。
+const sessions = createHostedSessions({
+  store,
+  adapterPath: defaultAdapterPath(),
+  logDir: join(dataDir, "logs"),
+});
+
 /** 后台同步节奏：默认 5 分钟一轮（`FLOWCARD_SYNC_INTERVAL_MS=0` 关掉）。 */
 const syncRaw = Number(process.env.FLOWCARD_SYNC_INTERVAL_MS ?? "");
 const syncIntervalMs = Number.isFinite(syncRaw) && syncRaw >= 0 ? syncRaw : DEFAULT_SYNC_INTERVAL_MS;
 const app = createApp(store, {
   runtime,
   sync: { intervalMs: syncIntervalMs },
+  sessions,
   autostart: {
     // 默认开；`FLOWCARD_AUTOSTART=0` 关掉（只开卡、不起会话）
     enabled: process.env.FLOWCARD_AUTOSTART !== "0",
     dataDir,
-    adapterPath: defaultAdapterPath(),
     cli: "flowcard",
   },
 });
@@ -57,6 +67,8 @@ let closing = false;
 const shutdown = async (): Promise<void> => {
   if (closing) return;
   closing = true;
+  // 先收会话：关 stdin → omp 走 EOF 收尾自己退（退之前各自上报 end）。
+  await sessions.stopAll();
   const stopped = await runtime.shutdown();
   if (stopped.length > 0) console.log(`已停掉运行时：${stopped.join(", ")}`);
   store.close();
@@ -70,6 +82,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 }
 
 // 异常退出路径的兜底：同步 SIGKILL 自己起过的进程组（走不到就靠下次启动的 reapStale）。
+// 托管会话不用兜底：它们的 stdin 是我们持有的管道，我们一死就 EOF，omp 自己收尾退出。
 process.on("exit", () => {
   runtime.shutdownSync();
 });

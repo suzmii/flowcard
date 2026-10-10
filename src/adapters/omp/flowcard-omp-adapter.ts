@@ -113,15 +113,41 @@ type ClaimResponse = {
   ok?: boolean;
   card?: { id?: string };
   rejection?: { code?: string; message?: string; hint?: string };
+  /** 命令结果里的事件计数：心跳"没被记下"（未知会话 / 卡片还没有会话）时都是 0。 */
+  inserted?: number;
+  duplicates?: number;
+  notes?: unknown;
 };
+
+/**
+ * 心跳真的被服务端记下了吗？
+ * 卡片还没有会话 → `NOT_FOUND`；卡片绑的是别的会话 → `ok:true` 但**什么都没记**（inserted/duplicates 都是 0，
+ * 只在 notes 里写一句"忽略未知会话"）。两种都算"这次心跳没生效"，调用方要退回 claim 重试。
+ */
+function beatApplied(res: ClaimResponse | undefined): boolean {
+  if (res?.ok !== true) return false;
+  const known = typeof res.inserted === "number" || typeof res.duplicates === "number";
+  // 服务端没给计数（别的版本）时不臆断失败，免得每 15s 白重试一次。
+  if (!known) return true;
+  return (res.inserted ?? 0) + (res.duplicates ?? 0) > 0;
+}
 
 export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
   let handle: unknown;
   let current: { id: string; cwd: string; kind: string; file?: string } | undefined;
   /** 卡片 id：FLOWCARD_CARD 显式给的，或 claim 时服务端按 cwd 解析出来的 */
   let bound = CARD;
+  /**
+   * **claim 成功了没有**——这是独立标志，不能复用 `bound`：开工链路**总是**带 `FLOWCARD_CARD`，
+   * `bound` 一上来就是真值；用它当"已绑"会让首个 claim 失败后再也不重试（服务重启 / 超时 /
+   * SESSION_CONFLICT：上一个会话的 `end` 没送达），卡片永远停在「实施中」，心跳要么 NOT_FOUND、
+   * 要么被服务端静默忽略。没 claim 上就下一拍继续 claim，直到服务端认下这次会话。
+   */
+  let claimed = false;
   /** 「解析失败」只记一次日志：心跳会重试，不能每 15s 刷屏 */
   let resolveFailedLogged = false;
+  /** 「claim 没成功」同理只记一次 */
+  let claimFailedLogged = false;
 
   pi.on("session_start", (_payload, ctx) => {
     current = identity(ctx);
@@ -159,27 +185,60 @@ export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
         // 显式给了 card 就是普通上报（照旧记一行 HTTP 日志）；按 cwd 解析的日志下面自己记
         !CARD,
       )) as ClaimResponse | undefined;
-      if (bound) return;
-      const resolved = res?.card?.id;
-      if (res?.ok && resolved) {
-        bound = resolved;
-        resolveFailedLogged = false;
-        log(`claim: 按 cwd 解析到卡片 ${resolved}（cwd ${me.cwd}）`);
+
+      if (res?.ok !== true) {
+        // 服务重启 / 超时 / 卡片绑着旧会话（SESSION_CONFLICT）：**不算 claim 上**，下一拍接着试。
+        if (!claimFailedLogged) {
+          claimFailedLogged = true;
+          log(
+            `claim: 没 claim 上（${bound ? `卡片 ${bound}` : `cwd ${me.cwd}`}）：` +
+              `${res?.rejection?.code ?? "UNREACHABLE"} ${res?.rejection?.message ?? "服务无响应"}` +
+              `${res?.rejection?.hint ? ` — ${res.rejection.hint}` : ""}；下一拍继续 claim，不影响会话`,
+          );
+        }
         return;
       }
-      if (!resolveFailedLogged) {
-        resolveFailedLogged = true;
-        log(
-          `claim: 没绑上卡片（cwd ${me.cwd}）：${res?.rejection?.code ?? "UNREACHABLE"} ` +
-            `${res?.rejection?.message ?? "服务无响应"}` +
-            `${res?.rejection?.hint ? ` — ${res.rejection.hint}` : ""}；心跳时重试，不影响会话`,
-        );
+
+      const resolved = res.card?.id;
+      if (!bound && resolved === undefined) {
+        // 服务端说 ok 却没给卡片（不该发生）：当没绑上，下一拍再试。
+        if (!resolveFailedLogged) {
+          resolveFailedLogged = true;
+          log(`claim: 服务端没给卡片 id（cwd ${me.cwd}）；下一拍继续 claim，不影响会话`);
+        }
+        return;
+      }
+
+      claimed = true;
+      claimFailedLogged = false;
+      if (!bound) {
+        bound = resolved!;
+        resolveFailedLogged = false;
+        log(`claim: 按 cwd 解析到卡片 ${bound}（cwd ${me.cwd}）`);
       }
     };
 
+    const beat = async (cwd: string): Promise<void> => {
+      const res = (await post(
+        {
+          cmd: "beat",
+          actor: { kind: "agent", harness: "omp", sessionId: me.id },
+          card: bound,
+          session: { harness: "omp", id: me.id, cwd, agentKind: "main" },
+        },
+        "beat",
+      )) as ClaimResponse | undefined;
+      if (beatApplied(res)) return;
+      // 心跳没人接（卡片还没有会话 / 卡片绑的是旧会话）：退回 claim，别让卡片永远停在「实施中」，
+      // 也别让下一个会话一直撞 SESSION_CONFLICT。claim 失败会自己记日志，这里不重复记。
+      claimed = false;
+      await claim();
+    };
+
     handle = ctx.setInterval?.(() => {
-      if (!bound) {
-        // 还没绑上（当时解析失败，或卡片还没建）：静默重试
+      if (!claimed) {
+        // 还没 claim 上（服务重启、上一个会话的 end 没送达、当时解析失败，或**卡片还没建**）：静默重试。
+        // 显式 `FLOWCARD_CARD` 也走这一支 —— 那正是开工链路的主路径。
         void claim();
         return;
       }
@@ -189,19 +248,13 @@ export default function flowcardOmpAdapter(pi: OmpExtensionApi): void {
       if (here !== me.cwd) {
         me = { ...me, cwd: here };
         log(`cwd 变了：${current?.cwd ?? "?"} → ${here}，重新 claim 让卡片跟上`);
-        // 挪了目录就重新 claim：claim 会把会话记录刷新，并触发"进实施中"的前进
+        // 挪了目录就重新 claim：claim 会把会话记录刷新，并触发"进实施中"的前进。
+        // 顺手把 claimed 摆回 false：claim 没成功就下一拍继续 claim，而不是拿着旧绑定继续心跳。
+        claimed = false;
         void claim();
         return;
       }
-      void post(
-        {
-          cmd: "beat",
-          actor: { kind: "agent", harness: "omp", sessionId: me.id },
-          card: bound,
-          session: { harness: "omp", id: me.id, cwd: here, agentKind: "main" },
-        },
-        "beat",
-      );
+      void beat(here);
     }, HEARTBEAT_MS);
 
     void claim();

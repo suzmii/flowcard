@@ -11,6 +11,7 @@
  */
 import { parseArgs } from "node:util";
 import { resolveUserPath } from "../shared/paths.ts";
+import { abort, finish, runCli } from "./exit.ts";
 
 const OPTIONS = {
   port: { type: "string" },
@@ -31,27 +32,27 @@ export async function runSync(argv: string[]): Promise<never> {
   const baseUrl =
     str(values.url) ?? process.env.FLOWCARD_URL ?? `http://127.0.0.1:${str(values.port) ?? process.env.FLOWCARD_PORT ?? "47825"}`;
 
-  const say = (payload: unknown): void => {
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-  };
+  /** 打完这一行再退：`--dry-run` 的事实清单能带上整段评论，裸 `process.exit` 会把它截断。 */
+  const say = (payload: unknown, code: number): Promise<never> => finish(`${JSON.stringify(payload)}\n`, code);
 
   function die(code: number, message: string, extra: Record<string, unknown> = {}): never {
-    say({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra });
-    process.exit(code);
+    return abort(`${JSON.stringify({ ok: false, rejection: { code: "USAGE_ERROR", message }, ...extra })}\n`, code);
   }
 
   if (values.help === true || positionals.length === 0) {
-    say({
-      usage: "flowcard sync <项目 id 或路径 | 卡片 id> [--since ISO] [--list] [--dry-run] [--port 47825]",
-      note:
-        "一轮 = 已绑编号精确读（GET issues/{n}、pulls/{n}）+ 每仓库一次评论增量（GET issues/comments?since=…）；全程只读。",
-      flags: {
-        "--list": "走全量列表（没有 since，用于手动排查/发现新编号）",
-        "--dry-run": "只打印将产生的事实，不落库、不推进游标",
-        "--since": "显式窗口起点（默认 = 上次同步时刻 - 60 s）",
+    return say(
+      {
+        usage: "flowcard sync <项目 id 或路径 | 卡片 id> [--since ISO] [--list] [--dry-run] [--port 47825]",
+        note:
+          "一轮 = 已绑编号精确读（GET issues/{n}、pulls/{n}）+ 每仓库一次评论增量（GET issues/comments?since=…）；全程只读。",
+        flags: {
+          "--list": "走全量列表（没有 since，用于手动排查/发现新编号）",
+          "--dry-run": "只打印将产生的事实，不落库、不推进游标",
+          "--since": "显式窗口起点（默认 = 上次同步时刻 - 60 s）",
+        },
       },
-    });
-    process.exit(values.help === true ? 0 : 2);
+      values.help === true ? 0 : 2,
+    );
   }
 
   /** 位置参数可能是项目 id、仓库路径、或卡片 id（卡片的 projectId 就是它所属项目）。 */
@@ -96,12 +97,10 @@ export async function runSync(argv: string[]): Promise<never> {
   try {
     project = await resolveProject(positionals[0]!);
   } catch (error) {
-    say({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` } });
-    process.exit(5);
+    return say({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` } }, 5);
   }
   if ("error" in project) {
-    say({ ok: false, rejection: project.error });
-    process.exit(3);
+    return say({ ok: false, rejection: project.error }, 3);
   }
 
   const body: Record<string, unknown> = {};
@@ -121,8 +120,7 @@ export async function runSync(argv: string[]): Promise<never> {
       body: JSON.stringify(body),
     });
   } catch (error) {
-    say({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` } });
-    process.exit(5);
+    return say({ ok: false, rejection: { code: "UNREACHABLE", message: `连不上 ${baseUrl}：${String(error)}` } }, 5);
   }
 
   const payload = (await res.json().catch(() => null)) as
@@ -134,24 +132,20 @@ export async function runSync(argv: string[]): Promise<never> {
       }
     | null;
 
-  if (!res.ok) {
-    say(payload ?? { ok: false });
-    process.exit(payload?.error?.code === "NOT_FOUND" ? 3 : 2);
-  }
+  const out = payload ?? { ok: false };
+  if (!res.ok) return say(out, payload?.error?.code === "NOT_FOUND" ? 3 : 2);
 
-  say(payload ?? { ok: false });
   const reason = payload?.reason ?? null;
-  if (reason === "no-credentials" || reason === "no-transport") {
-    process.exit(4);
-  }
-  if (reason !== null) {
-    // no-remote：remote 认不出目标仓库（不是凭据问题，也不是「同步成功」）。
-    process.exit(3);
-  }
-  process.exit(0);
+  // no-credentials / no-transport：缺凭据、没有可用的传输；no-remote：remote 认不出目标仓库
+  // （不是凭据问题，也不是「同步成功」）。
+  if (reason === "no-credentials" || reason === "no-transport") return say(out, 4);
+  if (reason !== null) return say(out, 3);
+  return say(out, 0);
 }
 
 // 直接执行（`node src/cli/sync.ts …`）时才跑；被 main.ts import 时由那边调 runSync。
 if (process.argv[1]?.endsWith("sync.ts") === true) {
-  await runSync(process.argv.slice(2));
+  await runCli(async () => {
+    await runSync(process.argv.slice(2));
+  });
 }

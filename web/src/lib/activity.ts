@@ -18,9 +18,6 @@ export type ActivitySignal = {
   detail?: string;
 };
 
-/** 会话失联多久算失联：与设计里 90s TTL 对齐（心跳按 30s 分桶，丢两次就算失联）。 */
-const LOST_AFTER_MS = 90_000;
-
 function minutesSince(iso: string, now: number): number {
   const at = Date.parse(iso);
   if (!Number.isFinite(at)) return 0;
@@ -76,7 +73,7 @@ export function cardActivity(card: CardView, now = Date.now()): ActivitySignal[]
   // —— 远端动态
   const unread = card.remoteComments.filter((c) => !c.read).length;
   if (unread > 0) {
-    out.push({ key: "remote", label: `${unread} 条新评论`, tone: "info", detail: "同步自远端，打开详情即标已读" });
+    out.push({ key: "remote", label: `${unread} 条新评论`, tone: "info", detail: "同步自远端，在详情里点「标为已读」才清" });
   }
   const outdated = card.review.comments.filter((c) => c.outdated).length;
   if (outdated > 0) {
@@ -88,9 +85,19 @@ export function cardActivity(card: CardView, now = Date.now()): ActivitySignal[]
 
   // —— 谁在动
   if (session) {
+    // `lost` 是**服务端按读取时刻推导**的（心跳超 90s 没来），所以这里只负责显示，不自己算。
+    if (session.state === "running") {
+      out.push({ key: "session", label: "会话在干活", tone: "success", detail: `${session.harness} · ${session.cwd}` });
+    } else if (session.state === "idle") {
+      out.push({
+        key: "session-idle",
+        label: "会话空闲",
+        tone: "muted",
+        detail: `${session.harness} 的会话还在（${session.cwd}），但这一轮没有动作`,
+      });
+    }
     if (session.state === "running" || session.state === "idle") {
       const inside = card.worktree ? session.cwd.startsWith(card.worktree.path) : false;
-      out.push({ key: "session", label: "会话在干活", tone: "success", detail: `${session.harness} · ${session.cwd}` });
       out.push(
         inside
           ? { key: "session-cwd", label: "在 worktree 内", tone: "success" }
@@ -104,7 +111,7 @@ export function cardActivity(card: CardView, now = Date.now()): ActivitySignal[]
         detail: "心跳超过 90s 没来；可能是终端关了或进程没了",
       });
     } else if (session.state === "ended" && card.state === "review") {
-      out.push({ key: "session-ended", label: "会话已结束，等你验收", tone: "warning" });
+      out.push({ key: "session-ended", label: "会话已结束，等你验收", tone: "warning", detail: "在「状态动作」里点「验收（G3）」" });
     }
   } else if (card.state === "working" || card.state === "ready") {
     out.push({ key: "no-session", label: "还没在干活", tone: "muted" });
@@ -142,16 +149,18 @@ export function cardNextStep(card: CardView): string {
   if (card.confirmations.some((c) => c.status === "pending")) return "等你批远程写";
   if (card.state === "review") {
     if (card.pr?.state === "merged") return "等你确认清理（G4）";
-    return card.acceptedAt ? "等合并 PR" : "等你验收";
+    return card.acceptedAt ? "等合并 PR" : "等你验收（在「状态动作」里点「验收（G3）」）";
   }
   if (card.state === "merged") return "等你确认清理（G4）";
 
+  // 顺序 = **真正挡路的顺序**：worktree → 会话（含切进 worktree）→ WIP PR → 推送。
+  // Issue 绑不绑不挡任何转换，所以排在最后（可选项不该盖过拦路的缺项）。
   if (!card.worktree) return "建 worktree（会话自己起名，建完用 flowcard worktree 登记）";
-  if (!card.issue) return "绑 Issue（只填编号）";
-  if (!card.pr) return "开 WIP PR（先申请远程写确认）";
-  if (card.pushes.length === 0) return "推一次并记录（flowcard push）";
   const session = card.session;
   if (!session || session.state === "ended" || session.state === "lost") return "起会话（在 worktree 里）";
-  if (card.worktree && !session.cwd.startsWith(card.worktree.path)) return "把会话切进 worktree（/wt 或 /move）";
+  if (!session.cwd.startsWith(card.worktree.path)) return "把会话切进 worktree（/wt 或 /move）";
+  if (!card.pr) return "开 WIP PR（先申请远程写确认）";
+  if (card.pushes.length === 0) return "推一次并记录（flowcard push）";
+  if (!card.issue) return "绑 Issue（只填编号；可选项，不挡任何推进）";
   return "干活，做完 flowcard end 交回";
 }
