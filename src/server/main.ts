@@ -53,6 +53,8 @@ const app = createApp(store, {
   sync: { intervalMs: syncIntervalMs },
   sessions,
   approvalHooks: { enabled: approvalHooksOn },
+  // 卡片 git 事实（看板阶段派生用）：只对有 worktree 的卡跑只读 git，结果缓存 30s。
+  gitFacts: {},
   autostart: {
     // 默认开；`FLOWCARD_AUTOSTART=0` 关掉（只开卡、不起会话）
     enabled: process.env.FLOWCARD_AUTOSTART !== "0",

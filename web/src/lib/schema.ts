@@ -4,7 +4,7 @@
  * 后端加字段/改字段时，web 的 `npm run web:typecheck` 会先报错。
  */
 import { z } from "zod";
-import { CARD_STATES, type Card, type Runtime } from "@/lib/contract";
+import { CARD_STATES, STAGES, type Card, type Runtime } from "@/lib/contract";
 
 const actorSchema = z.looseObject({
   kind: z.enum(["human", "agent", "system"]),
@@ -136,6 +136,16 @@ const runtimeSchema = z.looseObject({
   logPath: z.string().optional(),
 });
 
+/**
+ * 卡片 git 事实（服务端只对**有 worktree** 的卡采集，30s 缓存；缺 = 这一轮没采到）。
+ * 每项都可能为 null —— `null` 是「未知」，不是 0。
+ */
+const gitFactsSchema = z.looseObject({
+  dirtyFiles: z.number().nullable(),
+  commitsSinceBase: z.number().nullable(),
+  baseBranch: z.string().nullable(),
+});
+
 export const cardViewSchema = z.looseObject({
   deletedAt: z.string().optional(),
   deletedReason: z.string().optional(),
@@ -143,6 +153,12 @@ export const cardViewSchema = z.looseObject({
   title: z.string(),
   body: z.string(),
   state: z.enum(CARD_STATES),
+  /**
+   * 派生阶段（看板按它分列，而不是按 `state`）。判据见 `src/shared/stage.ts`。
+   * 声明成可选是为了跟 `Card` 的投影互相可赋值（老服务端没这个字段时，看板就地在本地派生）。
+   */
+  stage: z.enum(STAGES).optional(),
+  git: gitFactsSchema.optional(),
   /** 归属项目（`Project.id`）；服务端把没归属的老卡投影成 `local` */
   projectId: z.string(),
   repoPath: z.string().optional(),

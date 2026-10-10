@@ -3,6 +3,7 @@
  * 两个字面量表在前端本地镜像，并用类型断言锁死与共享契约的一致性（见文件末尾的编译期检查）。
  */
 import type { CardState, ConfirmAction, ConfirmStatus, RuntimeStatus } from "../../../src/shared/types.ts";
+import type { Stage } from "../../../src/shared/stage.ts";
 
 export type {
   Card,
@@ -37,6 +38,34 @@ export type {
   SessionTool,
   SessionView,
 } from "@/lib/session";
+
+/**
+ * 看板列的**派生阶段**（`src/shared/stage.ts` 是唯一来源：列集合、判据、纯函数都在那里）。
+ * 前端只读不改 —— 要让列变多/变少、改判据，改共享层那一处即可，这里自动跟上。
+ */
+export {
+  deriveStage,
+  STAGE_EMPTY_HINTS,
+  STAGE_FALLBACK,
+  STAGE_LABELS,
+  STAGE_RULES,
+  STAGES,
+  withStage,
+} from "../../../src/shared/stage.ts";
+export type { CardGitFacts, Stage, StageFacts, StageRule, StagedCard } from "../../../src/shared/stage.ts";
+
+/** 各列的进度点颜色（Tailwind 类名必须留在 web 里，构建时才扫得到）。 */
+export const STAGE_TONE: Record<Stage, string> = {
+  dropped: "bg-neutral-400",
+  done: "bg-emerald-600",
+  blocked: "bg-red-600",
+  merged: "bg-teal-600",
+  review: "bg-violet-500",
+  prReview: "bg-sky-500",
+  prTodo: "bg-amber-500",
+  working: "bg-blue-600",
+  backlog: "bg-neutral-300",
+};
 
 /** 与 CARD_STATES 同序，看板列顺序即此顺序。 */
 export const CARD_STATES = [

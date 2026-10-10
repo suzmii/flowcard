@@ -64,6 +64,12 @@ node src/cli/main.ts review c1 --list                    # 看评论与判定（
 
 Issue → worktree+分支 → WIP PR → 推送记录 → 验收 → 清理。硬门禁：**建卡即 `ready`（Issue 不是开工前置）**、**会话没进 worktree 不算开工**、无 PR 或没推送不许进 `review`（PR 挡交付、不挡开工）、人未验收或 PR 未合并不许进 `merged`、未清理不许 `done`、**PR 合并前绝不清理**。人只做三件事：远程写授权、验收、清理确认。
 
+**看板的列不是流程状态，而是按事实派生的阶段**（`src/shared/stage.ts`：一张有顺序的判据表，列序即优先级，第一条命中算数）——所以列可以比状态更细，而状态机一行没变。九列（从左到右，判据见 `docs/design.md` §4.2）：
+
+**放弃**（`dropped`）→ **完成**（`done`）→ **阻塞**（`blocked`）→ **已合并待清理**（`merged`，或 PR 已合并且已验收）→ **待你验收**（`review`，或会话已结束/失联且未验收）→ **PR 待审 / 等 CI**（有 PR 且未 merged，CI 作徽标）→ **待开 PR**（没 PR 但已有提交）→ **实施中**（有会话且不能证明它什么都没干）→ **待立项**（其余）。
+
+派生用的 git 事实（脏文件数 / 相对基线的提交数）只对**有 worktree** 的卡读一次并缓存 30 秒；读不到就退化成只看卡片事实（未知 ≠ 0，不猜）。`stage`（配 `git`）也在 `GET /api/cards` 与 `flowcard list` / `flowcard show` 的输出里。
+
 ## 接 omp（会话由 flowcard 托管，网页上直接对话）
 
 **默认路线（M10）**：flowcard 自己托管会话 —— 每张卡一个 `omp --mode rpc --no-ui` 子进程（stdio 管道），

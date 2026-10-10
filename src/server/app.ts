@@ -17,6 +17,9 @@ import {
   syncRequestSchema,
 } from "../shared/types.ts";
 import type { Project } from "../shared/types.ts";
+import { withStage } from "../shared/stage.ts";
+import type { CardGitFacts } from "../shared/stage.ts";
+import { createCardGitFactsCache } from "./card-git.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
 import { approvalHooksEnabled, createApprovalHooks } from "./approval-hooks.ts";
@@ -69,6 +72,12 @@ export type AppOptions = {
    * `main.ts` 自己建是为了进程退出时能 `stopAll()`，测试自己建是为了塞假 omp。
    */
   sessions?: HostedSessions;
+  /**
+   * 卡片 git 事实（看板的**阶段派生**要用：脏文件数 / 相对基线的提交数 / 基线 ref）。
+   * 只对有 worktree 的卡跑一次只读 git 探测，并缓存 ~30s（见 `server/card-git.ts`）。
+   * **不传 = 不采集**：阶段退化成只看卡片事实（测试默认如此，免得每个用例都去跑 git）。
+   */
+  gitFacts?: { run?: Run; ttlMs?: number; now?: () => number };
   /**
    * 审批 hook：人在看板上批准 / 驳回（`decideGate` / `decideConfirm` / `accept`）之后，
    * 自动把一条人话通知投给这张卡的托管会话；会话不在线就写卡片评论 + 记 pending，下次会话启动 / 发言时补投。
@@ -201,7 +210,14 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     c.json({ ok: true, cards: store.listCards().length, events: store.listEvents(1).length }),
   );
 
-  app.get("/api/cards", (c) => {
+  // 卡片 git 事实的采集器：不传 `gitFacts` 就是 null（不跑任何 git，阶段只看卡片事实）。
+  const gitFacts = opts.gitFacts ? createCardGitFactsCache(opts.gitFacts) : null;
+
+  /**
+   * `GET /api/cards`：每张卡带上派生 `stage`（看板按它分列）与（有 worktree 时）`git` 事实。
+   * git 事实走 30s 缓存 —— SSE 刷新再频繁也不会每个请求都跑 git。
+   */
+  app.get("/api/cards", async (c) => {
     // 软删除的卡默认不进看板；`?includeDeleted=1` 才带出来（配合 CLI 的 restore 用）
     const includeDeleted = c.req.query("includeDeleted") === "1";
     const now = Date.now();
@@ -210,13 +226,20 @@ export function createApp(store: Store, opts: AppOptions = {}) {
       .filter((card) => includeDeleted || !card.deletedAt)
       // 会话失联是「读取时刻」的判断：库里的投影只有 running/ended，出口统一改判，CLI 与看板一致
       .map((card) => deriveSessionState(card, now));
-    return c.json({ cards });
+    const facts = (await gitFacts?.collect(cards)) ?? new Map<string, CardGitFacts>();
+    return c.json({
+      cards: cards.map((card) =>
+        withStage(card, card.worktree ? (facts.get(card.worktree.path) ?? null) : null),
+      ),
+    });
   });
 
-  app.get("/api/cards/:id", (c) => {
-    const card = store.getCard(c.req.param("id"));
-    if (!card) return c.json({ error: { code: "NOT_FOUND", message: "卡片不存在" } }, 404);
-    return c.json({ card: deriveSessionState(card) });
+  app.get("/api/cards/:id", async (c) => {
+    const found = store.getCard(c.req.param("id"));
+    if (!found) return c.json({ error: { code: "NOT_FOUND", message: "卡片不存在" } }, 404);
+    const card = deriveSessionState(found);
+    const facts = (await gitFacts?.collect([card])) ?? new Map<string, CardGitFacts>();
+    return c.json({ card: withStage(card, card.worktree ? (facts.get(card.worktree.path) ?? null) : null) });
   });
 
   app.get("/api/events", (c) => {

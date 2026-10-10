@@ -194,9 +194,15 @@ flowcard worktree use <card> --path .worktrees/<名字>        # 登记 + 把会
 
 CLI：`flowcard up <card>` / `flowcard down <card>`；状态变化一样走事件流（`runtime.*`），所以 `rebuild` 之后按钮状态不会漂。
 
-## 4. 流程状态（看板的列）
+## 4. 流程状态与看板的列
 
-**人只做三件事：远程写授权、验收、清理确认；其余状态由事实自动推进。**
+**人只做三件事：远程写授权、验收、清理确认；其余由事实自动推进。**
+
+这里有两层，别混：
+- **流程状态**（§4.1）：`Card.state`，唯一的、会推进流程的状态机。
+- **看板的列**（§4.2）：从事实**派生的阶段**，只影响「卡片显示在哪一列」。
+
+### 4.1 流程状态（`Card.state`）
 
 | 状态 | 含义 | 出口条件 |
 |---|---|---|
@@ -225,6 +231,42 @@ stateDiagram-v2
 老库里的 `inbox` / `issue` 事件**原样保留**，只是投影时一律折成 `ready`（`PROJECTION_VERSION` v5 触发一次 rebuild）。
 
 **大需求拆多片**：agent 可以在同一边界内**自己新建卡片**（`flowcard spawn`），新卡自动继承 `issue`、带 `partOf` 指向原卡、并要求它自己开一个新 PR。看板上按 Issue 分组显示"这个 Issue 下有哪几片、每片什么状态"。
+
+### 4.2 看板的列 = 按事实派生的阶段（9 列）
+
+**列是「事实派生的视图」，不是新的状态机。** `Card.state` 与事件流**一行没动**：没有新增状态、没有新增事件、没有新增命令，列的多少也不参与流程推进（推进只看 §4.1 的状态机 + 门禁）。派生规则集中在 `src/shared/stage.ts` 的**一张有顺序的判据表**里（纯函数 `deriveStage(card, facts)`，server / CLI / 前端共用同一份）：
+
+```ts
+STAGES          // 列的 id 与顺序（= 判据优先级）
+STAGE_LABELS    // 列头中文名
+STAGE_RULES     // 判据表：按顺序取第一条命中的列
+```
+
+**加列 / 换列 = 只改 `STAGES` + `STAGE_LABELS` + `STAGE_RULES` 这三处**（判据表最后一条是兜底列，永远成立）。判据能看到的「外部事实」是 `StageFacts`（目前只有 git；以后加 AI 步骤回执之类的第二种来源，就在这个类型里加字段，判据与所有调用方签名都不用动）。
+
+| # | 列 id | 列头 | 判据（按顺序取**第一条**命中） | 备注 |
+|---|---|---|---|---|
+| 1 | `dropped` | 放弃 | `state === "dropped"` | 最优先：放弃的卡不再看别的现场 |
+| 2 | `done` | 完成 | `state === "done"` | 现场已清理 |
+| 3 | `blocked` | 阻塞 | `state === "blocked"` | 徽标显示 `blockedReason`（列头也列出原因，重复的合并成 `×N`） |
+| 4 | `merged` | 已合并待清理 | `state === "merged"`；或 `pr.state === "merged"` 且已验收（`acceptedAt`） | **未验收**的已合并 PR 不算（落第 5 列） |
+| 5 | `review` | 待你验收 | `state === "review"`；或会话 `ended`/`lost` 且 `acceptedAt` 空 | |
+| 6 | `prReview` | PR 待审 / 等 CI | `pr !== null && pr.state !== "merged"` | CI（`pr.ci` = `pending`/`pass`/`fail`，同步来的）**只作徽标，不改列** |
+| 7 | `prTodo` | 待开 PR | `pr === null` 且 `commitsSinceBase > 0` | 提交数必须**确实读到**：未知（`null`）不算有 |
+| 8 | `working` | 实施中 | 有会话（`session !== null`，含 `lost`）且**不能证明它什么都没干**（`dirtyFiles > 0` 或 `commitsSinceBase > 0`） | 只有读到「脏文件 0 且提交 0」才不算实施中 |
+| 9 | `backlog` | 待立项 | 其余（没有会话、没有改动、没有 PR） | 兜底列 |
+
+**缺事实时退化，不猜。** `CardGitFacts` 里每项 `null` = **未知**，不是 0：
+- 整块 git 事实缺（没 worktree / 探测失败 / 这一轮还没采集）→ 判据退化成只看**卡片事实**（状态、会话、PR、`acceptedAt`）。例：有会话但读不到 git → 仍是「实施中」（会话本身就是事实），而不是被当成「零改动」推进「待立项」。
+- 单项未知同理：`commitsSinceBase === null` 时「待开 PR」不成立（宁可留在原列，也不假装知道有没有提交）。
+
+**git 事实从哪来（只读 + 短缓存）**：只对**有 worktree** 的卡采集，复用 `server/probe.ts` 的只读探测（不 fetch、不写），在 `server/card-git.ts` 里按 worktree 路径**缓存 30 秒**并做并发去重 —— SSE 刷新再频繁也不会每个请求都跑 git；探测失败即「没有事实」。出口：
+
+- `GET /api/cards`（以及 `GET /api/cards/:id`）每张卡带 `stage`，有 worktree 的还带 `git`（`dirtyFiles` / `commitsSinceBase` / `baseBranch`）；
+- `flowcard list` / `flowcard show` 直接把这份响应原样打出来，所以 CLI 输出里也带 `stage`（agent 据此判断该干什么）；
+- 前端按 `stage` 分列（不再按 `state`），列头显示数量；若服务端没给 `stage`（老版本），前端就地用同一个 `deriveStage` 派生。
+
+判据的回归网在 `test/stage.test.ts`：**每条判据 + 每对优先级各一条硬断言**（事实组合 → 列），另加「缺 git 事实时退化」与「列集合/顺序/兜底」的结构断言。
 
 ## 5. 门禁（人工节点）
 
