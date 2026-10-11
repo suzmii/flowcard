@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { CheckCheck, CircleSlash, ExternalLink, Maximize2, X } from "lucide-react";
+import { CheckCheck, ChevronDown, ChevronRight, CircleSlash, ExternalLink, Maximize2, X } from "lucide-react";
 import { CopyButton } from "@/components/CopyButton";
 import { Markdown } from "@/components/Markdown";
 import { StateActions } from "@/components/detail/StateActions";
@@ -13,6 +13,7 @@ import { SlotGrid } from "@/components/detail/SlotGrid";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { postCommand } from "@/lib/api";
+import { pendingApprovals } from "@/lib/approvals";
 import { STATE_LABELS, STATE_TONE } from "@/lib/contract";
 import type { IssueBase } from "@/lib/projects";
 import { cardActivity, cardNextStep } from "@/lib/activity";
@@ -33,7 +34,11 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
   );
 }
 
-/** 卡片详情侧栏：六个必要项目格 + 会话 + 门禁 + 运行时 + 正文/评论（markdown）。 */
+/**
+ * 卡片详情侧栏。首屏顺序按「先要做什么、再等我拍板什么」排：
+ * 状态动作 → 正文（需求原文，长文先给 15rem 预览）→ 门禁 / 远程写确认
+ * → 对话（**默认折叠**，展开后 65vh）→ 必要项目格 → 会话 → 代码变更 → 运行时 → 评论 / 远端动态。
+ */
 export function CardDetail({
   card,
   cards,
@@ -57,6 +62,13 @@ export function CardDetail({
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const chatRef = useRef<HTMLDivElement | null>(null);
+  /** 对话默认折叠（首屏先给需求原文与待拍板的事）；从磁贴「对话」/会话灯进来时默认展开。 */
+  const [chatOpen, setChatOpen] = useState(() => focusSession || pendingApprovals(card).length > 0);
+  /** 正文长时先给 15rem 预览，点「展开全文」看完整 markdown。 */
+  const [bodyOpen, setBodyOpen] = useState(false);
+  /** 正文真的被 15rem 预览裁掉了才给「展开全文」按钮。 */
+  const [bodyClipped, setBodyClipped] = useState(false);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
 
   /**
    * 远端评论**不自动标已读**：打开详情就清零的话，未读高亮（磁贴上的「N 条新评论」）永远看不到。
@@ -64,11 +76,37 @@ export function CardDetail({
    */
   const unreadIds = card.remoteComments.filter((comment) => !comment.read).map((comment) => comment.id);
 
-  // 会话灯那条路：详情一挂上就把对话区滚进视野（换卡也重来一次）
+  // 从磁贴「对话」/会话灯进来的那条路：默认展开对话，展开后再把它滚进视野（换卡也重来一次）。
   useEffect(() => {
-    if (!focusSession) return;
-    chatRef.current?.scrollIntoView({ block: "start", inline: "nearest" });
+    if (focusSession) setChatOpen(true);
   }, [focusSession, card.id]);
+
+  /**
+   * 有「等拍板」的事（未决门禁 / 待批远程写）时默认展开对话：对话里也挂着审批条，
+   * 别让人为了点「同意」先去展开。
+   * 只在**换卡**时定默认值 —— 用户自己收起过的卡片，不会因为新来一条待批又被顶开。
+   */
+  useEffect(() => {
+    if (pendingApprovals(card).length > 0) setChatOpen(true);
+  }, [card.id]);
+
+  useEffect(() => {
+    if (!focusSession || !chatOpen) return;
+    chatRef.current?.scrollIntoView({ block: "start", inline: "nearest" });
+  }, [focusSession, chatOpen, card.id]);
+
+  // 换卡回到默认态：正文重新折叠（对话的展开/折叠是用户当下动作，换卡也回到默认）。
+  useEffect(() => {
+    setBodyOpen(false);
+  }, [card.id]);
+
+  // 正文被预览框裁掉了吗？（展开态不测量：展开时按钮要留着让人能收起）
+  useEffect(() => {
+    if (bodyOpen) return;
+    const element = bodyRef.current;
+    if (!element) return;
+    setBodyClipped(element.scrollHeight > element.clientHeight + 4);
+  }, [card.body, card.id, bodyOpen]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -186,28 +224,82 @@ export function CardDetail({
             <StateActions card={card} busy={busy} onRun={run} />
           </Section>
 
-          <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
-            <SlotGrid
-              card={card}
-              issueBase={issueBase}
-              busy={busy}
-              onRun={run}
-            />
+          {/* 首屏顺序：先「要做什么」（正文预览），再「等我拍板什么」（门禁 / 远程写确认），
+              对话折叠着排在它们后面 —— 打开详情第一屏就同时看到这两件事。
+              正文长时先给 15rem 预览（门禁才不会被长需求顶出首屏），要读全文点「展开全文」。 */}
+          {card.body ? (
+            <Section title="正文（需求原文）" hint="要做什么 · markdown（不解析原始 HTML）">
+              <div className="relative">
+                <div
+                  ref={bodyRef}
+                  className={cn(
+                    "rounded-lg border bg-background p-2.5",
+                    !bodyOpen && "max-h-[15rem] overflow-hidden",
+                  )}
+                  data-testid="card-body-markdown"
+                >
+                  <Markdown text={card.body} />
+                </div>
+                {bodyOpen || !bodyClipped ? null : (
+                  // 只是视觉渐隐，不影响点击（按钮在下面那条）
+                  <div className="pointer-events-none absolute inset-x-0 bottom-0 h-8 rounded-b-lg bg-gradient-to-t from-background to-transparent" />
+                )}
+              </div>
+              {/* 只有真的被裁掉时才给「展开全文」（短正文不摆多余的按钮）。 */}
+              {bodyOpen || bodyClipped ? (
+                <button
+                  type="button"
+                  data-testid="toggle-card-body"
+                  aria-expanded={bodyOpen}
+                  aria-controls="card-body-markdown"
+                  onClick={() => setBodyOpen((open) => !open)}
+                  className="text-[11px] text-muted-foreground underline decoration-dotted hover:text-foreground"
+                >
+                  {bodyOpen ? "收起正文" : "展开全文"}
+                </button>
+              ) : null}
+            </Section>
+          ) : null}
+
+          <Section title="门禁" hint="未决门禁可在这里批准/驳回 · 等你拍板的事都排在对话前面">
+            <GatePanel card={card} busy={busy} onRun={run} />
           </Section>
 
-          <Section title="会话" hint="cwd 必须落在 worktree 内">
-            <SessionPanel card={card} />
+          <Section title="远程写确认（G2）" hint="一事一议：一次批准只覆盖一次动作">
+            <ConfirmPanel card={card} busy={busy} onRun={run} />
           </Section>
 
-          {/* 对话就在卡片里（常用功能不放二级菜单）：转录自己滚、输入框贴底，读与发都在这一屏。
-              下面那行只作「独立/全屏」入口（左栏列表 + 全高转录）。 */}
+          {/* 对话内嵌在卡片里（常用功能不放二级菜单），但**默认折叠**：
+              转录自己滚、输入框贴底；展开后高度与以前一样（65vh）。
+              从磁贴的「对话」/会话灯进来时默认展开并滚到对话（focusSession）。 */}
           <Section title="对话" hint="直接在这里读转录、发消息；会话跑在卡片的 worktree 里">
-            <div
-              ref={chatRef}
-              className="h-[65vh] min-h-[20rem] scroll-mt-2"
-              data-testid="detail-session-chat"
-            >
-              <SessionChat key={card.id} card={card} />
+            <div ref={chatRef} className="scroll-mt-2">
+              <button
+                type="button"
+                data-testid="toggle-session-chat"
+                aria-expanded={chatOpen}
+                aria-controls="detail-session-chat"
+                onClick={() => setChatOpen((open) => !open)}
+                className="flex w-full items-center gap-2 rounded-lg border bg-background px-3 py-2 text-left text-xs transition-colors hover:border-foreground/30 hover:bg-accent/40"
+              >
+                {chatOpen ? (
+                  <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+                )}
+                <span className="font-medium">{chatOpen ? "收起对话" : "展开对话"}</span>
+                <span className="ml-auto text-muted-foreground">
+                  {chatOpen ? "转录与输入框在下面" : "默认折叠：首屏先看需求与要拍板的事"}
+                </span>
+              </button>
+              {/* 折叠只隐藏、不卸载：转录滚动位置与输入框草稿都留着（展开时 ResizeObserver 会重新贴底）。 */}
+              <div
+                id="detail-session-chat"
+                data-testid="detail-session-chat"
+                className={cn("mt-2 h-[65vh] min-h-[20rem]", !chatOpen && "hidden")}
+              >
+                <SessionChat key={card.id} card={card} />
+              </div>
             </div>
             <button
               type="button"
@@ -221,30 +313,26 @@ export function CardDetail({
             </button>
           </Section>
 
+          <Section title="必要项目" hint="空槽位也保留；每个槽位标注动作落在本地还是远程">
+            <SlotGrid
+              card={card}
+              issueBase={issueBase}
+              busy={busy}
+              onRun={run}
+            />
+          </Section>
+
+          <Section title="会话" hint="cwd 必须落在 worktree 内">
+            <SessionPanel card={card} />
+          </Section>
+
+          {/* 对话（折叠）已经提到「必要项目」前面；「独立/全屏」入口也跟着它走了。 */}
+
           <CodeChanges card={card} onRefresh={onRefresh} />
-
-          <Section title="门禁" hint="未决门禁可在这里批准/驳回">
-            <GatePanel card={card} busy={busy} onRun={run} />
-          </Section>
-
-          <Section title="远程写确认（G2）" hint="一事一议：一次批准只覆盖一次动作">
-            <ConfirmPanel card={card} busy={busy} onRun={run} />
-          </Section>
 
           <Section title="运行时" hint="/api/cards/:id/runtime">
             <RuntimePanel card={card} cards={cards} onRefresh={onRefresh} />
           </Section>
-
-          {card.body ? (
-            <Section title="正文" hint="markdown（不解析原始 HTML）">
-              <div
-                className="rounded-lg border bg-background p-2.5"
-                data-testid="card-body-markdown"
-              >
-                <Markdown text={card.body} />
-              </div>
-            </Section>
-          ) : null}
 
           {card.comments.length > 0 ? (
             <Section title="评论" hint={`${card.comments.length} 条 · markdown`}>
