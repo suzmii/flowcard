@@ -35,6 +35,7 @@ const HUMAN = { kind: "human" as const, name: "tester" };
  * 假 omp。`FAKE_OMP_MODE` 选分支：
  *   normal            —— 一轮完整交互：助手文本 → 工具调用（bash）→ 最终回答 → result
  *   hang              —— 收到 prompt 只吐一半就挂着，等 abort 才收尾（测中断）
+ *   hang-once         —— 只有**第一轮**挂着（之后的 prompt 照常跑完）：测「中断之后同一段会话还能接着聊」
  *   exit-after-turn   —— 一轮跑完就自己退（测"子进程早退"）
  *   die-before-ready  —— 连 ready 都不吐就退（测起不来）
  *   thinking          —— 一轮只有思考块 + 一句正文（测思考流式/落库，不跑工具）
@@ -183,7 +184,7 @@ function handleLine(line) {
       }
       out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "先" } });
       out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "跑一下" } });
-      if (MODE === "hang") return;
+      if (MODE === "hang" || (MODE === "hang-once" && turn === 1)) return;
       out({ type: "message_update", messageId: asked, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "先跑一下" } });
       out({ type: "tool_execution_start", toolCallId: callId, toolName: "bash", args: { command: "ls -la" } });
       out({ type: "tool_execution_update", toolCallId: callId, toolName: "bash", partialResult: { content: [{ type: "text", text: "total 0\n" }] } });
@@ -1466,12 +1467,14 @@ describe("引导（steer）的连发、空闲路径与对比项", () => {
 
     await sessions.start(id); // 不投 kickoff：起来就是空闲
     await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
 
     const idle = await sessions.prompt(id, "空闲时说一句", [], { steer: true });
     expect(idle.delivery).toBe("prompt");
-    // 先等这一轮真的跑完（"ok" 是假 omp 处理完 prompt 之后发的），再去读命令日志
-    // —— 日志是子进程写的，早读会读不到那一行。
+    // 先等这一轮真的跑完（"ok" 是假 omp 处理完 prompt 之后发的；busy 归零要等 prompt_result/session_settled
+    // 那一帧，可能比 message_end 晚一个 chunk）——两件事都等到，再去读命令日志与现况。
     await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
     const cmd = readCommands(cmdLog).filter((c) => c.message === "空闲时说一句");
     expect(cmd.map((c) => c.type)).toEqual(["prompt"]);
     // 兜底：空闲那条也带 streamingBehavior:"steer" —— 万一这一瞬间判错，omp 会排进 steering 队列而不是回 busy 错
@@ -1517,7 +1520,8 @@ describe("中断（abort）的语义与竞态", () => {
   it("忙时中断：本轮以 aborted 收尾（转录留半截）、会话不退出；空闲时是空操作；连点两次都 ok", async () => {
     const { store, dir } = makeStore();
     const id = openCard(store, dir);
-    const sessions = makeSessions(store, "hang");
+    // hang-once：只有第一轮挂着（好让「中断之后照旧能说话」那一步跑完一整轮，断言不靠时序）
+    const sessions = makeSessions(store, "hang-once");
     const log = new EventLog();
     sessions.subscribe(id, log.push);
 
@@ -1541,12 +1545,20 @@ describe("中断（abort）的语义与竞态", () => {
     expect(await sessions.abort(id)).toEqual({ ok: true });
     expect(log.byType("error")).toEqual([]);
 
-    // 中断之后照旧能说话（同一段会话接着跑）
+    // 中断之后照旧能说话（同一段会话接着跑一整轮）
+    const settledAgain = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
     const again = await sessions.prompt(id, "中断后继续");
     expect(again.delivery).toBe("prompt");
     await log.waitForNth((e) => e.type === "message" && e.textDelta === "跑一下", 2);
-    expect(sessions.snapshot(id).busy).toBe(true);
-    await sessions.abort(id);
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledAgain + 1);
+    expect(sessions.snapshot(id).busy).toBe(false);
+    expect(
+      sessions
+        .snapshot(id)
+        .messages.filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => m.text),
+    ).toEqual(["请从 1 数到 500", "12", "中断后继续", "先跑一下", "ok"]);
     await sessions.stop(id);
   });
 
