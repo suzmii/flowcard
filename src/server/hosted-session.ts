@@ -77,6 +77,12 @@ export type SessionEvent =
       isError?: boolean;
     }
   | { type: "state"; busy: boolean; status: HostedSessionStatus; cost?: SessionCost; model?: string }
+  /**
+   * omp 的排队快照（`queue_update` 帧）：`steering` 是**已引导但还没被模型读到**的消息文本
+   * （按队列顺序），`followUp` 是等这一程结束后才处理的；`liveSteered` 是队头里已经活投进
+   * 正在流的响应的条数（这些拿不回来了）。见 `docs/omp-rpc.md` §3.2。
+   */
+  | { type: "queue"; steering: string[]; followUp: string[]; liveSteered?: number }
   | { type: "notice"; level: string; message: string }
   | { type: "error"; message: string };
 
@@ -90,8 +96,23 @@ export type StartSessionResult = {
   error?: SessionError;
 };
 
-export type PromptResult = { ok: boolean; messageId?: string; error?: SessionError };
+/** `prompt`（这条用户消息）最后走了哪条路：`steer` = 忙时中途引导；`prompt` = 空闲时新起一轮。 */
+export type PromptDelivery = "steer" | "prompt";
+
+export type PromptResult = { ok: boolean; messageId?: string; delivery?: PromptDelivery; error?: SessionError };
 export type SimpleResult = { ok: boolean; error?: SessionError };
+
+/** `prompt()` 的选项：`steer` = 会话忙时改用 omp 的 `steer`（中途引导）而不是 `prompt`。 */
+export type PromptOptions = {
+  /**
+   * `true` = **忙时引导**：会话正忙（`busy`/`awaitingSettle`）就发 `steer` 命令，让它插进当前这一轮；
+   * 空闲时照旧发 `prompt`（新起一轮）。不传 = 老行为（永远 `prompt`，忙时会被 omp 拒）。
+   *
+   * HTTP 端点 `POST .../session/prompt` **默认就是 `true`**（用户拍板「默认引导」）；
+   * 这里默认 `false` 是为了不动既有调用方（kickoff、通知补投）的语义。
+   */
+  steer?: boolean;
+};
 
 /** 上传图片：前端给 `{name, dataBase64}`，这里补 omp 要的 `ImageContent`（mimeType 从扩展名猜）。 */
 export type SessionImage = { name: string; dataBase64: string };
@@ -149,7 +170,11 @@ export type ChangeCwdResult = {
 export type CardChange = { cardId: string; types: string[] };
 export type HostedSessions = {
   start(cardId: string, opts?: StartSessionOptions): Promise<StartSessionResult>;
-  prompt(cardId: string, text: string, images?: readonly SessionImage[]): Promise<PromptResult>;
+  /**
+   * 发一句话给会话。`opts.steer` = 忙时改用 omp 的 `steer`（中途引导）而不是排队等它空闲，见
+   * {@link PromptOptions}。返回的 `delivery` 说清这次实际走的是哪条路。
+   */
+  prompt(cardId: string, text: string, images?: readonly SessionImage[], opts?: PromptOptions): Promise<PromptResult>;
   abort(cardId: string): Promise<SimpleResult>;
   stop(cardId: string): Promise<SimpleResult>;
   /**
@@ -829,6 +854,15 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         }
         break;
       }
+      case "queue":
+        // 引导/跟进的排队快照（每次队列变化各一条）：网页据此显示「已引导，等模型读到」。
+        emit(live, {
+          type: "queue",
+          steering: event.steering,
+          followUp: event.followUp,
+          ...(event.liveSteered === 0 ? {} : { liveSteered: event.liveSteered }),
+        });
+        break;
       case "notice":
         emit(live, { type: "notice", level: event.level, message: event.message });
         break;
@@ -1120,6 +1154,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     cardId: string,
     text: string,
     images: readonly SessionImage[] = [],
+    opts: PromptOptions = {},
   ): Promise<PromptResult> => {
     let live = records.get(cardId);
     // 进程没了（崩溃 / 服务重启时被 stopAll 收掉）不代表会话作废：先把它续起来再说话。
@@ -1142,12 +1177,20 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
       return { ok: false, error: { code: "NO_SESSION", message: `卡片 ${cardId} 的会话没起来` } };
     }
     const id = `${live.tag}:p${++live.promptSeq}`;
-    const sent = live.session.send({
-      id,
-      type: "prompt",
-      message: text,
-      ...(images.length === 0 ? {} : { images: images.map(ompImage) }),
-    });
+    const commandImages = images.length === 0 ? {} : { images: images.map(ompImage) };
+    /**
+     * 忙 → `steer`（中途引导，见 docs/omp-rpc.md §3.2）；闲 → `prompt`（新起一轮）。
+     *
+     * 判据用本进程的 `busy || awaitingSettle`（都来自 omp 自己的帧：我们发 prompt 时置忙，
+     * `prompt_result` / `session_settled` 时放下）。判错方向也不致命：`steer` 在空闲时进队后
+     * 由 omp 自己起一轮（源码 `#canAutoContinueForFollowUp`：steering 队列非空即放行）；
+     * 反过来空闲那条 `prompt` 我们也带上 `streamingBehavior:"steer"` 兜底 —— 万一那一瞬间
+     * omp 其实在忙，它会排进 steering 队列，而不是回一个 AgentBusyError。
+     */
+    const steering = opts.steer === true && (live.busy || live.awaitingSettle);
+    const sent = steering
+      ? live.session.steer(text, { id, ...commandImages })
+      : live.session.prompt(text, { id, ...commandImages, ...(opts.steer === true ? { streamingBehavior: "steer" as const } : {}) });
     if (!sent) {
       return { ok: false, error: { code: "SEND_FAILED", message: "命令没写进 omp 的 stdin" } };
     }
@@ -1157,7 +1200,7 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
     live.lastActivityAt = at;
     emit(live, { type: "message_end", id, role: "user", text, at });
     emitState(live);
-    return { ok: true, messageId: id };
+    return { ok: true, messageId: id, delivery: steering ? "steer" : "prompt" };
   };
 
   const abort = async (cardId: string): Promise<SimpleResult> => {

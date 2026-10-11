@@ -289,7 +289,11 @@ export type OmpEvent =
   | { kind: "turn"; phase: "start" | "end"; toolResults: unknown }
   | { kind: "agent"; phase: "start" | "end" }
   | { kind: "notice"; level: string; message: string; source: string | null }
-  | { kind: "queue"; steering: string[]; followUp: string[] }
+  /**
+   * `queue_update`：omp 的排队快照（每次队列变化各一条）。
+   * `liveSteered` = 队头里**已经活投进当前流式响应**的条数（这些 `remove_queued_message` 够不着）。
+   */
+  | { kind: "queue"; steering: string[]; followUp: string[]; liveSteered: number }
   | { kind: "command_output"; text: string }
   | { kind: "ui"; id: string; method: string; request: Record<string, unknown> }
   | { kind: "other"; type: string; raw: Record<string, unknown> }
@@ -499,6 +503,7 @@ export class FrameNormalizer {
             kind: "queue",
             steering: asStringArray(raw["steering"]) ?? [],
             followUp: asStringArray(raw["followUp"]) ?? [],
+            liveSteered: asNumber(raw["liveSteered"]) ?? 0,
           },
         ];
       default:
@@ -668,6 +673,15 @@ export type OmpRpcSession = {
   send(command: RpcCommandInput): boolean;
   /** 发 prompt，返回自己生成的 `id`（用来跟 `result` 对齐）。 */
   prompt(message: string, opts?: { images?: readonly unknown[]; id?: string; streamingBehavior?: "steer" | "followUp" }): string;
+  /**
+   * 把一句话作为**中途引导**插进当前这一轮（omp 的 `steer` 命令）。
+   *
+   * 与 `prompt` 的区别（源码/文档见 `docs/omp-rpc.md` §3.2）：`steer` 只做「入 steering 队列」，
+   * **不会**在忙时报 busy 错、也不会另起一轮——omp 在下一个 tool 批次边界（或能活投进正在流的
+   * 响应时更早）把它注入；会话空闲时它同样进队，由 omp 自己把这一轮跑起来。
+   * 已退出/写失败 → 返回 id 但 `send` 会补一条 `error` 事件。
+   */
+  steer(message: string, opts?: { images?: readonly unknown[]; id?: string }): string;
   /** 中断当前 run；omp 仍会吐完事件并以 `result{status:"aborted"}` 收尾。 */
   abort(): boolean;
   /** 开新会话（浅层 `/clear`）；之后必须重新 `get_state` 拿新的 sessionId。 */
@@ -920,6 +934,16 @@ export function startRpcSession(opts: StartRpcOptions): OmpRpcSession {
         message,
         ...(promptOpts.images === undefined ? {} : { images: promptOpts.images }),
         ...(promptOpts.streamingBehavior === undefined ? {} : { streamingBehavior: promptOpts.streamingBehavior }),
+      });
+      return id;
+    },
+    steer(message, steerOpts = {}) {
+      const id = steerOpts.id ?? nextId("steer");
+      write({
+        id,
+        type: "steer",
+        message,
+        ...(steerOpts.images === undefined ? {} : { images: steerOpts.images }),
       });
       return id;
     },

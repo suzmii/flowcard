@@ -398,6 +398,12 @@ export const sessionPromptSchema = z.object({
   images: z
     .array(z.object({ name: z.string().min(1), dataBase64: z.string().min(1) }))
     .optional(),
+  /**
+   * 会话正忙时把这句话作为**中途引导**（omp 的 `steer`）投进当前这一轮，而不是干等它空闲。
+   * **默认 `true`**（用户在聊天框里说话就是要引导 AI）；传 `false` = 永远走 `prompt`（忙时会被 omp 拒），
+   * 见 `POST /api/cards/:id/session/prompt` 的契约与 `docs/omp-rpc.md` §3.2。
+   */
+  steer: z.boolean().optional(),
 });
 
 /**

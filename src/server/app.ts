@@ -19,6 +19,7 @@ import {
 import type { Project } from "../shared/types.ts";
 import { withStage } from "../shared/stage.ts";
 import type { CardGitFacts } from "../shared/stage.ts";
+import { buildWorkflow } from "../shared/workflow.ts";
 import { createCardGitFactsCache } from "./card-git.ts";
 import { resolveUserPath } from "../shared/paths.ts";
 import { attachmentRef, MAX_ATTACHMENT_BYTES } from "./attachments.ts";
@@ -253,6 +254,12 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     const facts = (await gitFacts?.collect([card])) ?? new Map<string, CardGitFacts>();
     return c.json({ card: withStage(card, card.worktree ? (facts.get(card.worktree.path) ?? null) : null) });
   });
+
+  /**
+   * `GET /api/workflow`：流程视图（Workflow tab）的数据 —— 状态/转换/门禁/自动节点 + 看板 9 列的溯源。
+   * **纯常量**（`src/flow/personal.ts` + `src/shared/stage.ts`），不读库、不看时间，前端不手写任何流程内容。
+   */
+  app.get("/api/workflow", (c) => c.json(buildWorkflow()));
 
   app.get("/api/events", (c) => {
     // SQLite 里负 LIMIT = 无上限，必须收敛（-1 会把整部历史一次性倒出来）
@@ -717,8 +724,8 @@ export function createApp(store: Store, opts: AppOptions = {}) {
    * |---|---|---|
    * | GET  | `/api/cards/:id/session` | 现况（status/busy/cost）+ 转录（落库的，重启后仍在） |
    * | POST | `/api/cards/:id/session/start` | `{cwd?}` → `{ok,status,ompSessionId?}`；**立刻回 `starting`** |
-   * | POST | `/api/cards/:id/session/prompt` | `{text,images?}` → `{ok,messageId?}` |
-   * | POST | `/api/cards/:id/session/abort` | 中断当前一轮 |
+   * | POST | `/api/cards/:id/session/prompt` | `{text,images?,steer?}` → `{ok,messageId?,delivery}`；`steer` 默认 `true`：忙时发 `steer`（中途引导），空闲发 `prompt` |
+   * | POST | `/api/cards/:id/session/abort` | 中断当前一轮（会话不退出，之后还能接着 `prompt`） |
    * | POST | `/api/cards/:id/session/stop` | 收尾（关 stdin → omp 自己退 → 上报 `end`） |
    * | POST | `/api/cards/:id/session/delete` | 删会话：停进程 + 清转录 + `session.deleted`（卡片 `session=null`）；**不动** omp 的会话文件 |
    * | POST | `/api/cards/:id/session/cwd` | `{path}` → 停旧进程、用新 cwd `-r` 续接（卡片随之 claim 进「实施中」） |
@@ -770,10 +777,25 @@ export function createApp(store: Store, opts: AppOptions = {}) {
     }
     // 先补投攒下的通知，再发人这句话：agent 看到的是「发生了什么 → 人又说了什么」。
     await notifyHooks.flush(cardId);
-    const result = await sessions.prompt(cardId, parsed.data.text, images);
+    // 默认**引导**（用户拍板）：忙时用 omp 的 `steer` 插进当前这一轮，空闲才新起一轮。
+    const steer = parsed.data.steer ?? true;
+    const result = await sessions.prompt(cardId, parsed.data.text, images, { steer });
     return c.json(result, result.ok ? 200 : 409);
   });
 
+  /**
+   * 中断当前这一轮（`HostedSessions.abort` → omp 的 `abort` 命令）。
+   *
+   * 语义（真机 18.9.0 验过，见 `docs/omp-rpc.md` §3.2）：
+   *   · 只中断**当前这一轮**：正在跑的 run 以 `prompt_result{status:"aborted"}` 收尾，半截的助手文本
+   *     照旧落转录；**会话本身不退出**（`status` 仍是 `running`），之后还能接着 `prompt`；
+   *   · **不清排队**：已经引导（`steer`）但还没被读到的消息**保留**，omp 收尾时会用它们起新的一轮；
+   *     想连排队一起撤下来是另一个命令（`abort_and_restore_queue`），flowcard 不暴露；
+   *   · **幂等**：重复点、或空闲时点，都是「命令已发出」（omp 只回回执，不报错）。
+   *
+   * 响应：`200 {ok:true}`；没有会话/进程没了 → `409 {ok:false,error:{code:"NO_SESSION"|"SEND_FAILED",…}}`。
+   * 前端别用这个响应判断「停了」——**以 SSE 的 `state.busy` 变回 `false` 为准**。
+   */
   app.post("/api/cards/:id/session/abort", async (c) => {
     const cardId = c.req.param("id");
     if (!store.getCard(cardId)) {

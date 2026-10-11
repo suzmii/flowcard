@@ -68,8 +68,10 @@ sequenceDiagram
 
 | 命令 | 形状 | 回执 | 说明 |
 |---|---|---|---|
-| `prompt` | `{id?, type:"prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer"\|"followUp"}` | `{type:"response", command:"prompt", success:true, data?:{agentInvoked}}`（异步，事件随后） | 带 `id` 才能把 `prompt_result` 对回来 |
-| `abort` | `{id?, type:"abort"}` | `{... command:"abort", success:true}` | 中断当前 run |
+| `prompt` | `{id?, type:"prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer"\|"followUp"}` | `{type:"response", command:"prompt", success:true, data?:{agentInvoked}}`（异步，事件随后） | 带 `id` 才能把 `prompt_result` 对回来。**忙时**不带 `streamingBehavior` 会抛 `AgentBusyError`（回 `success:false` + `prompt_result{status:"error"}`）——**不会**排队等空闲 |
+| `steer` | `{id?, type:"steer", message: string, images?: ImageContent[]}` | `{... command:"steer", success:true}`（**没有 `data`、也没有 `prompt_result`**） | 忙时插话：入 steering 队列，下一个边界注入当前这一轮。语义/细节见 §3.2 |
+| `follow_up` | `{id?, type:"follow_up", message, images?}` | `{... command:"follow_up", success:true}` | 入 follow-up 队列：**这一程结束**后才处理 |
+| `abort` | `{id?, type:"abort"}` | `{... command:"abort", success:true}` | 中断当前 run（**不清排队**，见 §3.2 尾） |
 | `new_session` | `{id?, type:"new_session", parentSession?}` | `{... command:"new_session", data:{cancelled:boolean}}` | **回执里没有 sessionId**，要再 `get_state`（见 §9） |
 | `get_state` | `{id?, type:"get_state"}` | `data: RpcSessionState`（含 `sessionId`、`isStreaming`、`isSettled`、`queuedMessages`、`model`…） | `rpc-types.ts:151-199` |
 | `get_session_stats` | `{id?, type:"get_session_stats"}` | `data: SessionStats`（`tokens:{input,output,reasoning,cacheRead,cacheWrite,total}`、`cost`、`sessionFile`） | 花费就用它 |
@@ -87,6 +89,7 @@ await session.ready;                       // {ok:true,protocolVersion,...} | {o
 const off = session.on((event) => …);      // 订阅简化事件（OmpEvent），返回退订函数
 session.setEventFilter(null, "delta");     // 建议第一件事
 const promptId = session.prompt("…", { images? });   // 返回自己生成的 id，用来跟 result 对齐
+const steerId = session.steer("…", { images? });     // 中途引导（`type:"steer"`），同样返回 id（见 §3.2）
 await session.request({ type: "get_state" }, { timeoutMs: 10_000 });  // 按 id 关联，永不 reject
 session.abort(); session.newSession(); session.getState(); session.getSessionStats();
 session.textFor("msg-2");                  // 已拼好的纯文本
@@ -96,6 +99,70 @@ await session.stop({ graceMs, killGraceMs });  // 幂等；返 {code, signal, fo
 
 `send()` 是逃生口（发任意 `RpcCommand`）；`request()` 在 `send()` 之上按 `id` 等回执。
 自己发的 `abort`（不带 id）在实测里回执是 `id: null` —— 需要关联就用 `request({type:"abort"})`。
+
+### 3.2 忙时插话：`steer` / `follow_up`（与 `prompt` 的区别）
+
+**`prompt` 不会排队。** 会话正忙（`session.isStreaming`）时，`prompt` **不带** `streamingBehavior` 就是
+直接抛错：RPC 回一条 `success:false` 的 `response`（`error:"Agent is already processing. …"`），
+并把 ticket 记成 `prompt_result{status:"error"}`（`rpc-mode.ts:2058-2064` 的 `AgentBusyError`、
+`agent-session.ts:7405-7412` 的 `if (this.isStreaming)` 分支）。所以「等它忙完再发」是要客户端自己排，
+omp 不给这个队。想**插进去**有三条路（源码 `rpc-mode.ts:1889-1892`）：
+
+| 写法 | 忙时行为 | 闲时行为 | 有 `prompt_result` 吗 |
+|---|---|---|---|
+| `{type:"steer", message}` | 入 **steering 队列**：下一个边界注入当前这一轮 | 入队后由 omp 自己起一轮（见下） | **没有**（`rpc-mode.ts:1891` 传 `undefined` ticket） |
+| `{type:"follow_up", message}` | 入 **follow-up 队列**：这一程结束后才处理 | 同上 | **没有** |
+| `{type:"prompt", …, streamingBehavior:"steer"\|"followUp"}` | 等价于上面两条（同一条 `#queueUserMessage` 路径） | 正常起一轮 | **有**（ticket 跟着排队的那条消息走，`rpc-prompt-results.ts:46-50`） |
+
+**插入点在哪**（agent-core 的循环，`pi-agent-core/src/agent-loop.ts`）：
+- 每个 **tool 批次边界**与 run 开始时 poll steering 队列（`:1222,1251,1297`）。正在跑的**原子工具不会被砍**。
+- `wait`/`vibe` 这类「纯等待」的 interruptible 工具会收到 steering 信号**提前收工**（`:152-153,3238-3246`），
+  消息随后在边界注入 —— 所以按了引导，等待里的会话能立刻动起来（不是等整个 run 完）。
+- 支持 live steering 的 provider 能把它**活投进正在流的那条响应**（`:1874-1878`）；这些算 `liveSteered`，
+  `remove_queued_message` 也撤不回来。
+
+**连发多条**（`pi-agent-core/src/agent.ts`）：
+- `steer` 就是一条一条 `push` 进队列（`:1376-1377`）——**不去重、不合并、不拒绝**；每次队列变化推一条
+  `queue_update{steering:[…], followUp:[…], liveSteered}`。
+- 取用时按 `steeringMode` 决定一批取几条：**默认 `one-at-a-time`**（`modes/settings.ts:749-753`）——
+  每个边界只投**一条**，剩下的留到后面的边界；`all` 才一次全投（`agent.ts:1482-1494`）。
+- 文本按 FIFO 顺序，原文不改（模板/斜杠命令会被展开，`agent-session.ts:8237-8242`）。
+
+**空闲时发 `steer`** 也会跑：`#canAutoContinueForFollowUp()` 见到 steering 队列非空就放行
+（`agent-session.ts:8490-8499`），omp 自己把这一轮起起来 —— 但那一轮**没有 `prompt_result`**，
+只有事件流 + 收尾的 `session_settled`。
+
+**失败长什么样**：忙**不是**失败条件。只有文本以 `/` 开头且命中扩展命令注册表时抛错
+（`agent-session.ts:8237-8240`），表现为一条 `success:false` 的 `response`。
+
+**`abort` 与排队的关系**（`agent-session.ts:9692-9785`）：`abort` 只 abort 当前 run 的 controller
+（`agent.ts:1529-1531`），**不清空** steering/follow-up 队列；abort 期间 `#abortInProgress` 先挡住 drain，
+收尾的 `finally` 再 `#drainStrandedQueuedMessages()`（`:9780-9784`）——**排队的用户 steer 保留，
+并立刻被跑成新的一轮**（advisor 卡例外：中断时被提取出来重新记成可见建议，不触发轮次）。
+想「中断并把排队撤回来」是另一个命令 `abort_and_restore_queue`（回执里带回被撤下的消息）。
+
+**flowcard 怎么接**（`hosted-session.ts` 的 `prompt(...,{steer})` ← `POST /api/cards/:id/session/prompt`）：
+- 忙（本进程的 `busy || awaitingSettle`）→ 发 `steer`；闲 → 发 `prompt`（**带** `streamingBehavior:"steer"`
+  兜底：万一这一刻判错，omp 会把它排进 steering 队列，而不是回 busy 错）。
+- 回执里 `delivery:"steer"|"prompt"` 说清这次实际走了哪条路；omp 的 `queue_update` 原样转成 SSE 的
+  `queue` 事件（前端据此显示「已引导、还没被模型读到」）。
+- 本节的语义核对的是**本机装的 `@oh-my-pi/pi-coding-agent` 18.9.0** 源码（`omp --version` 也是 18.9.0）；
+  帧形状与 18.8.7 一致（§8 那次真机验证就是 18.8.7）。
+
+**真机验证（2026-10-11，omp 18.9.0，`choosec/deepseek-flash`）**：临时脚本 `/tmp/fc-steer/drive.mjs`
+（不在仓库里）直接开 `omp --mode rpc --no-ui` 真管道，日志 `/tmp/fc-steer/abort.log`。两次观测：
+
+1. **忙时 `steer` 插进当前这一轮**（同一 run，`agent_start` 计数不变）：发 `prompt` 后 0.9 s 发
+   `steer` → `queue_update{steering:["…"],liveSteered:0}`，`response{command:"steer",success:true}`；
+   run 跑到 tool 批次边界时 `queue_update{steering:[]}` → `turn_start` → 一条 `{"role":"user",
+   "steering":true}` 的用户消息出现在转录里，模型接着这条继续答。同一份日志还看到：等待中的
+   `bash sleep 6` 被 steering 信号**提前收工**（`tool_execution_end` 的文本是 “Backgrounded early
+   to handle an incoming message; the command keeps running.”）——命令没被杀，转后台继续跑。
+2. **`abort` 后排队里的 steer 保留并起新的一轮**：`steer` 入队（`queue_update{steering:["别等了…"]}`）
+   → 1.8 s 后 `abort` → `response{command:"abort",success:true}`、`queue_update{steering:[]}`、
+   **`agent_start`（第 2 次）**、`prompt_result{id:"p1",status:"aborted",sessionSettled:false}`（因为
+   还有排队活没做完）→ 新的一轮把那条 steer 当作用户消息吃进去（`steering:true`）→ 最后一条
+   `session_settled`。**排队不丢**，`abort` 不是「清空队列表」。
 
 ## 4. 帧清单（stdout）
 
@@ -134,7 +201,7 @@ await session.stop({ graceMs, killGraceMs });  // 幂等；返 {code, signal, fo
 | `tool_execution_update` | `{type:"tool_execution_update", toolCallId, toolName, args, partialResult}`（**终端实时输出的来源**） | 同上 |
 | `tool_execution_end` | `{type:"tool_execution_end", toolCallId, toolName, result, isError?:boolean}` | 同上 |
 | `notice` | `{type:"notice", level:"info"\|"warning"\|"error", message, source?}` | `agent-session-events.ts:74` |
-| `queue_update` | `{type:"queue_update", steering:string[], followUp:string[]}` | `agent-session-events.ts:88` |
+| `queue_update` | `{type:"queue_update", steering:string[], followUp:string[], liveSteered?:number}` —— 队头里已活投进流式响应的条数（§3.2） | `agent-session-events.ts:88`、`rpc-session-events.ts` |
 | 其他 | `auto_compaction_*`、`auto_retry_*`、`cache_warming_*`、`model_changed`、`advisor_cost_changed` **[实测]**、`thinking_level_changed`、`todo_*`、`goal_updated`、`ttsr_triggered`、`irc_message`、`retry_fallback_*`、`config_warnings_changed` | `agent-session-events.ts:34-88` |
 
 `messageId` 是 **RPC 模式自己盖的**（`msg-1`、`msg-2`…，进程内唯一），
@@ -181,7 +248,7 @@ await session.stop({ graceMs, killGraceMs });  // 幂等；返 {code, signal, fo
 | `agent_start` / `agent_end` | `{kind:"agent", phase}` |
 | `message_start` / `message_end` | `{kind:"message", phase, messageId, role, text, stopReason}`（`text` 是拼好的文本，见 §6） |
 | `notice` | `{kind:"notice", level, message, source}` |
-| `queue_update` | `{kind:"queue", steering, followUp}` |
+| `queue_update` | `{kind:"queue", steering, followUp, liveSteered}` |
 | `prompt_result` | `{kind:"result", id, agentInvoked, status, error, retryable, sessionSettled}` ← **本协议里 `id` 的用途就是这个** |
 | `session_settled` | `{kind:"settled"}` |
 | `ready` | `{kind:"ready", protocolVersion, supportedProtocolVersions, maxFrameBytes}` |

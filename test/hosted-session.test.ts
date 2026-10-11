@@ -65,7 +65,15 @@ const sessionId =
     : "fake-session-1";
 // 挂着的那一轮：{ promptId, msgId }（abort 时照着它收尾）。
 let pending = null;
+// 已引导但还没被读到的消息（真 omp 的 steering 队列；abort 后**保留**并起新的一轮，见 docs/omp-rpc.md §3.2）。
+let steerQueue = [];
 let buf = "";
+// 收到的每条命令落一份日志（测试断言 stdin 里到底是 steer 还是 prompt）——只读不改协议。
+const CMD_LOG = process.env.FAKE_OMP_LOG || null;
+function logCmd(cmd) {
+  if (CMD_LOG === null) return;
+  try { require("node:fs").appendFileSync(CMD_LOG, JSON.stringify({ type: cmd.type, id: cmd.id, message: cmd.message, streamingBehavior: cmd.streamingBehavior }) + NL); } catch {}
+}
 // 真 omp 的 messageId / toolCallId 在**整个会话里递增**（不是每轮从 msg-1 重来）——
 // 假 omp 照抄这一点，两轮的帧/转录才分得清是哪一轮发的。
 let turn = 0;
@@ -83,9 +91,28 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.on("end", () => process.exit(0));
 
+/**
+ * 引导驱动起的一轮（abort 之后把排队里的引导跑成新的一轮）：真 omp 的引导**没有 prompt ticket**，
+ * 所以不会出现 prompt_result —— 只有事件流 + 收尾的 session_settled。
+ */
+function runSteeredTurn(text) {
+  turn += 1;
+  const u = "msg-" + (turn * 3 - 2);
+  const a = "msg-" + (turn * 3);
+  out({ type: "agent_start" });
+  out({ type: "message_start", messageId: u, message: { role: "user", content: [{ type: "text", text }] } });
+  out({ type: "message_end", messageId: u, message: { role: "user", content: [{ type: "text", text }], stopReason: "stop" } });
+  out({ type: "message_start", messageId: a, message: { role: "assistant", content: [] } });
+  out({ type: "message_update", messageId: a, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "引导收到" } });
+  out({ type: "message_update", messageId: a, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "引导收到" } });
+  out({ type: "message_end", messageId: a, message: { role: "assistant", content: [{ type: "text", text: "引导收到" }], stopReason: "stop" } });
+  out({ type: "agent_end", messages: [] });
+}
+
 function handleLine(line) {
   let cmd;
   try { cmd = JSON.parse(line); } catch { out({ type: "response", command: "parse", success: false, error: "bad json" }); return; }
+  logCmd(cmd);
   switch (cmd.type) {
     case "get_state":
       out({ id: cmd.id, type: "response", command: "get_state", success: true, data: { sessionId, isStreaming: false, isSettled: true, messageCount: 0 } });
@@ -98,17 +125,37 @@ function handleLine(line) {
       return;
     case "abort": {
       out({ id: cmd.id, type: "response", command: "abort", success: true });
-      if (pending === null) return;
+      if (pending === null) return; // 空闲时 abort 是空操作：只回回执，不报错、不起轮次
       // abort 之后在途帧还会有几条（真机就这样），然后以 aborted 收尾。
       out({ type: "message_update", messageId: pending.msgId, message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "2" } });
       out({ type: "message_update", messageId: pending.msgId, message: { role: "assistant" }, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "12" } });
       out({ type: "message_end", messageId: pending.msgId, message: { role: "assistant", content: [{ type: "text", text: "12" }], stopReason: "aborted" } });
-      out({ type: "prompt_result", id: pending.promptId, agentInvoked: true, status: "aborted", sessionSettled: true });
-      out({ type: "session_settled" });
+      // 真 omp：abort **不清空** steering 队列（agent.abort() 只 abort controller），收尾时
+      // #drainStrandedQueuedMessages 把排队里的引导直接跑成新的一轮（源码 agent-session.ts:9781-9784）。
+      const queued = steerQueue.shift();
+      out({ type: "prompt_result", id: pending.promptId, agentInvoked: true, status: "aborted", sessionSettled: queued === undefined });
       pending = null;
+      if (queued === undefined) { out({ type: "session_settled" }); return; }
+      out({ type: "queue_update", steering: steerQueue.slice(), followUp: [] });
+      runSteeredTurn(queued);
+      out({ type: "session_settled" });
+      return;
+    }
+    case "steer": {
+      // 引导：只入队（真 omp 的语义，docs/omp-rpc.md §3.2）——忙时也不报 busy 错、不另起一轮。
+      steerQueue.push(cmd.message);
+      out({ id: cmd.id, type: "response", command: "steer", success: true });
+      out({ type: "queue_update", steering: steerQueue.slice(), followUp: [] });
       return;
     }
     case "prompt": {
+      if (pending !== null) {
+        // 真 omp：忙时**不带** streamingBehavior 的 prompt 抛 AgentBusyError（rpc-mode 先吐一条失败回执，
+        // 再把 ticket 记成 error 的 prompt_result）——这正是「默认引导」要绕开的那条路。
+        out({ id: cmd.id, type: "response", command: "prompt", success: false, error: "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion." });
+        out({ type: "prompt_result", id: cmd.id, agentInvoked: false, status: "error", error: { message: "Agent is already processing.", retryable: false }, sessionSettled: false });
+        return;
+      }
       out({ id: cmd.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
       turn += 1;
       const user = "msg-" + (turn * 3 - 2);
@@ -1274,5 +1321,294 @@ describe("删会话：停进程 + 清转录 + 清卡片会话事实（omp 的会
 
     // 卡片不存在：404（不是 5xx）
     expect((await app.request("/api/cards/c404/session/delete", { method: "POST", headers: json, body: "{}" })).status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------- 忙时引导（steer）/ 中断（abort）
+
+/**
+ * 用户要的：**会话正忙时说话 = 中途引导 AI**（omp 的 `steer`），不是干等它忙完。
+ * 协议语义见 `docs/omp-rpc.md` §3.2；这里用假 omp 真管道断言 stdin 里到底是 `steer` 还是 `prompt`。
+ */
+describe("忙时引导（steer）与中断（abort）", () => {
+  /** 假 omp 收到的命令日志（每行一条 JSON：`{type,id,message,streamingBehavior}`）。 */
+  function readCommands(file: string): Array<{ type: string; id?: string; message?: string; streamingBehavior?: string }> {
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as { type: string; message?: string });
+  }
+
+  it("忙时说话默认就是引导：stdin 收到的是 steer（不是 prompt），不被 busy 拦掉，会话保持忙", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const cmdLog = join(dir, "cmds.jsonl");
+    const sessions = makeSessions(store, "hang", [], undefined, { FAKE_OMP_LOG: cmdLog });
+    const app = createApp(store, { sessions });
+    const json = { "content-type": "application/json" };
+    const url = (suffix: string): string => `/api/cards/${id}/session${suffix}`;
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    // 第一句把会话弄忙（hang 模式：吐半截就挂着）
+    expect((await sessions.prompt(id, "请从 1 数到 500")).delivery).toBe("prompt");
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+    expect(sessions.snapshot(id).busy).toBe(true);
+
+    // 忙时说话：不带 steer 字段 = 默认引导（HTTP 层默认 steer:true）
+    const steered = await app.request(url("/prompt"), {
+      method: "POST",
+      headers: json,
+      body: JSON.stringify({ text: "别数了，只回答 ok" }),
+    });
+    expect(steered.status).toBe(200); // 不是 409：忙不拦
+    const steeredBody = (await steered.json()) as { ok: boolean; messageId: string; delivery: string };
+    expect(steeredBody).toEqual({
+      ok: true,
+      messageId: expect.stringContaining(":p2"),
+      delivery: "steer",
+    });
+
+    // ① stdin 里那句是 `steer`，且**没有**第二句 `prompt`
+    const commands = readCommands(cmdLog);
+    const steering = commands.filter((cmd) => cmd.message === "别数了，只回答 ok");
+    expect(steering.map((cmd) => cmd.type)).toEqual(["steer"]);
+    expect(steering[0]?.id).toBe(steeredBody.messageId); // 我们自己的 prompt id 原样带上（转录/回显对齐用）
+    expect(commands.filter((cmd) => cmd.type === "prompt")).toHaveLength(1); // 只有第一句
+
+    // ② omp 的排队快照（queue_update）也推给了网页：已引导、还没被读到
+    const queue = await log.waitFor((e) => e.type === "queue");
+    expect(queue.type === "queue" ? queue.steering : []).toEqual(["别数了，只回答 ok"]);
+
+    // ③ 用户那句话照旧进转录 + SSE 回显；会话还是忙的（引导没结束这一轮）
+    expect((await log.waitFor((e) => e.type === "message_end" && e.role === "user" && e.text === "别数了，只回答 ok"))).toBeTruthy();
+    expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual(["请从 1 数到 500", "别数了，只回答 ok"]);
+    expect(sessions.snapshot(id).busy).toBe(true);
+    expect(sessions.snapshot(id).status).toBe("running");
+
+    // ④ 忙时引导**不会**报错（对比：steer:false 那条老路会被 omp 回 busy 错，见下一个用例）
+    expect(log.byType("error")).toEqual([]);
+
+    await sessions.abort(id);
+    await sessions.stop(id);
+  });
+});
+
+describe("引导（steer）的连发、空闲路径与对比项", () => {
+  function readCommands(file: string): Array<{ type: string; id?: string; message?: string; streamingBehavior?: string }> {
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as { type: string; message?: string });
+  }
+
+  it("忙时连发多条引导：一条一条进 steering 队列（FIFO、不合并、不被拒）", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const cmdLog = join(dir, "cmds.jsonl");
+    const sessions = makeSessions(store, "hang", [], undefined, { FAKE_OMP_LOG: cmdLog });
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await sessions.prompt(id, "请从 1 数到 500");
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+
+    const sent = [
+      await sessions.prompt(id, "改一", [], { steer: true }),
+      await sessions.prompt(id, "改二", [], { steer: true }),
+      await sessions.prompt(id, "改三", [], { steer: true }),
+    ];
+    expect(sent.map((r) => r.delivery)).toEqual(["steer", "steer", "steer"]);
+    expect(sent.map((r) => r.messageId)).toEqual([
+      expect.stringContaining(":p2"),
+      expect.stringContaining(":p3"),
+      expect.stringContaining(":p4"),
+    ]);
+
+    // 三条各成一帧、顺序不变、没有被合并成一条，也没有被拒绝
+    const steers = readCommands(cmdLog).filter((cmd) => cmd.type === "steer");
+    expect(steers.map((cmd) => cmd.message)).toEqual(["改一", "改二", "改三"]);
+
+    // omp 的排队快照逐条长大（1 → 2 → 3）：这是「都在队列里、没被吞掉」的证据
+    await log.waitFor((e) => e.type === "queue" && e.steering.length === 3);
+    expect(
+      log
+        .byType("queue")
+        .map((e) => (e.type === "queue" ? e.steering.length : 0)),
+    ).toEqual([1, 2, 3]);
+
+    expect(log.byType("error")).toEqual([]);
+    expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual([
+      "请从 1 数到 500",
+      "改一",
+      "改二",
+      "改三",
+    ]);
+    expect(sessions.snapshot(id).busy).toBe(true);
+
+    await sessions.abort(id);
+    await sessions.stop(id);
+  });
+
+  it("空闲时说一句：走 prompt（带 streamingBehavior:'steer' 兜底），delivery=prompt，正常跑完一轮", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const cmdLog = join(dir, "cmds.jsonl");
+    const sessions = makeSessions(store, "normal", [], undefined, { FAKE_OMP_LOG: cmdLog });
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id); // 不投 kickoff：起来就是空闲
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+
+    const idle = await sessions.prompt(id, "空闲时说一句", [], { steer: true });
+    expect(idle.delivery).toBe("prompt");
+    const cmd = readCommands(cmdLog).filter((c) => c.message === "空闲时说一句");
+    expect(cmd.map((c) => c.type)).toEqual(["prompt"]);
+    // 兜底：空闲那条也带 streamingBehavior:"steer" —— 万一这一瞬间判错，omp 会排进 steering 队列而不是回 busy 错
+    expect(cmd[0]?.streamingBehavior).toBe("steer");
+
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
+    expect(sessions.snapshot(id).busy).toBe(false);
+    expect(
+      sessions
+        .snapshot(id)
+        .messages.filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => m.text),
+    ).toEqual(["空闲时说一句", "先跑一下", "ok"]);
+    await sessions.stop(id);
+  });
+
+  it("steer:false 忙时仍是老路：omp 回 busy 错，SSE 上看到 error（默认引导要绕开的正是这条）", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const cmdLog = join(dir, "cmds.jsonl");
+    const sessions = makeSessions(store, "hang", [], undefined, { FAKE_OMP_LOG: cmdLog });
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await sessions.prompt(id, "请从 1 数到 500");
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+
+    const refused = await sessions.prompt(id, "排队等吧", [], { steer: false });
+    expect(refused.ok).toBe(true); // 命令照旧只是写进 stdin（乐观）；omp 的拒绝走 SSE
+    expect(refused.delivery).toBe("prompt");
+    expect(readCommands(cmdLog).filter((c) => c.message === "排队等吧").map((c) => c.type)).toEqual(["prompt"]);
+
+    const failure = await log.waitFor((e) => e.type === "error");
+    expect(failure.type === "error" ? failure.message : "").toContain("already processing");
+    await sessions.abort(id);
+    await sessions.stop(id);
+  });
+});
+
+describe("中断（abort）的语义与竞态", () => {
+  it("忙时中断：本轮以 aborted 收尾（转录留半截）、会话不退出；空闲时是空操作；连点两次都 ok", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const sessions = makeSessions(store, "hang");
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await sessions.prompt(id, "请从 1 数到 500");
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+    expect(sessions.snapshot(id).busy).toBe(true);
+
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
+    expect(await sessions.abort(id)).toEqual({ ok: true });
+    // 中断那一轮照旧落库（半截的 "12"），并以 aborted 收尾
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "12");
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
+    expect(sessions.snapshot(id).busy).toBe(false);
+    expect(sessions.snapshot(id).status).toBe("running"); // 会话本身没退出
+    expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual(["请从 1 数到 500", "12"]);
+
+    // 空闲时 abort：omp 只回回执（空操作），不报错；连点两次也一样
+    expect(await sessions.abort(id)).toEqual({ ok: true });
+    expect(await sessions.abort(id)).toEqual({ ok: true });
+    expect(log.byType("error")).toEqual([]);
+
+    // 中断之后照旧能说话（同一段会话接着跑）
+    const again = await sessions.prompt(id, "中断后继续");
+    expect(again.delivery).toBe("prompt");
+    await log.waitForNth((e) => e.type === "message" && e.textDelta === "跑一下", 2);
+    expect(sessions.snapshot(id).busy).toBe(true);
+    await sessions.abort(id);
+    await sessions.stop(id);
+  });
+
+  it("中断与 pending 引导：steering 队列不清空 —— 排队的引导保留，并在收尾时起新的一轮", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const sessions = makeSessions(store, "hang");
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    await sessions.start(id);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+    await sessions.prompt(id, "请从 1 数到 500");
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+
+    // 先引导一句（还没被模型读到就按了中断）
+    expect((await sessions.prompt(id, "别数了，回答 ok", [], { steer: true })).delivery).toBe("steer");
+    await log.waitFor((e) => e.type === "queue" && e.steering.length === 1);
+
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
+    expect(await sessions.abort(id)).toEqual({ ok: true });
+    // 被中断的一轮留下半截
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "12");
+    // 排队的引导没被丢掉：omp 把它跑成了新的一轮
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "引导收到");
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
+    expect(sessions.snapshot(id).busy).toBe(false);
+    expect(sessions.snapshot(id).status).toBe("running");
+    expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual([
+      "请从 1 数到 500",
+      "别数了，回答 ok",
+      "12",
+      "引导收到",
+    ]);
+    await sessions.stop(id);
+  });
+
+  it("HTTP 契约：POST /abort → 200 {ok:true}（会话不退出），中断后 POST /prompt 照旧 200", async () => {
+    const { store, dir } = makeStore();
+    const id = openCard(store, dir);
+    const sessions = makeSessions(store, "hang");
+    const app = createApp(store, { sessions });
+    const json = { "content-type": "application/json" };
+    const url = (suffix: string): string => `/api/cards/${id}/session${suffix}`;
+    const log = new EventLog();
+    sessions.subscribe(id, log.push);
+
+    const started = await app.request(url("/start"), { method: "POST", headers: json, body: JSON.stringify({}) });
+    expect(started.status).toBe(200);
+    await log.waitFor((e) => e.type === "ready" && e.ompSessionId !== undefined);
+
+    const first = await app.request(url("/prompt"), { method: "POST", headers: json, body: JSON.stringify({ text: "请从 1 数到 500" }) });
+    expect(first.status).toBe(200);
+    expect(((await first.json()) as { delivery?: string }).delivery).toBe("prompt"); // 空闲：新起一轮
+    await log.waitFor((e) => e.type === "message" && e.textDelta === "跑一下");
+
+    const settledBefore = log.byType("state").filter((e) => e.type === "state" && e.busy === false).length;
+    const aborted = await app.request(url("/abort"), { method: "POST" });
+    expect(aborted.status).toBe(200);
+    expect(await aborted.json()).toEqual({ ok: true });
+    await log.waitForNth((e) => e.type === "state" && e.busy === false, settledBefore + 1);
+    expect(((await (await app.request(url(""))).json()) as { status: string; busy: boolean }).status).toBe("running");
+
+    // 中断后继续说话：照旧 200（会话没退出）
+    const after = await app.request(url("/prompt"), { method: "POST", headers: json, body: JSON.stringify({ text: "中断后继续" }) });
+    expect(after.status).toBe(200);
+    expect(((await after.json()) as { delivery?: string }).delivery).toBe("prompt");
+    expect(await (await app.request(url("/stop"), { method: "POST" })).json()).toEqual({ ok: true });
   });
 });

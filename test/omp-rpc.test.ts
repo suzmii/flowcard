@@ -51,6 +51,7 @@ process.stdout.write("12345" + NL);
 
 let sessionId = "fake-1";
 let pendingPromptId = null;
+let steerQueue = [];
 let buf = "";
 
 process.stdin.setEncoding("utf8");
@@ -87,6 +88,12 @@ function handleLine(line) {
       return;
     case "set_event_filter":
       out({ id: cmd.id, type: "response", command: "set_event_filter", success: true, data: { events: null, messageUpdates: cmd.messageUpdates || "full" } });
+      return;
+    case "steer":
+      // 真 omp：入 steering 队列 + 回执 + queue_update（steering / liveSteered）。
+      steerQueue.push(cmd.message);
+      out({ id: cmd.id, type: "response", command: "steer", success: true });
+      out({ type: "queue_update", steering: steerQueue.slice(), followUp: [], liveSteered: 1 });
       return;
     case "abort":
       out({ id: cmd.id, type: "response", command: "abort", success: true });
@@ -395,7 +402,7 @@ describe("FrameNormalizer：帧 → 简化事件 + 拼纯文本", () => {
       '{"type":"agent_start"}',
       '{"type":"agent_end","messages":[]}',
       '{"type":"notice","level":"warning","message":"小心","source":"cfg"}',
-      '{"type":"queue_update","steering":["s"],"followUp":[]}',
+      '{"type":"queue_update","steering":["s"],"followUp":[],"liveSteered":1}',
     );
     expect(events.map((event) => event.kind)).toEqual([
       "thinking",
@@ -413,6 +420,8 @@ describe("FrameNormalizer：帧 → 简化事件 + 拼纯文本", () => {
     expect(events[2]).toMatchObject({ kind: "tool", phase: "start", toolName: "bash", intent: "列目录", args: { command: "ls" } });
     expect(events[3]).toMatchObject({ kind: "tool", phase: "end", isError: false, result: { stdout: "a" } });
     expect(events[8]).toMatchObject({ kind: "notice", level: "warning", message: "小心", source: "cfg" });
+    // queue_update：steering/followUp 的排队快照 + 队头里已活投进流式响应的条数
+    expect(events[9]).toEqual({ kind: "queue", steering: ["s"], followUp: [], liveSteered: 1 });
   });
 
   it("没见过的会话事件 → other（不丢信息），未知协议帧 → 丢弃并计数", () => {
@@ -608,6 +617,28 @@ describe("startRpcSession（假 omp 跑真管道）", () => {
       retryable: true,
       sessionSettled: true,
     });
+    await session.stop({ graceMs: 1_000, killGraceMs: 500 });
+  });
+
+  it("steer()：中途引导发的是 `type:\"steer\"`（不是 prompt），omp 的 queue_update 带 liveSteered", async () => {
+    const { session, log } = startFake("normal");
+    expect((await session.ready).ok).toBe(true);
+
+    // 自己生成的 id（跟 prompt 一样带序号），命令类型是 steer
+    const steerId = session.steer("打断一下：改用 pnpm");
+    expect(steerId).toMatch(/^steer-\d+$/);
+    await log.waitFor((event) => event.kind === "queue");
+    expect(log.events.find((event) => event.kind === "queue")).toMatchObject({
+      kind: "queue",
+      steering: ["打断一下：改用 pnpm"],
+      followUp: [],
+      liveSteered: 1,
+    });
+
+    // 回执按 id 关联得上（`request` 是确认「omp 收下了」的逃生口）
+    const ack = await session.request({ type: "steer", message: "再来一句" });
+    expect(ack).toMatchObject({ ok: true });
+    await log.waitFor((event) => event.kind === "queue" && event.steering.length === 2);
     await session.stop({ graceMs: 1_000, killGraceMs: 500 });
   });
 
