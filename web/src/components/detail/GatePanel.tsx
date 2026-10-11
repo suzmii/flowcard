@@ -3,24 +3,12 @@ import { CheckSquare, Lock, ShieldCheck, XCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { GATE_KIND_LABELS, gateDecisionCommand, gatePayloadItems } from "@/lib/approvals";
 import { GATE_STATUS_LABELS, type Gate } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 import { timeAgo } from "@/lib/utils";
 
 export type CommandRunner = (label: string, command: Record<string, unknown>) => Promise<void>;
-
-const GATE_KIND_LABEL: Record<Gate["kind"], string> = {
-  approve: "批准类",
-  confirm: "确认类",
-  review: "验收类",
-  cleanup: "清理类",
-};
-
-/** 门禁 payload 里的清理清单（G4 proposeCleanup 的 items）。 */
-function payloadItems(gate: Gate): string[] {
-  const items = gate.payload?.["items"];
-  return Array.isArray(items) ? items.filter((item): item is string => typeof item === "string") : [];
-}
 
 function OpenGate({
   card,
@@ -34,17 +22,12 @@ function OpenGate({
   onRun: CommandRunner;
 }) {
   const [reason, setReason] = useState("");
-  const items = payloadItems(gate);
+  const items = gatePayloadItems(gate);
 
-  const decide = (decision: "approved" | "rejected") =>
-    void onRun(decision === "approved" ? `批准 ${gate.id}` : `驳回 ${gate.id}`, {
-      cmd: "decideGate",
-      actor: { kind: "human", name: "me" },
-      card: card.id,
-      gate: gate.id,
-      decision,
-      ...(reason.trim() ? { reason: reason.trim() } : {}),
-    });
+  const decide = (decision: "approved" | "rejected") => {
+    const { label, command } = gateDecisionCommand(card.id, gate, decision, reason);
+    return void onRun(label, command);
+  };
 
   return (
     <div className="space-y-2 rounded-lg border-2 border-amber-500/60 bg-amber-50/60 p-2.5">
@@ -52,7 +35,7 @@ function OpenGate({
         <Lock className="size-3.5 text-amber-700" />
         <span className="font-mono text-xs font-semibold">{gate.id}</span>
         <span className="text-sm font-medium">{gate.title}</span>
-        <Badge variant="warning">{GATE_KIND_LABEL[gate.kind]}</Badge>
+        <Badge variant="warning">{GATE_KIND_LABELS[gate.kind]}</Badge>
         <span className="ml-auto text-xs text-muted-foreground">{timeAgo(gate.requestedAt)}</span>
       </div>
 

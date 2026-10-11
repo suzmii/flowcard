@@ -32,6 +32,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { PendingApprovals } from "@/components/detail/PendingApprovals";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -677,6 +678,9 @@ export function SessionChat({
           {card.worktree ? "" : "这张卡还没绑 worktree，cwd 由服务端决定。"}
         </p>
       ) : null}
+
+      {/* 待你拍板的审批（远程写确认 + 未决门禁）就地可操作：不用离开对话去卡片里点 */}
+      <PendingApprovals card={card} className="shrink-0" />
 
       {/* 转录：**自己滚**（外层给高度，内层 absolute 铺满），别指望整页滚 */}
       <div className="relative min-h-0 flex-1">

@@ -5,6 +5,7 @@ import type { CommandRunner } from "@/components/detail/GatePanel";
 import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { confirmDecisionCommand } from "@/lib/approvals";
 import { CONFIRM_ACTION_LABELS, type Confirmation } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 import { timeAgo } from "@/lib/utils";
@@ -23,15 +24,10 @@ function PendingConfirm({
   const [reason, setReason] = useState("");
   const requester = confirmation.requestedBy;
 
-  const decide = (decision: "approved" | "rejected") =>
-    void onRun(decision === "approved" ? `批准确认 ${confirmation.id}` : `驳回确认 ${confirmation.id}`, {
-      cmd: "decideConfirm",
-      actor: { kind: "human", name: "me" },
-      card: card.id,
-      id: confirmation.id,
-      decision,
-      ...(reason.trim() ? { reason: reason.trim() } : {}),
-    });
+  const decide = (decision: "approved" | "rejected") => {
+    const { label, command } = confirmDecisionCommand(card.id, confirmation, decision, reason);
+    return void onRun(label, command);
+  };
 
   return (
     <div className="space-y-2 rounded-lg border-2 border-amber-500/60 bg-amber-50/60 p-2.5">
