@@ -69,6 +69,8 @@ export type SessionEvent =
   | { type: "message_end"; id: string; role: "user" | "assistant" | "thinking"; text: string; at: string }
   | {
       type: "tool";
+      /** 落库行 id（= `<tag>:<toolCallId>`）：与服务端持久化的行身份同一份，前端按 id 对齐快照用。 */
+      id?: string;
       callId: string;
       name: string;
       phase: "start" | "update" | "end";
@@ -834,6 +836,9 @@ export function createHostedSessions(deps: HostedSessionDeps): HostedSessions {
         persist(live, { id: `${live.tag}:${event.toolCallId}`, role: "tool", at: now(), tool });
         emit(live, {
           type: "tool",
+          // 行身份与服务端落库**同一份**（`<tag>:<toolCallId>`）：前端按 id 对齐快照时才不会错位
+          // （此前只给裸 callId，前端 lines 对不上 → 每次合并都把工具块多挂一份到末尾）。
+          id: `${live.tag}:${event.toolCallId}`,
           callId: tool.callId,
           name: tool.name,
           phase: tool.status,
