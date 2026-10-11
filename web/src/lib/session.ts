@@ -424,6 +424,11 @@ export type SessionEvent =
   | { type: "message_end"; id: string; role: SessionRole; text: string; at: string }
   | {
       type: "tool";
+      /**
+       * 转录**行 id**：服务端带了 `id` 就照用（落库那行的 `<tag>:<callId>`），
+       * 没带就退到裸 `callId`（历史帧一直如此）。归并时的行身份见 `messageKey`。
+       */
+      id: string;
       callId: string;
       name: string;
       phase: "start" | "update" | "end";
@@ -493,6 +498,8 @@ export function parseSessionEvent(name: string, data: string): SessionEvent | nu
       if (!frame.callId || !frame.name || !frame.phase) return null;
       return {
         type: "tool",
+        // 服务端将来在 tool 帧里补上落库行的 `id` 也不用改前端：有就用，没有退到裸 callId。
+        id: frame.id ?? frame.callId,
         callId: frame.callId,
         name: frame.name,
         phase: frame.phase,
@@ -554,7 +561,9 @@ export function mergeToolOutput(previous: string, next: string): string {
 }
 
 function upsertTool(messages: SessionMessage[], event: Extract<SessionEvent, { type: "tool" }>): SessionMessage[] {
-  const existing = messages.find((message) => message.id === event.callId);
+  // 找旧行按 `tool.callId`（行身份见 `messageKey`），不按 `id`：服务端哪天在 tool 帧里补上落库行的
+  // `id`，同一个工具调用早先那几帧带的是裸 callId —— 按 id 找会另起一行。
+  const existing = messages.find((message) => message.tool?.callId === event.callId);
   const previous = existing?.tool;
   const started = event.phase === "start";
   const tool: SessionTool = {
@@ -568,13 +577,14 @@ function upsertTool(messages: SessionMessage[], event: Extract<SessionEvent, { t
   else if (previous?.isError !== undefined) tool.isError = previous.isError;
 
   const message: SessionMessage = {
-    id: event.callId,
+    // 新行用这一帧给的行 id；已有行沿用旧 id —— 同一行别在流中途被"降级"回裸 callId。
+    id: existing?.id ?? event.id,
     role: "tool",
     at: existing?.at ?? "",
     text: existing?.text,
     tool,
   };
-  return replaceMessage(messages, event.callId, () => message);
+  return replaceMessage(messages, existing?.id ?? event.id, () => message);
 }
 
 /** 一帧事件 → 新视图（纯函数；`now` 由调用方给，便于测试与稳定输出）。 */
@@ -651,14 +661,26 @@ function pushNotice(
 }
 
 /**
- * GET 快照 vs 本地流：同 id 时取信息更全的那份（文本更长者胜、工具输出更长者胜），
+ * 归并用的「行身份」：普通消息两端都是转录行 id，直接用 `id`；**工具块例外** ——
+ * SSE 的 `tool` 帧历史上只带裸 `callId`（前端拿它建行），而落库那行的 id 是
+ * `<tag>:<callId>`（前缀是每次启动的会话标记）。不按 `callId` 对齐的话工具行永远匹配不上：
+ * 每次合并（reload / 存活探针 / 发消息后）都把本地那份当成"本地独有"再挂一份到末尾 ——
+ * 工具块出现两份、新消息被挤到中间、跟流式回复交错（用户报的「对话记录会乱」就是这个）。
+ */
+function messageKey(message: SessionMessage): string {
+  return message.tool === undefined || message.tool.callId === "" ? message.id : message.tool.callId;
+}
+
+/**
+ * GET 快照 vs 本地流：同一行时取信息更全的那份（文本更长者胜、工具输出更长者胜），
  * 本地独有的消息挂在尾部（正在流、快照还没落盘的那条）。状态/成本以快照为准。
+ * 行的身份见 `messageKey`（工具行按 `tool.callId` 对齐，其余按 `id`）。
  */
 export function mergeSessionSnapshot(current: SessionState, snapshot: SessionState): SessionState {
-  const local = new Map(current.messages.map((message) => [message.id, message]));
+  const local = new Map(current.messages.map((message) => [messageKey(message), message]));
 
   const merged = snapshot.messages.map((message) => {
-    const mine = local.get(message.id);
+    const mine = local.get(messageKey(message));
     if (!mine) return message;
     const keepText = (mine.text?.length ?? 0) > (message.text?.length ?? 0);
     const tool = pickTool(mine.tool, message.tool);
@@ -671,8 +693,8 @@ export function mergeSessionSnapshot(current: SessionState, snapshot: SessionSta
     };
   });
 
-  const known = new Set(snapshot.messages.map((message) => message.id));
-  for (const message of current.messages) if (!known.has(message.id)) merged.push(message);
+  const known = new Set(snapshot.messages.map((message) => messageKey(message)));
+  for (const message of current.messages) if (!known.has(messageKey(message))) merged.push(message);
 
   return { ...snapshot, messages: merged };
 }

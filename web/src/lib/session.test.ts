@@ -69,6 +69,19 @@ describe("applySessionEvent", () => {
     expect(tool?.isError).toBe(true);
   });
 
+  it("工具帧带了落库行 id 就用它；老形状（只有裸 callId）的帧仍落在同一行上", () => {
+    let view = initialSessionView();
+    view = feed(view, "tool", { id: "ab12cd34:t1", callId: "t1", name: "bash", phase: "start", args: { command: "ls" } });
+    view = feed(view, "tool", { id: "ab12cd34:t1", callId: "t1", name: "bash", phase: "end", output: "ok" });
+    expect(view.session.messages.map((message) => message.id)).toEqual(["ab12cd34:t1"]);
+
+    // 服务端还没补 id 的那些帧（历史上一直这样）不能另起一行
+    view = feed(view, "tool", { callId: "t1", name: "bash", phase: "update", output: "ok!" });
+    expect(view.session.messages).toHaveLength(1);
+    expect(view.session.messages[0]?.id).toBe("ab12cd34:t1");
+    expect(view.session.messages[0]?.tool?.output).toBe("ok!");
+  });
+
   it("state 帧更新 busy/status/cost，notice/error 进提示流", () => {
     let view = initialSessionView();
     view = feed(view, "state", { busy: true, status: "running", cost: { total: 0.1234 } });
@@ -113,6 +126,40 @@ describe("mergeSessionSnapshot", () => {
       ["m1", "流到一半的更长文本"],
       ["m0", "在吗"],
       ["m2", "还没落盘"],
+    ]);
+  });
+
+  it("工具行按 tool.callId 对齐：同一个工具调用快照与本地各有一份，合并后只剩一行且在服务端的位置", () => {
+    let view = initialSessionView();
+    // 本地流：SSE 的 tool 帧只带裸 callId（`t1`）
+    view = feed(view, "message_end", { id: "ab12cd34:p1", role: "user", text: "看下目录", at: "" });
+    view = feed(view, "message_end", { id: "ab12cd34:msg-2", role: "assistant", text: "先跑一下", at: "" });
+    view = feed(view, "tool", { callId: "t1", name: "bash", phase: "end", args: { command: "ls" }, output: "total 0" });
+    view = feed(view, "message_end", { id: "ab12cd34:msg-3", role: "assistant", text: "ok", at: "" });
+
+    // 快照：落库那行的 id 带会话前缀（`<tag>:<callId>`）
+    const merged = mergeSessionSnapshot(view.session, {
+      status: "running",
+      cwd: "/tmp/wt",
+      busy: false,
+      messages: [
+        { id: "ab12cd34:p1", role: "user", at: "", text: "看下目录" },
+        { id: "ab12cd34:msg-2", role: "assistant", at: "", text: "先跑一下" },
+        {
+          id: "ab12cd34:t1",
+          role: "tool",
+          at: "",
+          tool: { callId: "t1", name: "bash", status: "end", args: '{"command":"ls"}', output: "total 0" },
+        },
+        { id: "ab12cd34:msg-3", role: "assistant", at: "", text: "ok" },
+      ],
+    });
+
+    expect(merged.messages.map((message) => message.id)).toEqual([
+      "ab12cd34:p1",
+      "ab12cd34:msg-2",
+      "ab12cd34:t1",
+      "ab12cd34:msg-3",
     ]);
   });
 });
