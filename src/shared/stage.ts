@@ -18,7 +18,8 @@
  *   只剩「卡片上写得明明白白的事实」能定列（状态、会话、PR、验收时间）。
  * - 给了但**某一项是 `null`** → 只有那一项未知，其它项照常用。
  */
-import type { Card } from "./types.ts";
+import type { FlowActor } from "./flow.ts";
+import type { Card, CardState } from "./types.ts";
 
 // ---------------------------------------------------------------- git 事实
 
@@ -102,11 +103,35 @@ export type StageFacts = {
   git: CardGitFacts | null;
 };
 
+/**
+ * 一条判据能看到的**事实来源**（只看**来源种类**，用来做溯源：这一列是被哪类事实推出来的）。
+ * 四种正好对应卡片上的四类事实，别再加第五种。
+ */
+export type StageFactSource = "card" | "pr" | "git" | "session";
+
+/** 事实来源的中文名（Workflow 视图、列头悬停提示与文档共用这一份，别各写各的）。 */
+export const STAGE_FACT_LABELS: Record<StageFactSource, string> = {
+  card: "卡片事实",
+  pr: "PR・CI",
+  git: "git 实况",
+  session: "会话",
+};
+
 /** 一条判据：`match` 为真 → 这张卡进 `stage` 这一列。 */
 export type StageRule = {
   stage: Stage;
   /** 人话判据（文档/调试用；真实判定只认 `match`）。 */
   when: string;
+  /**
+   * 这一列**在等谁动手**（`human` = 等人拍板/动手，`llm` = 等 agent 干活）。
+   * 口径与流程状态机同一份，见 `shared/flow.ts` 的 `FlowActor`（机器事实如 CI / git 不算第三方，
+   * 归到「该步最终由谁拍板」—— 例如 CI 绿了仍要人等审，所以 `prReview` 是 `human`）。
+   */
+  actor: FlowActor;
+  /** 这条判据读了哪几类事实（`when` 里提到的来源必须都在这里，判据与标注不许对不上）。 */
+  facts: readonly StageFactSource[];
+  /** 判据里**直接比对**的卡片状态（空数组 = 不看状态，纯靠引用/实况推出）。 */
+  states: readonly CardState[];
   match: (card: Card, facts: StageFacts | null) => boolean;
 };
 
@@ -119,26 +144,46 @@ export const STAGE_RULES: readonly StageRule[] = [
   {
     stage: "dropped",
     when: "卡片状态是 dropped（放弃）",
+    // 放弃是人拍的板（agent 不自己放弃）；终态没人等，仍按「谁把它定在这里」标 human。
+    actor: "human",
+    facts: ["card"],
+    states: ["dropped"],
     match: (card) => card.state === "dropped",
   },
   {
     stage: "done",
     when: "卡片状态是 done（现场已清理）",
+    // 「现场已清理」是人走完 G4 的结果 —— 等人确认。
+    actor: "human",
+    facts: ["card"],
+    states: ["done"],
     match: (card) => card.state === "done",
   },
   {
     stage: "blocked",
     when: "卡片状态是 blocked（徽标显示 blockedReason）",
+    // 解除阻塞只有显式 unblock 一条路（心跳/绑 worktree 的自动化都只认 ready），那是人的动作。
+    actor: "human",
+    facts: ["card"],
+    states: ["blocked"],
     match: (card) => card.state === "blocked",
   },
   {
     stage: "merged",
     when: "状态 merged，或 PR 已 merged 且已验收（acceptedAt）",
+    // PR 合了（机器事实/人授权的 merge），但这一列的活是**等人清理**（G4）。
+    actor: "human",
+    facts: ["card", "pr"],
+    states: ["merged"],
     match: (card) => card.state === "merged" || (card.pr?.state === "merged" && card.acceptedAt !== undefined),
   },
   {
     stage: "review",
     when: "状态 review；或会话已 ended/lost 而还没验收（acceptedAt 空）",
+    // agent 把活交回来了，卡在这儿**等人验收**（G3）。
+    actor: "human",
+    facts: ["card", "session"],
+    states: ["review"],
     match: (card) => {
       // 会话「交回来了」= ended 或 lost（卡片事实，不依赖 git）。
       const handedBack = card.session?.state === "ended" || card.session?.state === "lost";
@@ -148,17 +193,29 @@ export const STAGE_RULES: readonly StageRule[] = [
   {
     stage: "prReview",
     when: "有 PR 且还没 merged（CI 状态来自同步，作徽标）",
+    // CI 只是机器事实：绿了也还要**人**看、人合（G2 authorize + merge），所以等人。
+    actor: "human",
+    facts: ["pr"],
+    states: [],
     match: (card) => card.pr !== null && card.pr.state !== "merged",
   },
   {
     stage: "prTodo",
     when: "还没有 PR，但已经有提交（commitsSinceBase > 0）",
+    // 有提交还没开 PR：等 agent 开 WIP PR，人不需要在场。
+    actor: "llm",
+    facts: ["pr", "git"],
+    states: [],
     // 提交数必须**确实读到**：未知（null）不算有 —— 不猜。
     match: (card, facts) => card.pr === null && (facts?.git?.commitsSinceBase ?? 0) > 0,
   },
   {
     stage: "working",
     when: "有会话（含失联），且不能证明它什么都没干（脏文件或提交）",
+    // 会话在，活没干完 —— 等 agent 继续做。
+    actor: "llm",
+    facts: ["session", "git"],
+    states: [],
     match: (card, facts) => {
       const git = facts?.git ?? null;
       // 只有「读到了脏文件 0 且提交数 0」才算证明什么都没干；任何一项未知（含整块 git 事实缺失）都不算。
@@ -169,6 +226,10 @@ export const STAGE_RULES: readonly StageRule[] = [
   {
     stage: STAGE_FALLBACK,
     when: "其余：没有会话、没有改动、没有 PR",
+    // 兜底列：前面四类事实全过一遍都不成立 —— 等 agent 去建 worktree / 进会话开工。
+    actor: "llm",
+    facts: ["card", "pr", "git", "session"],
+    states: [],
     match: () => true,
   },
 ];

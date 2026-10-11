@@ -4,6 +4,7 @@
  */
 import type { CardState, ConfirmAction, ConfirmStatus, RuntimeStatus } from "../../../src/shared/types.ts";
 import type { Stage } from "../../../src/shared/stage.ts";
+import type { FlowActor } from "../../../src/shared/flow.ts";
 
 export type {
   Card,
@@ -43,16 +44,71 @@ export type {
  * 看板列的**派生阶段**（`src/shared/stage.ts` 是唯一来源：列集合、判据、纯函数都在那里）。
  * 前端只读不改 —— 要让列变多/变少、改判据，改共享层那一处即可，这里自动跟上。
  */
+import { STAGE_RULES } from "../../../src/shared/stage.ts";
+
 export {
   deriveStage,
   STAGE_EMPTY_HINTS,
+  STAGE_FACT_LABELS,
   STAGE_FALLBACK,
   STAGE_LABELS,
   STAGE_RULES,
   STAGES,
   withStage,
 } from "../../../src/shared/stage.ts";
-export type { CardGitFacts, Stage, StageFacts, StageRule, StagedCard } from "../../../src/shared/stage.ts";
+export type {
+  CardGitFacts,
+  Stage,
+  StageFactSource,
+  StageFacts,
+  StageRule,
+  StagedCard,
+} from "../../../src/shared/stage.ts";
+
+/**
+ * 谁动手（`human` = 人拍板/动手，`llm` = agent 干活）—— 类型只有这两个取值，
+ * 判定口径写在 `src/shared/flow.ts` 的 `FlowActor`（机器事实不算第三方）。
+ * 类型走 `import type`：`flow.ts` 会拖进 node 侧模块，**值**一律不许从那里进 bundle。
+ */
+export type { FlowActor } from "../../../src/shared/flow.ts";
+
+/** actor 的显示文字：用户要求「直接用 human 和 llm 标注」，**文字就是这两个词本身**，别换词。 */
+export const ACTOR_TEXT: Record<FlowActor, string> = {
+  human: "human",
+  llm: "llm",
+};
+
+/** actor 的悬停解释（只在 title / 图例里出现，标签文字仍然是上面那两个词）。 */
+export const ACTOR_HINT: Record<FlowActor, string> = {
+  human: "human：要人拍板或动手（验收 G3、清理 G4、远程写授权、等人看/合 PR、解除阻塞）",
+  llm: "llm：agent 干活推进（建 worktree、实施、开 PR、推送、写转录、按会话回执前进）",
+};
+
+/** actor 的样式（Tailwind 类名必须留在 web 里，构建时才扫得到）。 */
+export const ACTOR_TONE: Record<FlowActor, string> = {
+  human: "border-rose-200 bg-rose-50 text-rose-700",
+  llm: "border-sky-200 bg-sky-50 text-sky-700",
+};
+
+/**
+ * 每列**在等谁动手**与它的**人话判据** —— 直接从 `STAGE_RULES` 生成（别在组件里手写第二份）。
+ * 看板列头与 Workflow 视图都读这两份，改判据只改 `src/shared/stage.ts`。
+ */
+export const STAGE_ACTOR: Record<Stage, FlowActor> = Object.fromEntries(
+  STAGE_RULES.map((rule) => [rule.stage, rule.actor]),
+) as Record<Stage, FlowActor>;
+
+export const STAGE_WHEN: Record<Stage, string> = Object.fromEntries(
+  STAGE_RULES.map((rule) => [rule.stage, rule.when]),
+) as Record<Stage, string>;
+
+/**
+ * 「看板列头 → Workflow 里这一列」的锚点（单向的 hash 深链，App 监听 hashchange 切视图）。
+ * Workflow 视图里对应的节点 id 是 `wf-stage-<stage>`。
+ */
+export function stageTraceHash(stage: Stage): string {
+  return `#workflow/stage/${stage}`;
+}
 
 /** 各列的进度点颜色（Tailwind 类名必须留在 web 里，构建时才扫得到）。 */
 export const STAGE_TONE: Record<Stage, string> = {
@@ -152,6 +208,8 @@ type Assert<T extends true> = T;
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
+type _ActorTextIsExhaustive = Assert<Equal<keyof typeof ACTOR_TEXT, FlowActor>>;
+type _ActorToneIsExhaustive = Assert<Equal<keyof typeof ACTOR_TONE, FlowActor>>;
 type _StatesExactlyMatch =
   Assert<Equal<(typeof CARD_STATES)[number], CardState>>;
 type _LabelsAreExhaustive = Assert<Equal<keyof typeof STATE_LABELS, CardState>>;

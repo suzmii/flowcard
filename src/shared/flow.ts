@@ -5,6 +5,38 @@
 import type { Card, CardState, EventType, Gate } from "./types.ts";
 import { isInside } from "./paths.ts";
 
+// ---------------------------------------------------------------- 谁动手（human / llm）
+
+/**
+ * 流程里每一步**归谁**：`human` = 要人拍板/动手，`llm` = 要 agent 干活。
+ *
+ * **只有这两个取值**（别加第三种：机器事实、系统、轮询都不算第三方 —— 见下面的口径）。
+ *
+ * ## 判定口径（读标注前先读这段，别猜）
+ *
+ * 1. **看这一步最终由谁拍板，而不是看事实是谁送来的。**
+ *    机器事实（CI 结果、`git status` 脏文件数、PR 状态轮询、文件监听）**不单独成一类**：
+ *    它只提供条件，归到「该步最终拍板的那一方」。
+ *    - 例子：`prReview`（PR 待审）的 CI 已经绿了，但还是要**人等审/等合** → 这一列标 `human`，
+ *      CI 只是条件，不是「谁在等」。
+ * 2. `human` = 必须由人做决定或动手才能往下走：
+ *    验收（G3）、清理确认（G4）、远程写授权（G2 的 approve / consume）、
+ *    「PR 待审 / 等 CI」那一列（等人看、等人合）、「待你验收」那一列、解除阻塞（显式 `unblock`）。
+ * 3. `llm` = 由 agent 干活推进，人不需要在场：
+ *    建 worktree / 把会话搬进去（`flowcard worktree use`）、实施、开 PR、推送、
+ *    写转录、按会话心跳/结束这类回执推进状态。
+ * 4. **终态（`done` / `dropped`）也必须有标注**：按「谁拍板把它定在这里」算 ——
+ *    两者都是人（验收+清理确认 / 决定放弃），所以是 `human`。
+ * 5. 标在**三个地方**（同一套词，谁都别自造）：
+ *    `stateActors`（停在这个状态时在等谁动手）、`transitionActors`（这一步谁推的）、
+ *    `gates[].actor` / `automations[].actor`（这个节点谁动手）。
+ *    看板每列的 `actor` 在 `shared/stage.ts` 的 `STAGE_RULES` 上（这一列**在等谁动手**）。
+ */
+export type FlowActor = "human" | "llm";
+
+/** 合法的 actor 取值（校验与测试都读这一份，别另写字面量）。 */
+export const FLOW_ACTORS = ["human", "llm"] as const;
+
 export type Requirement = {
   id: string;
   /** 给人和 agent 看的说明，缺项时直接回给调用方。 */
@@ -18,6 +50,8 @@ export type GateSpec = {
   on: [CardState, CardState];
   kind: Gate["kind"];
   title: string;
+  /** 谁动手过这道门禁（`human` = 人批的；全流程目前都是人）。 */
+  actor: FlowActor;
   /** 生成门禁时需要一并展示的报告项（如清理清单）。 */
   report?: string[];
 };
@@ -29,6 +63,8 @@ export type AutomationSpec = {
   on: EventType;
   when?: (card: Card, payload: Record<string, unknown>) => boolean;
   do: Action[];
+  /** 这条自动节点的推进动作归谁动手（口径见 `FlowActor`）。 */
+  actor: FlowActor;
 };
 
 export type Transition = `${CardState} -> ${CardState}`;
@@ -36,9 +72,13 @@ export type Transition = `${CardState} -> ${CardState}`;
 export type Flow = {
   name: string;
   states: readonly CardState[];
+  /** 每个状态**停在那里时在等谁动手**（`Record` 语义：`defineFlow` 校验每个状态都有）。 */
+  stateActors: Partial<Record<CardState, FlowActor>>;
   requirements: Requirement[];
   gates: GateSpec[];
   requires: Partial<Record<Transition, string[]>>;
+  /** 每一条带硬前置的转换**归谁推**（`defineFlow` 校验与 `requires` 的键一一对应）。 */
+  transitionActors: Partial<Record<Transition, FlowActor>>;
   automations: AutomationSpec[];
 };
 
@@ -72,7 +112,32 @@ export function defineFlow(flow: Flow): Flow {
     }
   }
 
+  // 谁动手（human / llm）：**每个状态、每条转换、每个门禁与自动节点都必须有**、且只能是这两个词。
+  const actorOk = (a: unknown): a is FlowActor => (FLOW_ACTORS as readonly unknown[]).includes(a);
+  for (const state of states) {
+    const actor = flow.stateActors[state];
+    if (actor === undefined) problems.push(`状态 ${state} 没有 stateActors 标注（必须标 human 或 llm）`);
+    else if (!actorOk(actor)) problems.push(`状态 ${state} 的 actor "${String(actor)}" 不是 human / llm`);
+  }
+  for (const key of Object.keys(flow.stateActors)) {
+    if (!states.includes(key as CardState)) problems.push(`stateActors 里有未定义状态 "${key}"`);
+  }
+  for (const key of Object.keys(flow.requires)) {
+    const actor = flow.transitionActors[key as Transition];
+    if (actor === undefined) problems.push(`转换 ${key} 没有 transitionActors 标注（必须标 human 或 llm）`);
+    else if (!actorOk(actor)) problems.push(`转换 ${key} 的 actor "${String(actor)}" 不是 human / llm`);
+  }
+  for (const key of Object.keys(flow.transitionActors)) {
+    if (!(key in flow.requires)) problems.push(`transitionActors 里的 "${key}" 不是一条 requires 转换`);
+  }
+  for (const gate of flow.gates) {
+    if (!actorOk(gate.actor)) problems.push(`门禁 ${gate.id} 的 actor "${String(gate.actor)}" 不是 human / llm`);
+  }
+
   for (const auto of flow.automations) {
+    if (!actorOk(auto.actor)) {
+      problems.push(`自动节点 ${auto.name} 的 actor "${String(auto.actor)}" 不是 human / llm`);
+    }
     for (const action of auto.do) {
       if ("setState" in action && !states.includes(action.setState)) {
         problems.push(`自动动作 ${auto.name} 设置了未定义状态 "${action.setState}"`);

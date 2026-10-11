@@ -13,6 +13,21 @@ export const personalFlow = defineFlow({
 
   states: CARD_STATES,
 
+  /**
+   * 停在这个状态时**在等谁动手**（口径见 `shared/flow.ts` 的 `FlowActor`）：
+   * 人只做三件事（远程写授权 / 验收 / 清理确认），其余都是 agent 在推。
+   * 终态也标：`done` 是人验收+清理确认的结果，`dropped` 是人决定放弃。
+   */
+  stateActors: {
+    ready: "llm", // 等 agent 建 worktree、把会话搬进去（人已经开完卡）
+    working: "llm", // agent 在实施
+    review: "human", // 等 G3 验收
+    merged: "human", // 等 G4 清理确认
+    done: "human", // 人拍板定的终态（验收 + 清理）
+    blocked: "human", // 等**人**补齐前置并显式 unblock（心跳不会把它拉回 working）
+    dropped: "human", // 人决定放弃（终态）
+  },
+
   requirements: [
     {
       id: "worktree",
@@ -48,12 +63,14 @@ export const personalFlow = defineFlow({
   ],
 
   gates: [
-    { id: "G3", on: ["review", "merged"], kind: "review", title: "验收" },
+    // 全流程只剩两道门禁，都是人拍板：G3 验收、G4 清理确认（G2 是凭据不是流程节点）。
+    { id: "G3", on: ["review", "merged"], kind: "review", title: "验收", actor: "human" },
     {
       id: "G4",
       on: ["merged", "done"],
       kind: "cleanup",
       title: "清理确认",
+      actor: "human",
       report: ["worktree.path", "worktree.branch", "PR 状态"],
     },
   ],
@@ -68,6 +85,20 @@ export const personalFlow = defineFlow({
   },
 
   /**
+   * 每条转换**归谁推**（口径见 `shared/flow.ts` 的 `FlowActor`）：
+   * 机器事实（推送、PR merged、CI）只当条件，拍板归谁就看谁在等 ——
+   * `review -> merged` 虽然有 `prMerged` 这个机器事实，但同一道坎上 `accepted`（G3）是人，
+   * 所以整步标 `human`。
+   */
+  transitionActors: {
+    "ready -> working": "llm", // agent 建 worktree + 把会话搬进去，事实自己推
+    "working -> review": "llm", // agent 交回（并开 PR + 推送）
+    "review -> merged": "human", // G3 验收是人 + PR 合并（机器探测，但拍板在人）
+    "merged -> done": "human", // G4 清理确认是人
+    "blocked -> working": "human", // 必须人补齐前置后显式 unblock
+  },
+
+  /**
    * 自动节点：每个"可能让状态前进"的事实事件都挂一条，谁最后到谁触发前进；
    * 能不能前进由 requires 决定，缺项就只是记一笔 note，不报错。
    */
@@ -77,12 +108,14 @@ export const personalFlow = defineFlow({
       on: "worktree.bound",
       when: (c) => c.state === "ready",
       do: [{ setState: "working" }],
+      actor: "llm",
     },
     {
       name: "claim-advances-to-working",
       on: "session.started",
       when: (c) => c.state === "ready",
       do: [{ setState: "working" }],
+      actor: "llm",
     },
     {
       /**
@@ -95,24 +128,28 @@ export const personalFlow = defineFlow({
       on: "session.heartbeat",
       when: (c) => c.state === "ready",
       do: [{ setState: "working" }],
+      actor: "llm",
     },
     {
       name: "end-advances-to-review",
       on: "session.ended",
       when: (c) => c.state === "working",
       do: [{ setState: "review" }],
+      actor: "llm",
     },
     {
       name: "merged-opens-cleanup",
       on: "pr.merged",
       when: (c) => c.state === "review",
       do: [{ setState: "merged" }, { openGate: "G4" }],
+      actor: "human",
     },
     {
       name: "accepted-merges",
       on: "card.accepted",
       when: (c) => c.state === "review",
       do: [{ setState: "merged" }, { openGate: "G4" }],
+      actor: "human",
     },
   ],
 });

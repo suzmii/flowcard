@@ -268,6 +268,21 @@ STAGE_RULES     // 判据表：按顺序取第一条命中的列
 
 判据的回归网在 `test/stage.test.ts`：**每条判据 + 每对优先级各一条硬断言**（事实组合 → 列），另加「缺 git 事实时退化」与「列集合/顺序/兜底」的结构断言。
 
+### 4.3 每一步归谁动手：`human` / `llm`
+
+流程图上每个**状态 / 转换 / 自动节点 / 门禁 / 看板列**都带一个 `actor`，**只有两个取值**：`human`（要人拍板或动手）、`llm`（要 agent 干活）。判定口径写在代码里（唯一的真相）：`src/shared/flow.ts` 的 `FlowActor`。
+
+**口径一句话：看这一步最终由谁拍板，而不是看事实是谁送来的。** 机器事实（CI 结果、`git status` 脏文件、PR 状态轮询）**不单独成一类**，只提供条件，归到「该步最终拍板的那一方」：
+
+| 归谁 | 有哪些 | 为什么 |
+|---|---|---|
+| `human` | 验收（G3）、清理确认（G4）、远程写授权（G2 approve / consume）、`PR 待审 / 等 CI`、《待你验收》、解除阻塞（显式 `unblock`）、`done` / `dropped` 两个终态 | 都要**人**做决定或动手才往下走。CI 绿了仍要人等审/等合，所以 `PR 待审` 是 `human`（CI 只是条件） |
+| `llm` | 建 worktree / 把会话搬进 worktree、实施、开 PR、推送、写转录、按会话回执（心跳 / 结束）推进状态、`待开 PR`、`待立项` | 人不需要在场，agent 自己干 |
+
+标注落在这几处，改流程时**必须一起改**（`defineFlow` 会在启动/测试时校验，缺了直接报错）：
+`personalFlow.stateActors`（停在这个状态时在等谁）、`transitionActors`（这条转换谁推）、`gates[].actor` / `automations[].actor`、`STAGE_RULES[].actor`（这一列在等谁）。
+看板列头直接显示这两个词，悬停给出判据 + actor 由来；Workflow 视图（`GET /api/workflow`）把同一份标注画在流程图与 9 列节点上。不变量在 `test/workflow.test.ts`。
+
 ## 5. 门禁（人工节点）
 
 **只剩两道流程门禁（G3 验收、G4 清理）**；远程写是凭据（G2），不是流程节点。

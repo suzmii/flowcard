@@ -1,8 +1,9 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   GitFork,
   LayoutGrid,
+  ListTree,
   MessagesSquare,
   Plus,
   RefreshCw,
@@ -15,29 +16,56 @@ import { GraphView } from "@/components/GraphView";
 import { NewCardDialog } from "@/components/NewCardDialog";
 import { ProjectSwitcher } from "@/components/ProjectSwitcher";
 import { SessionView } from "@/components/SessionView";
+import { WorkflowView, type WorkflowFocus } from "@/components/WorkflowView";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useBoard, type Connection } from "@/lib/useBoard";
 import { useProjects } from "@/lib/useProjects";
+import { useWorkflow } from "@/lib/workflow";
 import { projectIssueBase } from "@/lib/projects";
 import { clockTime } from "@/lib/utils";
 import type { CardView } from "@/lib/schema";
 
-/** 主视图：看板 / 会话 / 提交图（后两个不重排看板，只切换主区）。 */
-type View = "board" | "sessions" | "graph";
+/** 主视图：看板 / 会话 / 提交图 / 流程（都只切主区，不重排看板数据）。 */
+type View = "board" | "sessions" | "graph" | "workflow";
 
 const VIEW_KEY = "flowcard.view";
 /** 会话视图选中的卡（换视图/刷新都记得）。 */
 const SESSION_CARD_KEY = "flowcard.sessionCardId";
 
 function readView(): View {
+  // hash 深链优先（例如从别处直接打开 `#workflow/stage/prTodo`）
+  if (readWorkflowFocus()) return "workflow";
   try {
     const saved = window.localStorage.getItem(VIEW_KEY);
-    return saved === "graph" || saved === "sessions" ? saved : "board";
+    return saved === "graph" || saved === "sessions" || saved === "workflow" ? saved : "board";
   } catch {
     // 隐私模式等拿不到 localStorage：只是不持久化
     return "board";
   }
+}
+
+/**
+ * `#workflow/stage/<列>` / `#workflow/state/<状态>` → 流程视图里选中的节点。
+ * 看板的列头就是靠这个 hash 一键跳进来的（普通 `<a href>`，不需要 props 传递）。
+ */
+function readWorkflowFocus(): WorkflowFocus | null {
+  const [view, kind, ...rest] = window.location.hash.replace(/^#/, "").split("/");
+  const id = rest.join("/");
+  if (view !== "workflow" || id === "") return null;
+  if (kind === "stage" || kind === "state") return { kind, id };
+  return null;
+}
+
+/** 给流程节点生成深链（同一份格式，读与写都在这里）。 */
+function workflowHash(focus: WorkflowFocus): string {
+  return `workflow/${focus.kind}/${focus.id}`;
+}
+
+/** 离开流程视图时把深链抹掉（否则刷新又跳回流程页）。 */
+function clearWorkflowHash() {
+  if (window.location.hash === "") return;
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
 }
 
 function readSessionCardId(): string | null {
@@ -92,6 +120,10 @@ export function App() {
   /** 详情是否要直接对着对话区（从磁贴的会话灯/会话徽标进来时为真）。 */
   const [focusSession, setFocusSession] = useState(false);
   const [view, setView] = useState<View>(() => readView());
+  /** 流程视图里被选中 / 要高亮的节点（看板列头跳进来时带上）。 */
+  const [workflowFocus, setWorkflowFocus] = useState<WorkflowFocus | null>(() => readWorkflowFocus());
+  // 流程视图的数据：进视图才拉（常量不会变，刷新按钮可手动重拉）
+  const workflow = useWorkflow(view === "workflow");
   const [sessionCardId, setSessionCardId] = useState<string | null>(() => readSessionCardId());
   const [refreshing, setRefreshing] = useState(false);
   const [newCardOpen, setNewCardOpen] = useState(false);
@@ -99,6 +131,30 @@ export function App() {
   const switchView = useCallback((next: View) => {
     setView(next);
     writeView(next);
+    // 离开流程视图就把 `#workflow/...` 去掉：深链只服务于「跳进流程」，别赖着不走
+    if (next !== "workflow") clearWorkflowHash();
+    else setWorkflowFocus(null);
+  }, []);
+
+  /** 看板列头 / 图内互跳：切到流程视图并选中那个节点，同时把深链写进 hash。 */
+  const traceWorkflow = useCallback((focus: WorkflowFocus) => {
+    setView("workflow");
+    writeView("workflow");
+    setWorkflowFocus(focus);
+    window.location.hash = workflowHash(focus);
+  }, []);
+
+  /** 浏览器前进/后退、以及页面里普通 `<a href="#workflow/...">` 都走这里。 */
+  useEffect(() => {
+    const sync = () => {
+      const focus = readWorkflowFocus();
+      if (!focus) return;
+      setView("workflow");
+      writeView("workflow");
+      setWorkflowFocus(focus);
+    };
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
   }, []);
 
   /** 磁贴主点击：打开卡片详情（顶部开始）。 */
@@ -220,6 +276,17 @@ export function App() {
               <GitFork />
               提交图
             </Button>
+            <Button
+              size="xs"
+              variant={view === "workflow" ? "secondary" : "ghost"}
+              data-testid="view-workflow"
+              role="tab"
+              aria-selected={view === "workflow"}
+              onClick={() => switchView("workflow")}
+            >
+              <ListTree />
+              流程
+            </Button>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
@@ -300,6 +367,17 @@ export function App() {
             projectNames={projectNames}
             selectedId={sessionCardId}
             onSelect={pickSessionCard}
+          />
+        ) : view === "workflow" ? (
+          <WorkflowView
+            workflow={workflow.workflow}
+            error={workflow.error}
+            loading={workflow.loading}
+            cards={cards}
+            focus={workflowFocus}
+            onFocus={traceWorkflow}
+            onOpenBoard={() => switchView("board")}
+            onRefresh={workflow.refresh}
           />
         ) : view === "graph" ? (
           <GraphView
