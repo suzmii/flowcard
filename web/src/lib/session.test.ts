@@ -1,11 +1,15 @@
 /** 托管会话的事件归并：按 id 追加/覆盖、按 callId 合并工具块、快照 vs 本地流。纯函数，不需要浏览器。 */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
+  ABORT_REQUESTED_NOTICE,
+  PROMPT_DELIVERY_NOTICE,
   applySessionEvent,
+  composerState,
   initialSessionView,
   mergeSessionSnapshot,
   mergeToolOutput,
   parseSessionEvent,
+  promptSession,
   sessionRowSignals,
   thinkingSummary,
   toolSummary,
@@ -264,5 +268,124 @@ describe("折叠头摘要", () => {
   it("思考摘要取首行（跳过空行）", () => {
     expect(thinkingSummary("\n\n第一行想法\n第二行")).toBe("第一行想法");
     expect(thinkingSummary("")).toBe("");
+  });
+});
+
+describe("排队快照（queue 帧）", () => {
+  it("认出 steering/followUp/liveSteered；缺数组的坏帧整帧丢掉（不糊成「队列空了」）", () => {
+    expect(parseSessionEvent("queue", JSON.stringify({ steering: ["先别改测试"], followUp: [], liveSteered: 1 }))).toEqual({
+      type: "queue",
+      steering: ["先别改测试"],
+      followUp: [],
+      liveSteered: 1,
+    });
+    // 服务端 liveSteered=0 时不带这个字段
+    expect(parseSessionEvent("queue", JSON.stringify({ steering: [], followUp: [] }))).toEqual({
+      type: "queue",
+      steering: [],
+      followUp: [],
+    });
+    expect(parseSessionEvent("queue", JSON.stringify({ steering: ["x"] }))).toBeNull();
+    expect(parseSessionEvent("queue", "{oops")).toBeNull();
+  });
+
+  it("整份覆盖视图：引导后没读到 → 列出来；被读进去（空了）→ 消失", () => {
+    let view = initialSessionView();
+    expect(view.queue).toEqual({ steering: [], followUp: [] });
+    view = feed(view, "queue", { steering: ["先别改测试"], followUp: [], liveSteered: 0 });
+    expect(view.queue.steering).toEqual(["先别改测试"]);
+    view = feed(view, "queue", { steering: [], followUp: [] });
+    expect(view.queue).toEqual({ steering: [], followUp: [] });
+  });
+
+  it("会话没了（ended/stopped）→ 排队跟着收掉，别挂着「等模型读到」", () => {
+    let view = feed(initialSessionView(), "queue", { steering: ["还没读到的"], followUp: [] });
+    view = feed(view, "state", { busy: true, status: "running" });
+    expect(view.queue.steering).toEqual(["还没读到的"]);
+    view = feed(view, "state", { busy: false, status: "ended" });
+    expect(view.queue).toEqual({ steering: [], followUp: [] });
+  });
+});
+
+describe("输入区的可发送性（忙 → 中途引导）", () => {
+  it("会话在跑且忙：**照样能发**，提示语说明会插进当前这一轮", () => {
+    const state = composerState({ status: "running", busy: true, acting: false, sending: false, hasContent: true });
+    expect(state.canSend).toBe(true);
+    expect(state.hint).toContain("中途引导");
+  });
+
+  it("空闲时能发且没有额外提示；没在跑 / 正在发别的动作 / 没内容都发不出去", () => {
+    expect(composerState({ status: "running", busy: false, acting: false, sending: false, hasContent: true })).toEqual({
+      canSend: true,
+      hint: null,
+    });
+    expect(
+      composerState({ status: "stopped", busy: false, acting: false, sending: false, hasContent: true }),
+    ).toEqual({ canSend: false, hint: "会话没在跑：先点「启动会话」" });
+    expect(
+      composerState({ status: "running", busy: true, acting: true, sending: true, hasContent: true }),
+    ).toEqual({ canSend: false, hint: "发送中…" });
+    expect(
+      composerState({ status: "running", busy: false, acting: false, sending: false, hasContent: false }).canSend,
+    ).toBe(false);
+  });
+});
+
+describe("发送 / 中断的反馈文案", () => {
+  it("delivery=steer 说「已引导（中途插入）」，delivery=prompt 说正常发送", () => {
+    expect(PROMPT_DELIVERY_NOTICE.steer).toContain("已引导（中途插入）");
+    expect(PROMPT_DELIVERY_NOTICE.steer).toContain("不会新起一轮");
+    expect(PROMPT_DELIVERY_NOTICE.prompt).toContain("已发送");
+  });
+
+  it("中断的反馈说清「只是命令已发出」，且注明不清排队", () => {
+    expect(ABORT_REQUESTED_NOTICE).toContain("命令已发出");
+    expect(ABORT_REQUESTED_NOTICE).toContain("不清排队");
+    expect(ABORT_REQUESTED_NOTICE).toContain("忙");
+  });
+});
+
+describe("promptSession", () => {
+  function stubFetch(response: { status: number; body: unknown }): { calls: { url: string; body: unknown }[] } {
+    const calls: { url: string; body: unknown }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: JSON.parse(String(init?.body)) as unknown });
+      return new Response(JSON.stringify(response.body), {
+        status: response.status,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    return { calls };
+  }
+
+  const original = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = original;
+  });
+
+  it("默认带 steer:true，并把回包的 delivery 透出来", async () => {
+    const { calls } = stubFetch({ status: 200, body: { ok: true, messageId: "t1:p1", delivery: "steer" } });
+    const result = await promptSession("c7", { text: "别等了，先跑测试" });
+    expect(result).toMatchObject({ ok: true, messageId: "t1:p1", delivery: "steer" });
+    expect(calls).toEqual([{ url: "/api/cards/c7/session/prompt", body: { text: "别等了，先跑测试", steer: true } }]);
+  });
+
+  it("steer:false 原样透传（不替用户改成引导）", async () => {
+    const { calls } = stubFetch({ status: 200, body: { ok: true, messageId: "t1:p2", delivery: "prompt" } });
+    const result = await promptSession("c7", { text: "你好", steer: false });
+    expect(result).toMatchObject({ ok: true, delivery: "prompt" });
+    expect(calls[0]?.body).toEqual({ text: "你好", steer: false });
+  });
+
+  it("409 的 NO_SESSION 收敛成可读失败（不抛）", async () => {
+    stubFetch({
+      status: 409,
+      body: { ok: false, error: { code: "NO_SESSION", message: "卡片 c7 没有在跑的会话" } },
+    });
+    expect(await promptSession("c7", { text: "在吗" })).toMatchObject({
+      ok: false,
+      code: "NO_SESSION",
+      message: "卡片 c7 没有在跑的会话",
+    });
   });
 });

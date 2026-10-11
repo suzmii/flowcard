@@ -43,9 +43,12 @@ import {
   TOOL_STATUS_LABELS,
   SESSION_STATUS_LABELS,
   SESSION_STATUS_TONE,
+  ABORT_REQUESTED_NOTICE,
   DELETE_SESSION_CONFIRM,
+  PROMPT_DELIVERY_NOTICE,
   abortSession,
   applySessionEvent,
+  composerState,
   deleteSession,
   fetchSession,
   initialSessionView,
@@ -485,13 +488,22 @@ export function SessionChat({
     if (kind === "prompt") {
       const text = draft.trim();
       const images: SessionImage[] = pending.map(({ name, dataBase64 }) => ({ name, dataBase64 }));
-      const result = await promptSession(card.id, { text, ...(images.length > 0 ? { images } : {}) });
+      // 默认引导：忙时服务端改用 omp 的 `steer` 插进当前这一轮（回包 `delivery` 说清走了哪条路）
+      const result = await promptSession(card.id, {
+        text,
+        ...(images.length > 0 ? { images } : {}),
+        steer: true,
+      });
       if (result.ok) {
         setDraft("");
         setPending([]);
         setImageErrors([]);
         stickRef.current = true;
         setStick(true);
+        // 反馈照 `delivery` 说：`steer` 要明确「已引导（中途插入）」，别让人以为新起了一轮。
+        // 拿不到 delivery（老服务端）就不编话，等排队快照自己说话。
+        const delivery = result.delivery;
+        if (delivery !== undefined) setNotice({ tone: "ok", text: PROMPT_DELIVERY_NOTICE[delivery] });
         await reload();
       } else {
         setNotice({ tone: "error", text: `${result.code}：${result.message}` });
@@ -519,7 +531,7 @@ export function SessionChat({
               ? `会话已启动（${result.ompSessionId}）`
               : "已请求启动会话，稍候…"
             : kind === "abort"
-              ? "已请求中断当前这一轮"
+              ? ABORT_REQUESTED_NOTICE
               : kind === "delete"
                 ? "会话已删除：转录已清空，下次「启动会话」是全新的对话（omp 的会话文件仍保留）"
                 : "已请求停止会话",
@@ -533,15 +545,16 @@ export function SessionChat({
   };
 
   const streaming = status === "running";
-  const canSend = streaming && !session.busy && action === null && (draft.trim() !== "" || pending.length > 0);
-  const sendHint =
-    action === "prompt"
-      ? "发送中…"
-      : status !== "running"
-        ? "会话没在跑：先点「启动会话」"
-        : session.busy
-          ? "会话忙：等它说完再发下一条"
-          : null;
+  const { canSend, hint: sendHint } = composerState({
+    status,
+    busy: session.busy,
+    acting: action !== null,
+    sending: action === "prompt",
+    hasContent: draft.trim() !== "" || pending.length > 0,
+  });
+  const steering = view.queue.steering;
+  const followUp = view.queue.followUp;
+  const liveSteered = view.queue.liveSteered ?? 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2 rounded-lg border bg-background p-2.5">
@@ -555,9 +568,13 @@ export function SessionChat({
           </span>
         ) : null}
         {session.busy ? (
-          <span className="flex items-center gap-1 text-[11px] text-muted-foreground" data-testid="session-busy">
+          <span
+            className="flex items-center gap-1 text-[11px] text-muted-foreground"
+            title="会话在跑：现在发消息会作为「中途引导」插进当前这一轮"
+            data-testid="session-busy"
+          >
             <Loader2 className="size-3 animate-spin" />
-            忙
+            忙（可中途引导）
           </span>
         ) : null}
         {connection === "live" ? null : (
@@ -612,6 +629,7 @@ export function SessionChat({
               variant="destructive"
               disabled={action !== null}
               data-testid="session-abort"
+              title="只中断当前这一轮（会话不退出、也不清排队）；真停了以「忙」消失为准"
               onClick={() => void act("abort")}
             >
               <Hand />
@@ -742,6 +760,52 @@ export function SessionChat({
         )}
       </div>
 
+      {/* 已引导、还没被模型读到的话：显式列出来，别让用户以为没发出去（omp 的 `queue` 帧，读到后空了就消失） */}
+      {steering.length > 0 || followUp.length > 0 ? (
+        <div
+          className="shrink-0 rounded border border-sky-600/30 bg-sky-50 p-1.5 text-[11px] text-sky-900"
+          data-testid="session-queue"
+        >
+          {steering.length > 0 ? (
+            <>
+              <p className="font-medium">
+                已引导 · 等模型读到（{steering.length}）：会话正忙时投进去的，已进当前这一轮，还没被读进去。
+              </p>
+              <ul className="mt-0.5 space-y-0.5">
+                {steering.map((text, index) => (
+                  <li
+                    key={`${String(index)}:${text}`}
+                    className="whitespace-pre-wrap break-words rounded bg-background/70 px-1.5 py-0.5 font-mono"
+                    data-testid="session-queue-steering"
+                  >
+                    {text}
+                  </li>
+                ))}
+              </ul>
+              {liveSteered > 0 ? (
+                <p className="mt-0.5">其中 {liveSteered} 条已经活投进正在流的那条回复里，撤不回来了。</p>
+              ) : null}
+            </>
+          ) : null}
+          {followUp.length > 0 ? (
+            <>
+              <p className="font-medium">等这一轮结束再处理（{followUp.length}）：</p>
+              <ul className="mt-0.5 space-y-0.5">
+                {followUp.map((text, index) => (
+                  <li
+                    key={`${String(index)}:${text}`}
+                    className="whitespace-pre-wrap break-words rounded bg-background/70 px-1.5 py-0.5 font-mono"
+                    data-testid="session-queue-followup"
+                  >
+                    {text}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       <div
         className="shrink-0 space-y-1.5"
         onDragOver={(event) => {
@@ -754,7 +818,11 @@ export function SessionChat({
           value={draft}
           rows={2}
           placeholder={
-            streaming ? "跟这张卡说点什么…（Enter 发送 / Shift+Enter 换行；图片可粘贴或拖放）" : "先启动会话再发消息"
+            streaming
+              ? session.busy
+                ? "会话在跑：现在发出去就是「中途引导」，插进当前这一轮…（Enter 发送 / Shift+Enter 换行）"
+                : "跟这张卡说点什么…（Enter 发送 / Shift+Enter 换行；图片可粘贴或拖放）"
+              : "先启动会话再发消息"
           }
           disabled={!streaming}
           onChange={(event) => setDraft(event.target.value)}

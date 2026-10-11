@@ -219,9 +219,36 @@ export type SessionResult = { ok: true; data: SessionState } | SessionFailure;
 
 export type SessionImage = { name: string; dataBase64: string };
 
+/** 这次 `prompt` 实际走了哪条路：`steer` = 当时会话忙，作为中途引导插进当前这一轮；`prompt` = 当时空闲，新起了一轮。 */
+export type PromptDelivery = "steer" | "prompt";
+
 export type SessionActionOutcome =
-  | { ok: true; status?: HostedSessionStatus; ompSessionId?: string; messageId?: string }
+  | {
+      ok: true;
+      status?: HostedSessionStatus;
+      ompSessionId?: string;
+      messageId?: string;
+      delivery?: PromptDelivery;
+    }
   | SessionFailure;
+
+/**
+ * 发送反馈的文案（`delivery` 说了算，别自己猜）：忙时那句要明确说「插进了当前这一轮」，
+ * 免得用户以为这只是普通的一条新消息、或者以为没发出去。
+ */
+export const PROMPT_DELIVERY_NOTICE: Record<PromptDelivery, string> = {
+  steer:
+    "已引导（中途插入）：会话当时正忙，这句插进了当前这一轮，不会新起一轮。" +
+    "模型读到之前，它会列在输入框上面的「已引导 · 等模型读到」里。",
+  prompt: "已发送：会话当时空闲，正常起了一轮。",
+};
+
+/**
+ * 中断按钮的反馈：**回执只说明「命令发出去了」** —— abort 是幂等的（空闲点也回 ok）、
+ * 而且**不清排队**（已引导的几句仍会被 omp 读到）。真停了要看状态栏的「忙」变回空闲。
+ */
+export const ABORT_REQUESTED_NOTICE =
+  "中断命令已发出：这只表示「命令送到了」，不代表已经停下 —— 真停下看状态栏的「忙」消失。abort 幂等，也不清排队（已引导、还没被读到的几句仍会被读到）。";
 
 function sessionPath(cardId: string, suffix = ""): string {
   return `/api/cards/${encodeURIComponent(cardId)}/session${suffix}`;
@@ -350,17 +377,19 @@ async function postSession(
   return { ok: true, raw: (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown> };
 }
 
-const startResponseSchema = z.looseObject({
+/** 四个写操作的回包：`start` 用 status/ompSessionId，`prompt` 用 messageId/delivery，各自只取自己认的。 */
+const actionResponseSchema = z.looseObject({
   status: statusSchema.optional().catch(undefined),
   ompSessionId: optString,
   messageId: optString,
+  delivery: z.enum(["steer", "prompt"]).optional().catch(undefined),
 });
 
 /** 启动托管会话（cwd 不传时由服务端挑：卡片 worktree 优先）。 */
 export async function startSession(cardId: string, opts: { cwd?: string } = {}): Promise<SessionActionOutcome> {
   const outcome = await postSession(cardId, "/start", opts.cwd ? { cwd: opts.cwd } : {}, "启动会话");
   if (!outcome.ok) return outcome;
-  const extra = startResponseSchema.safeParse(outcome.raw);
+  const extra = actionResponseSchema.safeParse(outcome.raw);
   if (!extra.success) return { ok: true };
   return {
     ok: true,
@@ -370,22 +399,31 @@ export async function startSession(cardId: string, opts: { cwd?: string } = {}):
   };
 }
 
-/** 发一句话（图片按契约内联 base64）。 */
+/**
+ * 发一句话（图片按契约内联 base64）。
+ *
+ * `steer` **默认 `true`**：会话忙时由服务端改用 omp 的 `steer` 把这句话插进当前这一轮（见
+ * `docs/omp-rpc.md` §3.2），空闲时正常起一轮；回包里的 `delivery` 说清实际走了哪条路，
+ * 界面据此给反馈（`PROMPT_DELIVERY_NOTICE`）。
+ */
 export async function promptSession(
   cardId: string,
-  prompt: { text: string; images?: SessionImage[] },
+  prompt: { text: string; images?: SessionImage[]; steer?: boolean },
 ): Promise<SessionActionOutcome> {
-  const body: Record<string, unknown> = { text: prompt.text };
+  const body: Record<string, unknown> = { text: prompt.text, steer: prompt.steer ?? true };
   if (prompt.images && prompt.images.length > 0) body.images = prompt.images;
   const outcome = await postSession(cardId, "/prompt", body, "发送消息");
   if (!outcome.ok) return outcome;
-  const extra = startResponseSchema.safeParse(outcome.raw);
-  return extra.success && extra.data.messageId !== undefined
-    ? { ok: true, messageId: extra.data.messageId }
-    : { ok: true };
+  const extra = actionResponseSchema.safeParse(outcome.raw);
+  if (!extra.success) return { ok: true };
+  return {
+    ok: true,
+    ...(extra.data.messageId === undefined ? {} : { messageId: extra.data.messageId }),
+    ...(extra.data.delivery === undefined ? {} : { delivery: extra.data.delivery }),
+  };
 }
 
-/** 中断当前这一轮（会话还活着）。 */
+/** 中断当前这一轮（会话还活着）。**回执只代表命令已发**，真停了看 SSE 的 `state.busy` 转 `false`。 */
 export async function abortSession(cardId: string): Promise<SessionActionOutcome> {
   const outcome = await postSession(cardId, "/abort", {}, "中断");
   return outcome.ok ? { ok: true } : outcome;
@@ -437,11 +475,26 @@ export type SessionEvent =
       isError?: boolean;
     }
   | { type: "state"; busy: boolean; status?: HostedSessionStatus; cost?: SessionCost; model?: string }
+  /**
+   * omp 的排队快照：`steering` = **已引导、还没被模型读到**的消息文本（按队列顺序），
+   * 数组空了就是已经被读进去了；`followUp` = 等这一程结束才处理的；`liveSteered` = 队头里
+   * 已经活投进正在流的响应的条数（这些撤不回来）。见 `docs/omp-rpc.md` §3.2。
+   */
+  | { type: "queue"; steering: string[]; followUp: string[]; liveSteered?: number }
   | { type: "notice"; level: SessionNoticeLevel; message: string }
   | { type: "error"; message: string };
 
-/** SSE 名字取自契约：ready / message / message_end / tool / state / notice / error。 */
-export const SESSION_EVENT_NAMES = ["ready", "message", "message_end", "tool", "state", "notice", "error"] as const;
+/** SSE 名字取自契约：ready / message / message_end / tool / state / queue / notice / error。 */
+export const SESSION_EVENT_NAMES = [
+  "ready",
+  "message",
+  "message_end",
+  "tool",
+  "state",
+  "queue",
+  "notice",
+  "error",
+] as const;
 export type SessionEventName = (typeof SESSION_EVENT_NAMES)[number];
 
 const eventSchema = z.looseObject({
@@ -465,6 +518,9 @@ const eventSchema = z.looseObject({
   level: z.enum(["info", "warn", "warning", "error"]).optional().catch(undefined),
   ompSessionId: optString,
   cwd: optString,
+  steering: z.array(z.string()).optional().catch(undefined),
+  followUp: z.array(z.string()).optional().catch(undefined),
+  liveSteered: optNumber,
 });
 
 /** 一帧 SSE → 事件；认不出来（坏 JSON / 缺关键字段）返回 null，由调用方忽略。 */
@@ -515,6 +571,16 @@ export function parseSessionEvent(name: string, data: string): SessionEvent | nu
         ...(frame.cost === undefined ? {} : { cost: frame.cost }),
         ...(frame.model === undefined ? {} : { model: frame.model }),
       };
+    case "queue": {
+      // 排队快照：两个数组缺一个就认不出这帧（宁可整帧丢掉，也别把坏帧糊成「队列空了」骗用户）
+      if (frame.steering === undefined || frame.followUp === undefined) return null;
+      return {
+        type: "queue",
+        steering: frame.steering,
+        followUp: frame.followUp,
+        ...(frame.liveSteered === undefined ? {} : { liveSteered: frame.liveSteered }),
+      };
+    }
     case "notice":
       return {
         type: "notice",
@@ -528,12 +594,48 @@ export function parseSessionEvent(name: string, data: string): SessionEvent | nu
   }
 }
 
-export type SessionView = { session: SessionState; notices: SessionNotice[] };
+/** 排队快照：`steering` = 已引导、还没被模型读到；`followUp` = 等这一程结束再处理。 */
+export type SessionQueue = { steering: string[]; followUp: string[]; liveSteered?: number };
+
+export const EMPTY_SESSION_QUEUE: SessionQueue = { steering: [], followUp: [] };
+
+/**
+ * 界面要用的一整份视图：会话状态 + 提示流 + **排队快照**。
+ * 排队是 omp 的实时状态（GET 快照里没有），所以只挂在视图上，不塞进 `SessionState`。
+ */
+export type SessionView = { session: SessionState; notices: SessionNotice[]; queue: SessionQueue };
 
 export const MAX_NOTICES = 24;
 
 export function initialSessionView(): SessionView {
-  return { session: { status: "stopped", cwd: "", busy: false, messages: [] }, notices: [] };
+  return {
+    session: { status: "stopped", cwd: "", busy: false, messages: [] },
+    notices: [],
+    queue: EMPTY_SESSION_QUEUE,
+  };
+}
+
+/**
+ * 输入区这一块的可用性与提示语（一起算，免得按钮与提示两处口径走偏）。
+ *
+ * 关键一条：**忙也照样能发** —— 默认就是中途引导（`steer`，见 `docs/omp-rpc.md` §3.2），
+ * 只有「会话没在跑」「正在发别的动作」「没内容」三种情况才发不出去；忙的时候提示语要说清
+ * 「这条会插进当前这一轮」，别让用户以为按了会新起一轮或者根本发不出去。
+ */
+export function composerState(input: {
+  status: HostedSessionStatus;
+  busy: boolean;
+  /** 有写操作在跑（启动/中断/停止/删除都算）→ 按钮全禁，避免命令打架。 */
+  acting: boolean;
+  /** 正在发的就是这句话（按钮上显示「发送中…」）。 */
+  sending: boolean;
+  hasContent: boolean;
+}): { canSend: boolean; hint: string | null } {
+  const canSend = input.status === "running" && !input.acting && input.hasContent;
+  if (input.sending) return { canSend, hint: "发送中…" };
+  if (input.status !== "running") return { canSend, hint: "会话没在跑：先点「启动会话」" };
+  if (input.busy) return { canSend, hint: "会话在跑：这条会作为「中途引导」插进当前这一轮（不会新起一轮）" };
+  return { canSend, hint: null };
 }
 
 function replaceMessage(
@@ -635,12 +737,27 @@ export function applySessionEvent(view: SessionView, event: SessionEvent, now = 
     case "state":
       return {
         ...view,
+        // 会话不再跑（ended / failed / stopped / starting）时，排队里的「已引导」已经没有意义：
+        // 跟着收掉，免得进程都没了还挂着「等模型读到」。
+        ...(event.status === undefined || event.status === "running"
+          ? {}
+          : { queue: EMPTY_SESSION_QUEUE }),
         session: {
           ...session,
           busy: event.busy,
           ...(event.status === undefined ? {} : { status: event.status }),
           ...(event.cost === undefined ? {} : { cost: event.cost }),
           ...(event.model === undefined ? {} : { model: event.model }),
+        },
+      };
+    case "queue":
+      // 排队快照是**整份覆盖**（不是增量）：omp 每次队列变化都推全量，空了就是被读进去了。
+      return {
+        ...view,
+        queue: {
+          steering: event.steering,
+          followUp: event.followUp,
+          ...(event.liveSteered === undefined ? {} : { liveSteered: event.liveSteered }),
         },
       };
     case "notice":
