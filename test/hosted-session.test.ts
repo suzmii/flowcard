@@ -1371,16 +1371,17 @@ describe("忙时引导（steer）与中断（abort）", () => {
       delivery: "steer",
     });
 
+    // ② omp 的排队快照（queue_update）也推给了网页：已引导、还没被读到
+    //    （**先等这条**再读命令日志：日志是假 omp 子进程写的，早读会读不到那一行）
+    const queue = await log.waitFor((e) => e.type === "queue");
+    expect(queue.type === "queue" ? queue.steering : []).toEqual(["别数了，只回答 ok"]);
+
     // ① stdin 里那句是 `steer`，且**没有**第二句 `prompt`
     const commands = readCommands(cmdLog);
     const steering = commands.filter((cmd) => cmd.message === "别数了，只回答 ok");
     expect(steering.map((cmd) => cmd.type)).toEqual(["steer"]);
     expect(steering[0]?.id).toBe(steeredBody.messageId); // 我们自己的 prompt id 原样带上（转录/回显对齐用）
     expect(commands.filter((cmd) => cmd.type === "prompt")).toHaveLength(1); // 只有第一句
-
-    // ② omp 的排队快照（queue_update）也推给了网页：已引导、还没被读到
-    const queue = await log.waitFor((e) => e.type === "queue");
-    expect(queue.type === "queue" ? queue.steering : []).toEqual(["别数了，只回答 ok"]);
 
     // ③ 用户那句话照旧进转录 + SSE 回显；会话还是忙的（引导没结束这一轮）
     expect((await log.waitFor((e) => e.type === "message_end" && e.role === "user" && e.text === "别数了，只回答 ok"))).toBeTruthy();
@@ -1429,17 +1430,18 @@ describe("引导（steer）的连发、空闲路径与对比项", () => {
       expect.stringContaining(":p4"),
     ]);
 
-    // 三条各成一帧、顺序不变、没有被合并成一条，也没有被拒绝
-    const steers = readCommands(cmdLog).filter((cmd) => cmd.type === "steer");
-    expect(steers.map((cmd) => cmd.message)).toEqual(["改一", "改二", "改三"]);
-
     // omp 的排队快照逐条长大（1 → 2 → 3）：这是「都在队列里、没被吞掉」的证据
+    //（**先等它**再读命令日志：日志是子进程写的，早读会读不到那几行）
     await log.waitFor((e) => e.type === "queue" && e.steering.length === 3);
     expect(
       log
         .byType("queue")
         .map((e) => (e.type === "queue" ? e.steering.length : 0)),
     ).toEqual([1, 2, 3]);
+
+    // 三条各成一帧、顺序不变、没有被合并成一条，也没有被拒绝
+    const steers = readCommands(cmdLog).filter((cmd) => cmd.type === "steer");
+    expect(steers.map((cmd) => cmd.message)).toEqual(["改一", "改二", "改三"]);
 
     expect(log.byType("error")).toEqual([]);
     expect(sessions.snapshot(id).messages.map((m) => m.text)).toEqual([
@@ -1467,12 +1469,14 @@ describe("引导（steer）的连发、空闲路径与对比项", () => {
 
     const idle = await sessions.prompt(id, "空闲时说一句", [], { steer: true });
     expect(idle.delivery).toBe("prompt");
+    // 先等这一轮真的跑完（"ok" 是假 omp 处理完 prompt 之后发的），再去读命令日志
+    // —— 日志是子进程写的，早读会读不到那一行。
+    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
     const cmd = readCommands(cmdLog).filter((c) => c.message === "空闲时说一句");
     expect(cmd.map((c) => c.type)).toEqual(["prompt"]);
     // 兜底：空闲那条也带 streamingBehavior:"steer" —— 万一这一瞬间判错，omp 会排进 steering 队列而不是回 busy 错
     expect(cmd[0]?.streamingBehavior).toBe("steer");
 
-    await log.waitFor((e) => e.type === "message_end" && e.role === "assistant" && e.text === "ok");
     expect(sessions.snapshot(id).busy).toBe(false);
     expect(
       sessions
@@ -1499,10 +1503,11 @@ describe("引导（steer）的连发、空闲路径与对比项", () => {
     const refused = await sessions.prompt(id, "排队等吧", [], { steer: false });
     expect(refused.ok).toBe(true); // 命令照旧只是写进 stdin（乐观）；omp 的拒绝走 SSE
     expect(refused.delivery).toBe("prompt");
-    expect(readCommands(cmdLog).filter((c) => c.message === "排队等吧").map((c) => c.type)).toEqual(["prompt"]);
-
+    // 先等 omp 的拒绝（证明那句 prompt 真被子进程处理了），再去读命令日志
     const failure = await log.waitFor((e) => e.type === "error");
     expect(failure.type === "error" ? failure.message : "").toContain("already processing");
+    expect(readCommands(cmdLog).filter((c) => c.message === "排队等吧").map((c) => c.type)).toEqual(["prompt"]);
+
     await sessions.abort(id);
     await sessions.stop(id);
   });
