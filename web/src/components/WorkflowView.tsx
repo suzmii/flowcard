@@ -23,7 +23,13 @@ import {
   type FlowActor,
   type Stage,
 } from "@/lib/contract";
-import { countByStage, type Workflow, type WorkflowStateNode } from "@/lib/workflow";
+import {
+  countByStage,
+  type Workflow,
+  type WorkflowActionNode,
+  type WorkflowEvidence,
+  type WorkflowStateNode,
+} from "@/lib/workflow";
 import type { CardView } from "@/lib/schema";
 
 /** 图上被选中的节点（看板列头 / 图内互跳都走这里）。 */
@@ -35,7 +41,20 @@ const NODE_H = 46;
 const LANE_GAP = 64;
 const ROW_GAP = 26;
 
-const ACTOR_COLOR: Record<FlowActor, string> = { human: "#e11d48", llm: "#0284c7" };
+const ACTOR_COLOR: Record<FlowActor, string> = { human: "#e11d48", llm: "#0284c7", command: "#475569" };
+
+/** 证据来源怎么显示（事件 / 卡片字段 / 门禁 —— 只认这三种）。 */
+const EVIDENCE_KIND_LABEL: Record<WorkflowEvidence["kind"], string> = {
+  event: "事件",
+  field: "字段",
+  gate: "门禁",
+};
+
+function evidenceRef(evidence: WorkflowEvidence): string {
+  if (evidence.kind === "event") return evidence.name;
+  if (evidence.kind === "field") return evidence.path;
+  return evidence.id;
+}
 
 /** 停在这个状态时在等谁动手 —— 徽标文字就是那一列 / 那一站等的人。 */
 function ActorBadge({ actor, size = "sm" }: { actor: FlowActor; size?: "sm" | "xs" }) {
@@ -195,6 +214,114 @@ function WorkflowDiagram({
   );
 }
 
+/**
+ * 一个动作节点（细粒度层）：序号 = 执行顺序（常量数组里的顺序，前置永远在它前面）。
+ * 命令文字放 `<details>` 里（折起来默认不占地方），但 `data-command` 一直在 —— 验收/DOM 断言直接读它。
+ */
+function ActionRow({
+  action,
+  focus,
+  onFocus,
+}: {
+  action: WorkflowActionNode;
+  focus: WorkflowFocus | null;
+  onFocus: (focus: WorkflowFocus) => void;
+}) {
+  const active = focus?.kind === "state" && action.toState !== null && focus.id === action.toState;
+  return (
+    <li
+      data-testid={`wf-action-${action.id}`}
+      data-action={action.id}
+      data-actor={action.actor}
+      data-command={action.command ?? ""}
+      data-order={action.order}
+      className={`rounded-lg border bg-background p-2 text-[11px] ${active ? "ring-2 ring-slate-900" : ""}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+          #{action.order}
+        </span>
+        <span className="font-semibold">{action.title}</span>
+        <ActorBadge actor={action.actor} size="xs" />
+        <span className="font-mono text-[10px] text-muted-foreground">{action.id}</span>
+        {action.command === null ? null : (
+          <details className="ml-auto">
+            <summary className="cursor-pointer select-none text-[10px] text-muted-foreground">命令</summary>
+            <code className="mt-0.5 block rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{action.command}</code>
+          </details>
+        )}
+      </div>
+      <dl className="mt-1 space-y-0.5 text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-1">
+          <dt>前置</dt>
+          {action.needs.length === 0 ? (
+            <dd className="rounded bg-muted px-1.5 py-0.5">无（流程入口）</dd>
+          ) : (
+            action.needs.map((need) => (
+              <dd key={need.id} className="rounded border px-1.5 py-0.5">
+                #{need.order} {need.title}
+              </dd>
+            ))
+          )}
+          {action.needsStates.length > 0 ? (
+            <dd className="flex flex-wrap items-center gap-1">
+              {action.needsStates.map((state) => (
+                <span key={state} className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                  {state}
+                </span>
+              ))}
+            </dd>
+          ) : null}
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <dt>产出</dt>
+          <dd>{action.output}</dd>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <dt>证据</dt>
+          {action.evidence.map((evidence) => (
+            <dd key={`${evidence.kind}-${evidenceRef(evidence)}`} className="rounded border px-1.5 py-0.5 font-mono">
+              {EVIDENCE_KIND_LABEL[evidence.kind]}·{evidenceRef(evidence)}
+            </dd>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <dt>推进到</dt>
+          <dd>
+            {action.toState === null ? (
+              <span className="rounded bg-muted px-1.5 py-0.5">不推状态</span>
+            ) : (
+              <button
+                type="button"
+                className="rounded border px-1.5 py-0.5 font-mono hover:bg-muted"
+                onClick={() => onFocus({ kind: "state", id: action.toState ?? "" })}
+                title="跳到流程图上这个状态"
+              >
+                {action.toState}
+              </button>
+            )}
+          </dd>
+          <dd>
+            {action.toStage === null ? (
+              <span className="rounded bg-muted px-1.5 py-0.5">不改列</span>
+            ) : (
+              <button
+                type="button"
+                className="rounded border px-1.5 py-0.5 font-mono hover:bg-muted"
+                onClick={() => onFocus({ kind: "stage", id: action.toStage ?? "" })}
+                title="跳到下面这一列的溯源卡片"
+              >
+                列 {action.toStage}
+              </button>
+            )}
+          </dd>
+        </div>
+      </dl>
+      <p className="mt-1 text-[10px] text-muted-foreground">{action.actorWhy}</p>
+    </li>
+  );
+}
+
 function StageNode({
   stage,
   count,
@@ -242,6 +369,22 @@ function StageNode({
               {STAGE_FACT_LABELS[fact]}
             </dd>
           ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <dt>落进这一列的动作</dt>
+          <dd className="flex flex-wrap items-center gap-1">
+            {stage.actions.map((action) => (
+              <button
+                key={action.id}
+                type="button"
+                onClick={() => document.getElementById(`wf-action-${action.id}`)?.scrollIntoView({ block: "center", behavior: "smooth" })}
+                className="rounded border px-1.5 py-0.5 hover:bg-muted"
+                title="跳到动作节点那一行"
+              >
+                #{action.order} {action.title} · {action.actor}
+              </button>
+            ))}
+          </dd>
         </div>
         <div className="flex flex-wrap items-center gap-1">
           <dt>读到的状态</dt>
@@ -318,8 +461,8 @@ export function WorkflowView({
           </div>
           <p className="text-[11px] text-muted-foreground">
             本页内容由 <code className="font-mono">src/flow/personal.ts</code>（状态机：转换 / 硬前置 / 门禁 /
-            自动节点）与 <code className="font-mono">src/shared/stage.ts</code>（看板 9 列的判据）
-            <strong>编译而成</strong>，前端不手写流程。
+            自动节点 / <strong>动作节点</strong>）与 <code className="font-mono">src/shared/stage.ts</code>
+            （看板 9 列的判据）<strong>编译而成</strong>，前端不手写流程。
           </p>
           <span className="flex items-center gap-2 text-[11px] text-muted-foreground">
             <ActorBadge actor="human" size="xs" />
@@ -328,6 +471,10 @@ export function WorkflowView({
           <span className="flex items-center gap-2 text-[11px] text-muted-foreground">
             <ActorBadge actor="llm" size="xs" />
             {ACTOR_HINT.llm}
+          </span>
+          <span className="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <ActorBadge actor="command" size="xs" />
+            {ACTOR_HINT.command}
           </span>
           <button
             type="button"
@@ -429,9 +576,28 @@ export function WorkflowView({
           </div>
         </section>
 
+        <section data-testid="wf-actions" className="space-y-2 rounded-xl border bg-background p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-xs font-semibold">二、动作节点（细粒度层，按执行顺序）</h3>
+            <span className="text-[11px] text-muted-foreground">
+              共 {workflow.flow.actions.length} 个节点（
+              {(["human", "llm", "command"] as const)
+                .map((actor) => `${actor} ${workflow.flow.actions.filter((a) => a.actor === actor).length}`)
+                .join(" / ")}
+              ）：把上面那七步状态机细到「具体动作 → 具体动作」。
+              序号 = 执行顺序（常量数组顺序，前置永远在它前面）；命令折在「命令」里，点开就是 CLI 原文。
+            </span>
+          </div>
+          <ol className="space-y-1.5" data-testid="wf-action-list">
+            {workflow.flow.actions.map((action) => (
+              <ActionRow key={action.id} action={action} focus={focus} onFocus={onFocus} />
+            ))}
+          </ol>
+        </section>
+
         <section data-testid="wf-stages" className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-xs font-semibold">二、看板的 9 列：每列的溯源</h3>
+            <h3 className="text-xs font-semibold">三、看板的 9 列：每列的溯源</h3>
             <span className="text-[11px] text-muted-foreground">
               顺序 = 判据匹配优先级（第一条命中即定列）；看板从左到右是显示顺序，两者不同。
             </span>

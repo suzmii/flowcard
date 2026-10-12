@@ -11,7 +11,7 @@
  * 改流程/改列只改上面那两处，这个文件与前端自动跟上；对不上的地方由 `test/workflow.test.ts` 钉住。
  */
 import { personalFlow } from "../flow/personal.ts";
-import type { FlowActor, Transition } from "./flow.ts";
+import type { Evidence, FlowActor, Transition } from "./flow.ts";
 import {
   STAGE_EMPTY_HINTS,
   STAGE_FACT_LABELS,
@@ -79,6 +79,29 @@ export type WorkflowGate = {
   report: string[];
 };
 
+/**
+ * **动作节点**（细粒度层）：`order` = 执行顺序（= 常量数组里的顺序，`defineFlow` 保证前置永远在它前面）。
+ * 每个节点自带「前置 / 产出 / 证据来源 / 推进到哪个状态或列」，`command` 是它在 CLI 里敲的那条命令。
+ */
+export type WorkflowActionNode = {
+  order: number;
+  id: string;
+  title: string;
+  actor: FlowActor;
+  /** 为什么是这个人（拍板 or 只是落库的机械动作）。 */
+  actorWhy: string;
+  /** 前置动作（带中文名与序号，前端不用自己查表）。 */
+  needs: { id: string; title: string; order: number }[];
+  needsStates: CardState[];
+  output: string;
+  /** 证据来源：事件 / 卡片字段 / 门禁。 */
+  evidence: Evidence[];
+  toState: CardState | null;
+  toStage: Stage | null;
+  /** 在 CLI 里敲什么（`command` 节点必有；没有对应命令的就是 `null`）。 */
+  command: string | null;
+};
+
 /** 看板的一列 —— 每列的**溯源**：判据、等谁动手、看哪几类事实、直接读哪些卡片状态。 */
 export type WorkflowStageNode = {
   id: Stage;
@@ -93,6 +116,8 @@ export type WorkflowStageNode = {
   states: CardState[];
   /** 在判据表里的名次（1 = 最优先命中）。 */
   priority: number;
+  /** 这一步之后会落进这一列的动作节点（**每列至少一个**，由 `test/workflow.test.ts` 钉住）。 */
+  actions: { id: string; title: string; actor: FlowActor; order: number }[];
 };
 
 export type WorkflowPayload = {
@@ -104,13 +129,15 @@ export type WorkflowPayload = {
     gates: WorkflowGate[];
     /** 声明式转换之外的入口也要能解释：哪些状态没有进入边。 */
     entranceFreeStates: CardState[];
+    /** 动作节点（按执行顺序）。 */
+    actions: WorkflowActionNode[];
   };
   stages: WorkflowStageNode[];
 };
 
 /** 视图里会打出的一个 actor 标签（`human` / `llm` 文字）。 */
 export type WorkflowActorSlot = {
-  kind: "state" | "transition" | "automation" | "gate" | "stage";
+  kind: "state" | "transition" | "automation" | "gate" | "action" | "stage";
   id: string;
   actor: FlowActor;
 };
@@ -187,6 +214,26 @@ export function buildWorkflow(): WorkflowPayload {
     report: gate.report ?? [],
   }));
 
+  const actions: WorkflowActionNode[] = flow.actions.map((action, index) => ({
+    order: index + 1,
+    id: action.id,
+    title: action.title,
+    actor: action.actor,
+    actorWhy: action.actorWhy,
+    // 前置只可能写在前面（defineFlow 已校验），所以顺序表里一定查得到
+    needs: action.needsActions.map((id) => ({
+      id,
+      title: flow.actions.find((candidate) => candidate.id === id)?.title ?? id,
+      order: flow.actions.findIndex((candidate) => candidate.id === id) + 1,
+    })),
+    needsStates: [...action.needsStates],
+    output: action.output,
+    evidence: [...action.evidence],
+    toState: action.toState,
+    toStage: action.toStage,
+    command: action.command,
+  }));
+
   const stages: WorkflowStageNode[] = STAGE_RULES.map((rule, index) => ({
     id: rule.stage,
     label: STAGE_LABELS[rule.stage],
@@ -196,6 +243,9 @@ export function buildWorkflow(): WorkflowPayload {
     facts: [...rule.facts],
     states: [...rule.states],
     priority: index + 1,
+    actions: actions
+      .filter((action) => action.toStage === rule.stage)
+      .map((action) => ({ id: action.id, title: action.title, actor: action.actor, order: action.order })),
   }));
 
   return {
@@ -206,6 +256,7 @@ export function buildWorkflow(): WorkflowPayload {
       automations,
       gates,
       entranceFreeStates: states.filter((state) => state.incoming.length === 0).map((state) => state.id),
+      actions,
     },
     stages,
   };
@@ -221,6 +272,7 @@ export function workflowActorSlots(payload: WorkflowPayload): WorkflowActorSlot[
     ...payload.flow.transitions.map((t) => ({ kind: "transition" as const, id: t.id, actor: t.actor })),
     ...payload.flow.automations.map((a) => ({ kind: "automation" as const, id: a.name, actor: a.actor })),
     ...payload.flow.gates.map((g) => ({ kind: "gate" as const, id: g.id, actor: g.actor })),
+    ...payload.flow.actions.map((a) => ({ kind: "action" as const, id: a.id, actor: a.actor })),
     ...payload.stages.map((s) => ({ kind: "stage" as const, id: s.id, actor: s.actor })),
   ];
 }

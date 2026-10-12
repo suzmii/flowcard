@@ -268,20 +268,39 @@ STAGE_RULES     // 判据表：按顺序取第一条命中的列
 
 判据的回归网在 `test/stage.test.ts`：**每条判据 + 每对优先级各一条硬断言**（事实组合 → 列），另加「缺 git 事实时退化」与「列集合/顺序/兜底」的结构断言。
 
-### 4.3 每一步归谁动手：`human` / `llm`
+### 4.3 动作节点（细粒度层）：把流程讲到「具体动作」
 
-流程图上每个**状态 / 转换 / 自动节点 / 门禁 / 看板列**都带一个 `actor`，**只有两个取值**：`human`（要人拍板或动手）、`llm`（要 agent 干活）。判定口径写在代码里（唯一的真相）：`src/shared/flow.ts` 的 `FlowActor`。
+状态机（§4.1）只有七步，讲不清「建 worktree 到底谁干、拿什么判定它干完了」。所以 `personalFlow.actions` 里再声明一层**动作节点**（`src/shared/flow.ts` 的 `ActionSpec`）：
 
-**口径一句话：看这一步最终由谁拍板，而不是看事实是谁送来的。** 机器事实（CI 结果、`git status` 脏文件、PR 状态轮询）**不单独成一类**，只提供条件，归到「该步最终拍板的那一方」：
+- 每个节点写清 `title`（中文名）、`actor` + `actorWhy`（为什么是这个人）、`needsActions` / `needsStates`（前置）、`output`（产出）、
+  `evidence`（**靠哪个事件 / 卡片字段 / 门禁判定它真的发生了**）、`toState` / `toStage`（推进到哪个状态、之后落进看板哪一列）、`command`（在 CLI 里敲什么）；
+- **数组顺序 = 执行顺序**，`needsActions` 只能指向前面的节点（`defineFlow` 校验），前端不用自己拓扑排序；
+- `command` 节点必须有命令，且命令**必须真实存在**：`src/cli/commands.ts` 的命令表是唯一真相（`flowcard help` 也从它生成），
+  `--flag` 还要命中 `src/cli/main.ts` 里真实的 `parseArgs` 选项 —— 编造命令会被 `test/workflow.test.ts` 当场挡下（例：`flowcard push --record` 里的 `--record` 不存在，写上去就是红的）；
+- 这层**不动状态机语义**：`Card.state` 仍然只有那七个值，细分只体现在节点上（`toState: null` 的节点不推状态）。
 
-| 归谁 | 有哪些 | 为什么 |
+`GET /api/workflow` 把这一层和状态机、9 列判据一起编译成纯数据，Workflow 视图按执行顺序排布（不是硬塞进状态机的方框里）。
+
+### 4.4 每一步归谁动手：`human` / `llm` / `command`
+
+流程图上每个**状态 / 转换 / 自动节点 / 门禁 / 动作节点 / 看板列**都带一个 `actor`，三个取值。判定口径写在代码里（唯一的真相）：`src/shared/flow.ts` 的 `FlowActor`。
+
+| 取值 | 谁 | 判据（问「这一步有没有判断」） |
 |---|---|---|
-| `human` | 验收（G3）、清理确认（G4）、远程写授权（G2 approve / consume）、`PR 待审 / 等 CI`、《待你验收》、解除阻塞（显式 `unblock`）、`done` / `dropped` 两个终态 | 都要**人**做决定或动手才往下走。CI 绿了仍要人等审/等合，所以 `PR 待审` 是 `human`（CI 只是条件） |
-| `llm` | 建 worktree / 把会话搬进 worktree、实施、开 PR、推送、写转录、按会话回执（心跳 / 结束）推进状态、`待开 PR`、`待立项` | 人不需要在场，agent 自己干 |
+| `human` | 人 | 必须人**拍板或动手**才往下走：验收（G3）、清理确认（G4）、远程写授权与 approve、等人看 / 合 PR、解除阻塞，以及 `done` / `dropped` 两个终态 |
+| `llm` | agent | 由 agent **做判断并干活**推进：按 brief 实施、跑验证、开 PR、交回、拆片、绑 Issue、报阻塞 |
+| `command` | 机械动作 | **只是把已经定好的事落到系统里**：没有人的判断、也没有模型的判断 —— `flowcard worktree use`、`flowcard push --sha`、`flowcard confirm --consume`、`flowcard cleanup`、`flowcard sync` |
 
-标注落在这几处，改流程时**必须一起改**（`defineFlow` 会在启动/测试时校验，缺了直接报错）：
-`personalFlow.stateActors`（停在这个状态时在等谁）、`transitionActors`（这条转换谁推）、`gates[].actor` / `automations[].actor`、`STAGE_RULES[].actor`（这一列在等谁）。
-看板列头直接显示这两个词，悬停给出判据 + actor 由来；Workflow 视图（`GET /api/workflow`）把同一份标注画在流程图与 9 列节点上。不变量在 `test/workflow.test.ts`。
+**边界例子（拿不准时照这几个判）**：`flowcard accept`（人验收 G3）虽然是 CLI 敲的，但**判断是人做的** → `human`；`flowcard confirm --approve` 同理是 `human`；而 `flowcard confirm --consume` 只是核销一张已经批过的凭据 → `command`。`flowcard worktree use` 的名字/路径都由参数定死了 → `command`。
+
+**机器事实不是第三方。** CI 结果、`git status` 脏文件、PR 状态轮询、会话心跳都只提供条件，归到「这一步最终由谁拍板」：CI 绿了仍要人等审 → `PR 待审 / 等 CI` 这一列是 `human`；而「把 PR/CI 状态同步回来」这个**动作**是纯机械 → `flowcard sync` 是 `command`。两者不矛盾：列说「在等谁」，动作说「谁在做那件机械事」。
+
+**`command` 只出现在动作节点上。** 状态机那一层（`stateActors` / `transitionActors` / `gates[].actor` / `automations[].actor` / `STAGE_RULES[].actor`）说的都是「谁在拍板」，只可能是 `human` / `llm`（`defineFlow` 与 `test/workflow.test.ts` 都会校验）。
+
+标注落在这几处，改流程时**必须一起改**（`defineFlow` 在启动/测试时校验，缺了直接报错）：
+`personalFlow.stateActors`、`transitionActors`、`gates[].actor` / `automations[].actor`、`actions[].actor` + `actorWhy`、`STAGE_RULES[].actor`。
+
+看板列头直接显示这三个词里属于它的那个，悬停给出判据 + actor 由来；Workflow 视图（`GET /api/workflow`）把同一份标注画在流程图、动作节点与 9 列节点上（命令折在「命令」里，点开就是 CLI 原文）。不变量在 `test/workflow.test.ts`。
 
 ## 5. 门禁（人工节点）
 

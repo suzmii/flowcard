@@ -9,6 +9,7 @@ import { parseArgs } from "node:util";
 import { MAX_ATTACHMENT_BYTES, MIME_BY_EXT } from "../server/attachments.ts";
 import { summarizeDiff } from "../server/diff.ts";
 import { defaultRun, firstLine } from "../server/probe.ts";
+import { CLI_COMMANDS } from "./commands.ts";
 import { runDetect } from "./detect.ts";
 import { abort, ExitSignal, finish, runCli } from "./exit.ts";
 import { runSync } from "./sync.ts";
@@ -874,8 +875,10 @@ async function main(): Promise<void> {
   const name = positionals[0];
 
   if (!name || name === "help" || name === "--help") {
+    // 命令清单从 `commands.ts` 的表生成（那份表也是 Workflow 里 `command` 节点校验的依据）
+    const names = CLI_COMMANDS.map((command) => command.name).join(" ");
     return finish(
-      `${JSON.stringify({ usage: "flowcard <命令> <card> [选项…]；命令：project attach open issue gate confirm worktree session claim beat pr push end accept block unblock drop probe cleanup comment spawn up down diff review detect sync list show" })}\n`,
+      `${JSON.stringify({ usage: `flowcard <命令> <card> [选项…]；命令：${names}` })}\n`,
       0,
     );
   }

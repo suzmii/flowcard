@@ -13,7 +13,7 @@ import { CARD_STATES, deriveStage, STAGE_FACT_LABELS, STAGES, type CardGitFacts,
 import type { FlowActor } from "@/lib/contract";
 import type { CardView } from "@/lib/schema";
 
-const actorSchema = z.enum(["human", "llm"] satisfies [FlowActor, ...FlowActor[]]);
+const actorSchema = z.enum(["human", "llm", "command"] satisfies [FlowActor, ...FlowActor[]]);
 const cardStateSchema = z.enum(CARD_STATES);
 const stageSchema = z.enum(STAGES);
 const factSourceSchema = z.enum(
@@ -47,6 +47,27 @@ const automationSchema = z.looseObject({
   whenStates: z.array(cardStateSchema),
 });
 
+const evidenceSchema = z.discriminatedUnion("kind", [
+  z.looseObject({ kind: z.literal("event"), name: z.string() }),
+  z.looseObject({ kind: z.literal("field"), path: z.string() }),
+  z.looseObject({ kind: z.literal("gate"), id: z.string() }),
+]);
+
+const actionSchema = z.looseObject({
+  order: z.number(),
+  id: z.string(),
+  title: z.string(),
+  actor: actorSchema,
+  actorWhy: z.string(),
+  needs: z.array(z.looseObject({ id: z.string(), title: z.string(), order: z.number() })),
+  needsStates: z.array(cardStateSchema),
+  output: z.string(),
+  evidence: z.array(evidenceSchema),
+  toState: cardStateSchema.nullable(),
+  toStage: stageSchema.nullable(),
+  command: z.string().nullable(),
+});
+
 const gateSchema = z.looseObject({
   id: z.string(),
   title: z.string(),
@@ -68,6 +89,7 @@ export const stageNodeSchema = z.looseObject({
   facts: z.array(factSourceSchema),
   states: z.array(cardStateSchema),
   priority: z.number(),
+  actions: z.array(z.looseObject({ id: z.string(), title: z.string(), actor: actorSchema, order: z.number() })),
 });
 
 export const workflowSchema = z.looseObject({
@@ -78,6 +100,7 @@ export const workflowSchema = z.looseObject({
     automations: z.array(automationSchema),
     gates: z.array(gateSchema),
     entranceFreeStates: z.array(cardStateSchema),
+    actions: z.array(actionSchema),
   }),
   stages: z.array(stageNodeSchema),
 });
@@ -86,6 +109,8 @@ export type WorkflowStateNode = z.infer<typeof stateNodeSchema>;
 export type WorkflowTransition = z.infer<typeof transitionSchema>;
 export type WorkflowAutomation = z.infer<typeof automationSchema>;
 export type WorkflowGate = z.infer<typeof gateSchema>;
+export type WorkflowEvidence = z.infer<typeof evidenceSchema>;
+export type WorkflowActionNode = z.infer<typeof actionSchema>;
 export type WorkflowStageNode = z.infer<typeof stageNodeSchema>;
 export type Workflow = z.infer<typeof workflowSchema>;
 

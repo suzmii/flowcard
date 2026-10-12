@@ -72,22 +72,26 @@ export type {
  */
 export type { FlowActor } from "../../../src/shared/flow.ts";
 
-/** actor 的显示文字：用户要求「直接用 human 和 llm 标注」，**文字就是这两个词本身**，别换词。 */
+/** actor 的显示文字：用户要求「直接用 human / llm / command 标注」，**文字就是这三个词本身**，别换词。 */
 export const ACTOR_TEXT: Record<FlowActor, string> = {
   human: "human",
   llm: "llm",
+  command: "command",
 };
 
-/** actor 的悬停解释（只在 title / 图例里出现，标签文字仍然是上面那两个词）。 */
+/** actor 的悬停解释（只在 title / 图例里出现，标签文字仍然是上面那几个词）。 */
 export const ACTOR_HINT: Record<FlowActor, string> = {
   human: "human：要人拍板或动手（验收 G3、清理 G4、远程写授权、等人看/合 PR、解除阻塞）",
-  llm: "llm：agent 干活推进（建 worktree、实施、开 PR、推送、写转录、按会话回执前进）",
+  llm: "llm：agent 做判断并干活推进（建 worktree、按 brief 实施、跑验证、开 PR、交回、拆片）",
+  command:
+    "command：只是把已经定好的事落到系统里 —— 没有人的判断、也没有模型的判断（worktree use / push --sha / confirm --consume / cleanup）",
 };
 
 /** actor 的样式（Tailwind 类名必须留在 web 里，构建时才扫得到）。 */
 export const ACTOR_TONE: Record<FlowActor, string> = {
   human: "border-rose-200 bg-rose-50 text-rose-700",
   llm: "border-sky-200 bg-sky-50 text-sky-700",
+  command: "border-slate-300 bg-slate-100 text-slate-700",
 };
 
 /**
